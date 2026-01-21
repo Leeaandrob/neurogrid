@@ -1,0 +1,166 @@
+NeuroGrid Engine License
+Version 1.0, January 2026
+
+Copyright (c) 2026 Leandro Barbosa. All Rights Reserved.
+
+================================================================================
+                        SOURCE AVAILABLE LICENSE
+                    WITH ACADEMIC & EDUCATIONAL USE GRANT
+================================================================================
+
+DEFINITIONS
+
+"Software" means the NeuroGrid Engine source code, documentation, and any
+associated files in this repository.
+
+"Commercial Use" means any use of the Software that is primarily intended for
+or directed toward commercial advantage or monetary compensation. This includes,
+but is not limited to:
+  - Selling the Software or derivative works
+  - Using the Software to provide paid services
+  - Incorporating the Software into commercial products
+  - Using the Software in a business context for profit generation
+
+"Non-Commercial Use" means use that is not Commercial Use, including:
+  - Personal learning and experimentation
+  - Academic research and education
+  - Non-profit organization use
+  - Open source projects (that are themselves non-commercial)
+
+"Licensor" means Leandro Barbosa and any authorized consultancy or business
+entity designated by Leandro Barbosa.
+
+================================================================================
+                              GRANT OF RIGHTS
+================================================================================
+
+1. NON-COMMERCIAL USE LICENSE
+
+Subject to the terms of this License, the Licensor hereby grants you a
+worldwide, royalty-free, non-exclusive license to:
+
+  a) Use, copy, and modify the Software for Non-Commercial Use
+  b) Create derivative works for Non-Commercial Use
+  c) Share and distribute the Software for Non-Commercial Use, provided that:
+     - You include this License with any distribution
+     - You clearly attribute the original work to the Licensor
+     - You indicate any modifications made
+     - You do not misrepresent the origin of the Software
+
+2. ACADEMIC AND EDUCATIONAL USE
+
+Students, researchers, educators, and academic institutions are explicitly
+permitted to:
+
+  a) Use the Software for coursework, thesis, and dissertation research
+  b) Use the Software in classroom instruction and academic workshops
+  c) Publish academic papers and research based on the Software
+  d) Include the Software in academic projects and portfolios
+  e) Use the Software for learning and skill development
+
+Attribution is required in any academic publication or presentation.
+
+3. OPEN SOURCE PROJECT USE
+
+Non-commercial open source projects may incorporate this Software provided:
+
+  a) The incorporating project is itself non-commercial
+  b) This License is included and referenced
+  c) The original copyright notice is preserved
+  d) Modifications are clearly documented
+
+================================================================================
+                              RESTRICTIONS
+================================================================================
+
+4. COMMERCIAL USE PROHIBITION
+
+Commercial Use of this Software is NOT permitted without explicit written
+authorization from the Licensor.
+
+To obtain a Commercial License, contact:
+  Email: leandrobar93@gmail.com
+  Subject: NeuroGrid Commercial License Inquiry
+
+5. PROHIBITED ACTIVITIES
+
+Without a Commercial License, you may NOT:
+
+  a) Sell, lease, or rent the Software or any derivative works
+  b) Use the Software to provide commercial services or SaaS offerings
+  c) Incorporate the Software into proprietary commercial products
+  d) Use the Software for commercial consulting or training services
+  e) Sublicense the Software for commercial purposes
+  f) Remove or obscure copyright notices or license terms
+
+================================================================================
+                          ADDITIONAL TERMS
+================================================================================
+
+6. CONTRIBUTIONS
+
+Any contributions submitted to this project are subject to this License.
+By contributing, you agree that your contributions may be used under both
+this License and any Commercial License granted by the Licensor.
+
+7. PATENT RIGHTS
+
+This License does not grant any patent rights. The Licensor reserves all
+patent rights in the Software.
+
+8. TRADEMARK
+
+This License does not grant permission to use the trade names, trademarks,
+service marks, or product names of the Licensor, except as required for
+attribution purposes.
+
+9. DISCLAIMER OF WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+10. LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+11. TERMINATION
+
+This License automatically terminates if you violate any of its terms.
+Upon termination, you must destroy all copies of the Software in your
+possession.
+
+12. GOVERNING LAW
+
+This License shall be governed by and construed in accordance with the
+laws of Brazil, without regard to its conflict of law provisions.
+
+================================================================================
+                              COMMERCIAL LICENSING
+================================================================================
+
+For Commercial Use licensing inquiries, including:
+  - Enterprise deployments
+  - SaaS and cloud service integration
+  - Commercial product embedding
+  - Consulting and professional services
+  - Custom development and support
+
+Contact:
+  Leandro Barbosa
+  Email: leandrobar93@gmail.com
+
+Commercial licenses include:
+  - Full Commercial Use rights
+  - Priority support options
+  - Custom feature development
+  - SLA guarantees
+  - Indemnification options
+
+================================================================================
+
+By using this Software, you acknowledge that you have read this License,
+understand it, and agree to be bound by its terms and conditions.
