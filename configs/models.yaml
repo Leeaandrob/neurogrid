@@ -1,0 +1,61 @@
+# Model aliases configuration for HuggingFace downloads
+# This file maps short aliases to full HuggingFace repo IDs
+
+aliases:
+  # TinyLlama - Small model for testing (public, no auth required)
+  tinyllama:
+    repo: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    size_gb: 2.2
+    requires_auth: false
+    description: "TinyLlama 1.1B Chat - Small model for testing"
+
+  # Llama 2 7B variants (gated, requires HF_TOKEN)
+  llama7b:
+    repo: "meta-llama/Llama-2-7b-hf"
+    size_gb: 13
+    requires_auth: true
+    description: "Llama 2 7B - Base model"
+
+  llama7b-chat:
+    repo: "meta-llama/Llama-2-7b-chat-hf"
+    size_gb: 13
+    requires_auth: true
+    description: "Llama 2 7B Chat - Fine-tuned for dialogue"
+
+  # Llama 2 13B variants (gated, requires HF_TOKEN)
+  llama13b:
+    repo: "meta-llama/Llama-2-13b-hf"
+    size_gb: 26
+    requires_auth: true
+    description: "Llama 2 13B - Base model"
+
+  llama13b-chat:
+    repo: "meta-llama/Llama-2-13b-chat-hf"
+    size_gb: 26
+    requires_auth: true
+    description: "Llama 2 13B Chat - Fine-tuned for dialogue"
+
+# Default model for quick testing
+default: tinyllama
+
+# Model files to download (patterns)
+include_patterns:
+  - "*.safetensors"
+  - "*.json"
+  - "*.model"
+  - "tokenizer.model"
+  - "vocab.json"
+  - "merges.txt"
+
+# Files to skip
+exclude_patterns:
+  - "*.bin"  # Skip old PyTorch format
+  - "*.pt"   # Skip PyTorch checkpoints
+  - "*.gguf" # Skip GGUF quantized (separate download)
+
+# Performance settings
+download:
+  concurrency: 4
+  buffer_size_kb: 32
+  retry_count: 3
+  retry_delay_ms: 1000

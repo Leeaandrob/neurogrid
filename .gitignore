@@ -1,0 +1,43 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.so
+*.a
+
+# Binary outputs (at root level only)
+/neurogrid
+/download
+/e2e.test
+
+# Model files (large)
+models/
+*.safetensors
+*.bin
+*.model
+*.vocab
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+*.exe
+*.test
+
+# Session files
+.prp-session/
+
+# Logs
+*.log
+
+# Temp files
+/tmp/
+*.tmp

@@ -1,0 +1,50 @@
+// FlatBuffers schema for NeuroGrid tensor serialization
+// Used for efficient zero-copy tensor transfer over the network
+
+namespace neurogrid;
+
+// Data type enumeration for tensor elements
+enum DType : byte {
+    Float32 = 0,
+    Float16 = 1,
+    Int8 = 2,
+    BFloat16 = 3,
+    Int32 = 4,
+    Int64 = 5
+}
+
+// Tensor metadata describing shape and type
+table TensorMeta {
+    shape: [int64];      // Tensor dimensions (e.g., [batch, seq_len, hidden])
+    dtype: DType;        // Element data type
+    device_id: int32;    // Source device ID
+    layer_id: int32;     // Layer in the model
+    position: int32;     // Token position (for KV cache)
+}
+
+// Activation message for inter-layer communication
+table Activation {
+    meta: TensorMeta;    // Tensor metadata
+    data: [ubyte];       // Raw tensor data bytes
+    sequence_id: uint64; // Sequence number for ordering
+}
+
+// Key-Value cache entry for attention layers
+table KVCacheEntry {
+    layer_id: int32;     // Layer index
+    position: int32;     // Token position
+    key: [ubyte];        // Key tensor data
+    value: [ubyte];      // Value tensor data
+    dtype: DType;        // Element type
+    head_dim: int32;     // Head dimension
+    num_heads: int32;    // Number of attention heads
+}
+
+// Batch of activations for pipelined transfer
+table ActivationBatch {
+    activations: [Activation];
+    batch_id: uint64;
+}
+
+// Root type for activation messages
+root_type Activation;

@@ -1,0 +1,549 @@
+// Package inference provides distributed inference capabilities for LLM generation.
+package inference
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math"
+	"sync"
+	"sync/atomic"
+
+	"github.com/neurogrid/engine/pkg/scheduler"
+	"github.com/neurogrid/engine/pkg/transport"
+	"github.com/neurogrid/engine/pkg/types"
+)
+
+// GenerateRequest represents a text generation request.
+type GenerateRequest struct {
+	Prompt      string
+	MaxTokens   int
+	Temperature float32
+	TopP        float32
+	StopTokens  []int
+}
+
+// GenerateResponse represents a text generation response.
+type GenerateResponse struct {
+	Text       string
+	TokenCount int
+	StopReason string
+}
+
+// Tokenizer interface for encoding/decoding text.
+type Tokenizer interface {
+	Encode(text string) ([]int, error)
+	Decode(tokens []int) (string, error)
+	EOSToken() int
+	BOSToken() int
+	VocabSize() int
+}
+
+// LayerExecutor interface for executing a single layer forward pass.
+type LayerExecutor interface {
+	Forward(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, []byte, []byte, error) // returns hidden, k, v
+}
+
+// EngineConfig holds configuration for the inference engine.
+type EngineConfig struct {
+	ModelConfig *types.LlamaConfig
+	LocalPeerID string
+}
+
+// GPUInference interface for GPU-accelerated operations.
+type GPUInference interface {
+	EmbedTokenGPU(token int) ([]byte, error)
+	ApplyLMHeadGPU(hidden []byte) ([]float32, error)
+}
+
+// Engine orchestrates distributed inference across multiple peers.
+type Engine struct {
+	config       *types.LlamaConfig
+	scheduler    *scheduler.Scheduler
+	router       *transport.TransportRouter
+	prefetch     *scheduler.PrefetchCoordinator
+	tokenizer    Tokenizer
+	sampler      *Sampler
+	kvCaches     *KVCacheManager
+	assignments  []scheduler.LayerAssignment
+	localPeerID  string
+	seqCounter   uint64
+	layerExecutor LayerExecutor
+
+	// Embedding and output head (stored as raw bytes for CPU fallback)
+	embeddings []byte // Token embedding matrix [vocabSize, hiddenSize] in FP16
+	lmHead     []byte // Output projection [hiddenSize, vocabSize] in FP16
+
+	// GPU components (nil if running in CPU mode)
+	gpuInference GPUInference
+	useGPU       bool
+
+	mu sync.RWMutex
+}
+
+// NewEngine creates a new distributed inference engine.
+func NewEngine(config EngineConfig) *Engine {
+	return &Engine{
+		config:      config.ModelConfig,
+		kvCaches:    NewKVCacheManager(),
+		sampler:     NewSampler(42), // Default seed
+		localPeerID: config.LocalPeerID,
+	}
+}
+
+// SetScheduler sets the layer scheduler.
+func (e *Engine) SetScheduler(s *scheduler.Scheduler) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.scheduler = s
+}
+
+// SetRouter sets the transport router.
+func (e *Engine) SetRouter(r *transport.TransportRouter) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.router = r
+}
+
+// SetTokenizer sets the tokenizer.
+func (e *Engine) SetTokenizer(t Tokenizer) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.tokenizer = t
+}
+
+// SetSampler sets the token sampler with a specific seed.
+func (e *Engine) SetSampler(seed int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sampler = NewSampler(seed)
+}
+
+// SetLayerExecutor sets the layer executor for forward passes.
+func (e *Engine) SetLayerExecutor(exec LayerExecutor) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.layerExecutor = exec
+}
+
+// SetAssignments sets the layer-to-peer assignments.
+func (e *Engine) SetAssignments(assignments []scheduler.LayerAssignment) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.assignments = assignments
+	e.prefetch = scheduler.NewPrefetchCoordinator(assignments, 16)
+}
+
+// LoadEmbeddings loads the token embedding matrix.
+func (e *Engine) LoadEmbeddings(embeddings []byte) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.embeddings = embeddings
+}
+
+// LoadLMHead loads the language model output head.
+func (e *Engine) LoadLMHead(lmHead []byte) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.lmHead = lmHead
+}
+
+// InitializeKVCaches creates KV caches for all layers based on assignments.
+func (e *Engine) InitializeKVCaches() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.config == nil {
+		return fmt.Errorf("model config not set")
+	}
+
+	for _, assignment := range e.assignments {
+		// Skip embedding (-1) and output layer (numLayers)
+		if assignment.LayerID < 0 || assignment.LayerID >= e.config.NumLayers {
+			continue
+		}
+
+		isLocal := assignment.PeerID == e.localPeerID
+
+		cache := NewDistributedKVCache(
+			KVCacheConfig{
+				LayerID:    assignment.LayerID,
+				NumKVHeads: e.config.NumKVHeads,
+				HeadDim:    e.config.HeadDim,
+				MaxSeqLen:  e.config.MaxSeqLen,
+			},
+			assignment.PeerID,
+			0, // Device ID determined by peer
+			isLocal,
+		)
+
+		e.kvCaches.RegisterCache(cache)
+	}
+
+	return nil
+}
+
+// Generate performs text generation given a prompt.
+func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.tokenizer == nil {
+		return nil, fmt.Errorf("tokenizer not set")
+	}
+
+	// Tokenize input
+	inputTokens, err := e.tokenizer.Encode(req.Prompt)
+	if err != nil {
+		return nil, fmt.Errorf("tokenization failed: %w", err)
+	}
+	log.Printf("[Generate] Input tokens: %v", inputTokens)
+
+	// Get sequence ID for this request
+	seqID := atomic.AddUint64(&e.seqCounter, 1)
+
+	// Clear KV caches for new sequence
+	e.kvCaches.ClearAll()
+
+	// Prefill phase - process all input tokens
+	hidden, err := e.prefill(ctx, inputTokens, seqID)
+	if err != nil {
+		return nil, fmt.Errorf("prefill failed: %w", err)
+	}
+
+	// Autoregressive decode
+	outputTokens := make([]int, 0, req.MaxTokens)
+	stopReason := "max_tokens"
+
+	for i := 0; i < req.MaxTokens; i++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Forward pass through all layers
+		logits, err := e.forwardAllLayers(ctx, hidden, len(inputTokens)+i, seqID)
+		if err != nil {
+			return nil, fmt.Errorf("forward pass failed at step %d: %w", i, err)
+		}
+
+		// Debug: check logits
+		var maxLogit, minLogit float32 = logits[0], logits[0]
+		var maxIdx int
+		for j, l := range logits {
+			if l > maxLogit {
+				maxLogit = l
+				maxIdx = j
+			}
+			if l < minLogit {
+				minLogit = l
+			}
+		}
+		fmt.Printf("[DEBUG] Step %d: logits range [%.4f, %.4f], argmax=%d\n", i, minLogit, maxLogit, maxIdx)
+
+		// Sample next token
+		nextToken := e.sampler.Sample(logits, req.Temperature, req.TopP)
+		outputTokens = append(outputTokens, nextToken)
+		fmt.Printf("[DEBUG] Step %d: sampled token %d\n", i, nextToken)
+
+		// Check for EOS
+		if nextToken == e.tokenizer.EOSToken() {
+			stopReason = "eos"
+			break
+		}
+
+		// Check for stop tokens
+		for _, stop := range req.StopTokens {
+			if nextToken == stop {
+				stopReason = "stop_token"
+				break
+			}
+		}
+		if stopReason == "stop_token" {
+			break
+		}
+
+		// Get embedding for next token
+		hidden, err = e.embedToken(nextToken)
+		if err != nil {
+			return nil, fmt.Errorf("embed token failed: %w", err)
+		}
+	}
+
+	// Decode output tokens to text
+	outputText, err := e.tokenizer.Decode(outputTokens)
+	if err != nil {
+		return nil, fmt.Errorf("decoding failed: %w", err)
+	}
+
+	return &GenerateResponse{
+		Text:       outputText,
+		TokenCount: len(outputTokens),
+		StopReason: stopReason,
+	}, nil
+}
+
+// prefill processes all input tokens through the model.
+func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byte, error) {
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("empty input tokens")
+	}
+
+	// Get embeddings for all input tokens
+	var hidden []byte
+	for i, token := range tokens {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Embed token
+		tokenHidden, err := e.embedToken(token)
+		if err != nil {
+			return nil, fmt.Errorf("embed token %d failed: %w", i, err)
+		}
+
+		// Forward through all layers at this position
+		hidden, err = e.forwardAllLayersHidden(ctx, tokenHidden, i, seqID)
+		if err != nil {
+			return nil, fmt.Errorf("forward at position %d failed: %w", i, err)
+		}
+	}
+
+	return hidden, nil
+}
+
+// forwardAllLayers runs the hidden state through all layers and returns logits.
+func (e *Engine) forwardAllLayers(ctx context.Context, hidden []byte, position int, seqID uint64) ([]float32, error) {
+	// Forward through transformer layers
+	output, err := e.forwardAllLayersHidden(ctx, hidden, position, seqID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply LM head to get logits
+	logits, err := e.applyLMHead(output)
+	if err != nil {
+		return nil, err
+	}
+
+	return logits, nil
+}
+
+// forwardAllLayersHidden forwards hidden state through all transformer layers.
+func (e *Engine) forwardAllLayersHidden(ctx context.Context, hidden []byte, position int, seqID uint64) ([]byte, error) {
+	current := hidden
+
+	for layerID := 0; layerID < e.config.NumLayers; layerID++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Check if this layer needs prefetch (cross-peer transition)
+		if e.prefetch != nil && e.prefetch.NeedsPrefetch(layerID) {
+			// Issue prefetch request for activation transfer
+			peerID, _ := e.prefetch.GetNextPeer(layerID)
+			e.prefetch.RequestPrefetch(scheduler.PrefetchRequest{
+				LayerID:  layerID + 1,
+				PeerID:   peerID,
+				SeqID:    seqID,
+				Priority: 1,
+			}, nil)
+		}
+
+		// Execute layer forward pass
+		output, k, v, err := e.forwardLayer(ctx, layerID, current, position)
+		if err != nil {
+			return nil, fmt.Errorf("layer %d forward failed: %w", layerID, err)
+		}
+
+		// Update KV cache
+		if cache, ok := e.kvCaches.GetCache(layerID); ok && cache.IsLocal() {
+			if err := cache.Update(ctx, k, v, position); err != nil {
+				return nil, fmt.Errorf("kv cache update failed for layer %d: %w", layerID, err)
+			}
+		}
+
+		current = output
+	}
+
+	return current, nil
+}
+
+// forwardLayer executes a single layer forward pass.
+func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, []byte, []byte, error) {
+	// Debug: check input for NaN
+	if layerID == 0 {
+		hasNaN := false
+		for i := 0; i < len(hidden) && i < 100; i += 2 {
+			val := fp16ToFloat32Debug(hidden[i : i+2])
+			if val != val { // NaN check
+				hasNaN = true
+				break
+			}
+		}
+		if hasNaN {
+			fmt.Printf("[DEBUG] Layer %d input has NaN at position %d\n", layerID, position)
+		}
+	}
+
+	// Check if this is a local or remote layer
+	var peerID string
+	for _, a := range e.assignments {
+		if a.LayerID == layerID {
+			peerID = a.PeerID
+			break
+		}
+	}
+
+	if peerID == e.localPeerID {
+		// Local execution
+		if e.layerExecutor != nil {
+			output, k, v, err := e.layerExecutor.Forward(ctx, layerID, hidden, position)
+			// Debug: check output for NaN
+			if layerID == 0 && err == nil {
+				hasNaN := false
+				for i := 0; i < len(output) && i < 100; i += 2 {
+					val := fp16ToFloat32Debug(output[i : i+2])
+					if val != val { // NaN check
+						hasNaN = true
+						break
+					}
+				}
+				if hasNaN {
+					fmt.Printf("[DEBUG] Layer %d output has NaN at position %d\n", layerID, position)
+				}
+			}
+			return output, k, v, err
+		}
+		// Mock local execution for testing
+		return hidden, make([]byte, e.config.NumKVHeads*e.config.HeadDim*2), make([]byte, e.config.NumKVHeads*e.config.HeadDim*2), nil
+	}
+
+	// Remote execution - send activation to peer and wait for result
+	if e.router == nil {
+		return nil, nil, nil, fmt.Errorf("router not set for remote execution")
+	}
+
+	seqID := atomic.LoadUint64(&e.seqCounter)
+	if err := e.router.RouteActivation(ctx, layerID, seqID, hidden); err != nil {
+		return nil, nil, nil, fmt.Errorf("route activation failed: %w", err)
+	}
+
+	// In a real implementation, we'd wait for the response
+	// For now, return the input as a passthrough
+	return hidden, nil, nil, nil
+}
+
+// embedToken looks up the embedding for a token.
+func (e *Engine) embedToken(token int) ([]byte, error) {
+	// Use GPU embeddings when available
+	if e.useGPU && e.gpuInference != nil {
+		return e.gpuInference.EmbedTokenGPU(token)
+	}
+
+	// CPU fallback
+	if e.embeddings == nil {
+		// Return mock embedding for testing
+		return make([]byte, e.config.HiddenSize*2), nil // FP16
+	}
+
+	if token < 0 || token >= e.config.VocabSize {
+		return nil, fmt.Errorf("token %d out of vocabulary range [0, %d)", token, e.config.VocabSize)
+	}
+
+	// Calculate offset into embedding matrix
+	// Embeddings are [vocabSize, hiddenSize] in FP16
+	bytesPerEmbedding := e.config.HiddenSize * 2
+	offset := token * bytesPerEmbedding
+
+	if offset+bytesPerEmbedding > len(e.embeddings) {
+		return nil, fmt.Errorf("embedding offset out of range")
+	}
+
+	return e.embeddings[offset : offset+bytesPerEmbedding], nil
+}
+
+// applyLMHead applies the output projection to get logits.
+func (e *Engine) applyLMHead(hidden []byte) ([]float32, error) {
+	// DEBUG: Print first 4 hidden values
+	log.Printf("[applyLMHead] hidden size=%d bytes, useGPU=%v, gpuInference=%v",
+		len(hidden), e.useGPU, e.gpuInference != nil)
+	if len(hidden) >= 8 {
+		var vals []float32
+		for i := 0; i < 4; i++ {
+			vals = append(vals, fp16ToFloat32Debug(hidden[i*2:i*2+2]))
+		}
+		log.Printf("[applyLMHead] First 4 FP16 vals: %.4f %.4f %.4f %.4f", vals[0], vals[1], vals[2], vals[3])
+	}
+
+	// Use GPU LM head when available
+	if e.useGPU && e.gpuInference != nil {
+		return e.gpuInference.ApplyLMHeadGPU(hidden)
+	}
+
+	// CPU fallback - mock logits for testing
+	if e.lmHead == nil {
+		logits := make([]float32, e.config.VocabSize)
+		// Set a peak at position 42 for deterministic testing
+		logits[42] = 10.0
+		return logits, nil
+	}
+
+	// CPU implementation would be matrix multiplication:
+	// logits = hidden @ lmHead
+	// For now, return mock logits (CPU inference not fully implemented)
+	logits := make([]float32, e.config.VocabSize)
+	return logits, nil
+}
+
+// Config returns the model configuration.
+func (e *Engine) Config() *types.LlamaConfig {
+	return e.config
+}
+
+// fp16ToFloat32Debug converts FP16 bytes to float32 for debugging.
+func fp16ToFloat32Debug(b []byte) float32 {
+	if len(b) < 2 {
+		return 0
+	}
+	bits := uint16(b[0]) | uint16(b[1])<<8
+	sign := (bits >> 15) & 1
+	exp := (bits >> 10) & 0x1F
+	mant := bits & 0x3FF
+
+	var f float32
+	if exp == 0 {
+		if mant == 0 {
+			f = 0
+		} else {
+			f = float32(mant) / float32(1<<10) * float32(1.0/(1<<14))
+		}
+	} else if exp == 31 {
+		if mant == 0 {
+			f = float32(1e30) // Infinity
+		} else {
+			return float32(math.NaN()) // NaN
+		}
+	} else {
+		f = (1 + float32(mant)/float32(1<<10)) * float32(uint32(1)<<uint32(exp-15+127)) / float32(1<<127)
+	}
+	if sign == 1 {
+		f = -f
+	}
+	return f
+}
+
+// KVCaches returns the KV cache manager.
+func (e *Engine) KVCaches() *KVCacheManager {
+	return e.kvCaches
+}
+
+// Assignments returns the layer assignments.
+func (e *Engine) Assignments() []scheduler.LayerAssignment {
+	return e.assignments
+}

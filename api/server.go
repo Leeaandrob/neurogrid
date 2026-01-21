@@ -1,0 +1,438 @@
+// Package api provides HTTP API handlers for the NeuroGrid inference engine.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/neurogrid/engine/pkg/inference"
+)
+
+const (
+	// Version is the API version.
+	Version = "1.0.0"
+)
+
+// ServerConfig holds server configuration.
+type ServerConfig struct {
+	Addr         string
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	ModelName    string
+	EnableCORS   bool
+}
+
+// DefaultServerConfig returns default server configuration.
+func DefaultServerConfig() ServerConfig {
+	return ServerConfig{
+		Addr:         ":8080",
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		ModelName:    "llama-7b",
+		EnableCORS:   true,
+	}
+}
+
+// Server is the HTTP API server.
+type Server struct {
+	engine     *inference.Engine
+	config     ServerConfig
+	server     *http.Server
+	mux        *http.ServeMux
+	startTime  time.Time
+	reqCounter uint64
+}
+
+// NewServer creates a new API server.
+func NewServer(engine *inference.Engine, config ServerConfig) *Server {
+	s := &Server{
+		engine:    engine,
+		config:    config,
+		mux:       http.NewServeMux(),
+		startTime: time.Now(),
+	}
+
+	s.setupRoutes()
+	return s
+}
+
+// setupRoutes configures the HTTP routes.
+func (s *Server) setupRoutes() {
+	// API endpoints
+	s.mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
+	s.mux.HandleFunc("/v1/models", s.handleListModels)
+	s.mux.HandleFunc("/v1/models/", s.handleGetModel)
+
+	// Health and status
+	s.mux.HandleFunc("/health", s.handleHealth)
+	s.mux.HandleFunc("/ready", s.handleReady)
+	s.mux.HandleFunc("/metrics", s.handleMetrics)
+
+	// Root
+	s.mux.HandleFunc("/", s.handleRoot)
+}
+
+// Start starts the HTTP server.
+func (s *Server) Start() error {
+	var handler http.Handler = s.mux
+
+	// Apply middleware
+	handler = s.loggingMiddleware(handler)
+	if s.config.EnableCORS {
+		handler = s.corsMiddleware(handler)
+	}
+	handler = s.recoveryMiddleware(handler)
+
+	s.server = &http.Server{
+		Addr:         s.config.Addr,
+		Handler:      handler,
+		ReadTimeout:  s.config.ReadTimeout,
+		WriteTimeout: s.config.WriteTimeout,
+	}
+
+	log.Printf("Starting server on %s", s.config.Addr)
+	return s.server.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the server.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.server == nil {
+		return nil
+	}
+	return s.server.Shutdown(ctx)
+}
+
+// corsMiddleware adds CORS headers.
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loggingMiddleware logs HTTP requests.
+func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		reqID := atomic.AddUint64(&s.reqCounter, 1)
+
+		// Wrap response writer to capture status
+		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+		next.ServeHTTP(rw, r)
+
+		duration := time.Since(start)
+		log.Printf("[%d] %s %s %d %v", reqID, r.Method, r.URL.Path, rw.statusCode, duration)
+	})
+}
+
+// recoveryMiddleware recovers from panics.
+func (s *Server) recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("Panic recovered: %v", err)
+				s.sendError(w, "Internal server error", "server_error", "internal_error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// responseWriter wraps http.ResponseWriter to capture status code.
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// handleRoot handles the root endpoint.
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	resp := map[string]string{
+		"name":    "NeuroGrid Inference Engine",
+		"version": Version,
+		"status":  "running",
+	}
+
+	s.sendJSON(w, resp, http.StatusOK)
+}
+
+// handleHealth handles the health check endpoint.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	resp := HealthResponse{
+		Status:    "healthy",
+		Model:     s.config.ModelName,
+		Timestamp: time.Now().Unix(),
+		Version:   Version,
+	}
+
+	s.sendJSON(w, resp, http.StatusOK)
+}
+
+// handleReady handles the readiness check endpoint.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	// Check if engine is ready
+	if s.engine == nil {
+		s.sendError(w, "Engine not initialized", "not_ready", "not_ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	resp := map[string]interface{}{
+		"ready":  true,
+		"uptime": time.Since(s.startTime).Seconds(),
+		"model":  s.config.ModelName,
+	}
+
+	s.sendJSON(w, resp, http.StatusOK)
+}
+
+// handleMetrics handles the metrics endpoint.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	resp := map[string]interface{}{
+		"requests_total": atomic.LoadUint64(&s.reqCounter),
+		"uptime_seconds": time.Since(s.startTime).Seconds(),
+		"model":          s.config.ModelName,
+	}
+
+	s.sendJSON(w, resp, http.StatusOK)
+}
+
+// handleListModels handles GET /v1/models.
+func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.sendError(w, "Method not allowed", "invalid_request", "method_not_allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	resp := ModelsResponse{
+		Object: "list",
+		Data: []ModelInfo{
+			{
+				ID:      s.config.ModelName,
+				Object:  "model",
+				Created: s.startTime.Unix(),
+				OwnedBy: "neurogrid",
+			},
+		},
+	}
+
+	s.sendJSON(w, resp, http.StatusOK)
+}
+
+// handleGetModel handles GET /v1/models/{model_id}.
+func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.sendError(w, "Method not allowed", "invalid_request", "method_not_allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	modelID := strings.TrimPrefix(r.URL.Path, "/v1/models/")
+	if modelID == "" || modelID != s.config.ModelName {
+		s.sendError(w, "Model not found", "not_found", "model_not_found", http.StatusNotFound)
+		return
+	}
+
+	resp := ModelInfo{
+		ID:      s.config.ModelName,
+		Object:  "model",
+		Created: s.startTime.Unix(),
+		OwnedBy: "neurogrid",
+	}
+
+	s.sendJSON(w, resp, http.StatusOK)
+}
+
+// handleChatCompletions handles POST /v1/chat/completions.
+func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		s.sendError(w, "Method not allowed", "invalid_request", "method_not_allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse request
+	var req ChatCompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.sendError(w, "Invalid JSON: "+err.Error(), "invalid_request", "invalid_json", http.StatusBadRequest)
+		return
+	}
+
+	// Validate request
+	if len(req.Messages) == 0 {
+		s.sendError(w, "Messages array is required", "invalid_request", "missing_messages", http.StatusBadRequest)
+		return
+	}
+
+	req.SetDefaults()
+
+	// Check for streaming
+	if req.Stream {
+		s.handleChatCompletionsStream(w, r, &req)
+		return
+	}
+
+	// Build prompt from messages
+	prompt := buildLlamaPrompt(req.Messages)
+
+	// Generate response
+	genReq := &inference.GenerateRequest{
+		Prompt:      prompt,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+	}
+
+	ctx := r.Context()
+	genResp, err := s.engine.Generate(ctx, genReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			s.sendError(w, "Request cancelled", "cancelled", "cancelled", http.StatusGatewayTimeout)
+			return
+		}
+		s.sendError(w, "Generation failed: "+err.Error(), "server_error", "generation_failed", http.StatusInternalServerError)
+		return
+	}
+
+	// Build response
+	resp := NewChatCompletionResponse(s.config.ModelName, genResp.Text, genResp.StopReason)
+
+	s.sendJSON(w, resp, http.StatusOK)
+}
+
+// handleChatCompletionsStream handles streaming chat completions.
+func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Request, req *ChatCompletionRequest) {
+	// Create SSE writer
+	sse, err := NewSSEWriter(w)
+	if err != nil {
+		s.sendError(w, err.Error(), "server_error", "no_streaming", http.StatusInternalServerError)
+		return
+	}
+
+	// Create stream state for consistent ID/timestamp across chunks
+	streamState := NewStreamState(s.config.ModelName, time.Now().Unix())
+
+	// Build prompt
+	prompt := buildLlamaPrompt(req.Messages)
+
+	// Generate response (non-streaming for now, simulated streaming)
+	genReq := &inference.GenerateRequest{
+		Prompt:      prompt,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+	}
+
+	ctx := r.Context()
+	genResp, err := s.engine.Generate(ctx, genReq)
+	if err != nil {
+		sse.WriteError(err.Error(), "server_error")
+		return
+	}
+
+	// Send first chunk with role
+	if err := sse.WriteEvent(streamState.CreateRoleChunk()); err != nil {
+		log.Printf("Error writing role chunk: %v", err)
+		return
+	}
+
+	// Simulate streaming by sending words
+	words := strings.Fields(genResp.Text)
+	for i, word := range words {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		content := word
+		if i < len(words)-1 {
+			content += " "
+		}
+
+		if err := sse.WriteEvent(streamState.CreateContentChunk(content)); err != nil {
+			log.Printf("Error writing content chunk: %v", err)
+			return
+		}
+
+		// Small delay to simulate real streaming
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Send final chunk with finish reason
+	if err := sse.WriteEvent(streamState.CreateFinalChunk(genResp.StopReason)); err != nil {
+		log.Printf("Error writing final chunk: %v", err)
+		return
+	}
+
+	// Send [DONE] marker
+	if err := sse.Close(); err != nil {
+		log.Printf("Error closing SSE stream: %v", err)
+	}
+}
+
+// buildLlamaPrompt builds a TinyLlama-format prompt from messages.
+// TinyLlama uses ChatML-like format with special tokens.
+func buildLlamaPrompt(messages []Message) string {
+	var prompt strings.Builder
+
+	for _, msg := range messages {
+		switch msg.Role {
+		case "system":
+			prompt.WriteString("<|system|>\n")
+			prompt.WriteString(msg.Content)
+			prompt.WriteString("</s>\n")
+		case "user":
+			prompt.WriteString("<|user|>\n")
+			prompt.WriteString(msg.Content)
+			prompt.WriteString("</s>\n")
+		case "assistant":
+			prompt.WriteString("<|assistant|>\n")
+			prompt.WriteString(msg.Content)
+			prompt.WriteString("</s>\n")
+		}
+	}
+
+	// Add generation prompt for assistant response
+	prompt.WriteString("<|assistant|>\n")
+
+	return prompt.String()
+}
+
+// sendJSON sends a JSON response.
+func (s *Server) sendJSON(w http.ResponseWriter, data interface{}, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+// sendError sends an error response.
+func (s *Server) sendError(w http.ResponseWriter, message, errorType, code string, status int) {
+	resp := NewErrorResponse(message, errorType, code)
+	s.sendJSON(w, resp, status)
+}
+
+// Mux returns the server's HTTP mux for testing.
+func (s *Server) Mux() *http.ServeMux {
+	return s.mux
+}
