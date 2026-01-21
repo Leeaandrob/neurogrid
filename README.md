@@ -66,8 +66,8 @@ sudo apt-get install build-essential
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/neurogrid-engine.git
-cd neurogrid-engine
+git clone https://github.com/Leeaandrob/neurogrid.git
+cd neurogrid
 
 # Build CUDA library and Go binaries
 make build
