@@ -38,6 +38,12 @@ vendor/
 # Logs
 *.log
 
+# Internal docs (kept locally, not tracked)
+docs/archive/
+docs/brainstorming/
+docs/prps/
+docs/templates/
+
 # Temp files
 /tmp/
 *.tmp
