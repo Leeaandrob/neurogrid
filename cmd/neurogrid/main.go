@@ -15,6 +15,7 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/multiformats/go-multiaddr"
@@ -111,6 +112,9 @@ func (c *Coordinator) Start() error {
 		fullAddr := fmt.Sprintf("%s/p2p/%s", addr.String(), c.host.ID())
 		log.Printf("Listening on: %s", fullAddr)
 	}
+
+	// Subscribe to network connection events to detect incoming worker connections
+	c.host.Network().Notify(&networkNotifee{coordinator: c})
 
 	// Connect to bootstrap peers first (for WAN connections)
 	if len(c.config.BootstrapPeers) > 0 {
@@ -575,6 +579,56 @@ func (c *Coordinator) GetStats() map[string]interface{} {
 type coordinatorNotifee struct {
 	coordinator *Coordinator
 }
+
+// networkNotifee handles network connection events
+type networkNotifee struct {
+	coordinator *Coordinator
+}
+
+// Connected is called when a peer connects
+func (n *networkNotifee) Connected(net network.Network, conn network.Conn) {
+	peerID := conn.RemotePeer()
+
+	// Don't add self
+	if peerID == n.coordinator.host.ID() {
+		return
+	}
+
+	// Check if already in peers list
+	n.coordinator.peersMu.RLock()
+	for _, p := range n.coordinator.peers {
+		if p.ID == peerID {
+			n.coordinator.peersMu.RUnlock()
+			return // Already registered
+		}
+	}
+	n.coordinator.peersMu.RUnlock()
+
+	// Add new peer
+	pi := peer.AddrInfo{
+		ID:    peerID,
+		Addrs: []multiaddr.Multiaddr{conn.RemoteMultiaddr()},
+	}
+
+	n.coordinator.peersMu.Lock()
+	n.coordinator.peers = append(n.coordinator.peers, pi)
+	peerCount := len(n.coordinator.peers)
+	n.coordinator.peersMu.Unlock()
+
+	log.Printf("Worker connected: %s (total workers: %d)", peerID, peerCount)
+}
+
+// Disconnected is called when a peer disconnects
+func (n *networkNotifee) Disconnected(net network.Network, conn network.Conn) {
+	peerID := conn.RemotePeer()
+	log.Printf("Worker disconnected: %s", peerID)
+}
+
+// Listen is called when we start listening on an address (required by interface)
+func (n *networkNotifee) Listen(net network.Network, ma multiaddr.Multiaddr) {}
+
+// ListenClose is called when we stop listening on an address (required by interface)
+func (n *networkNotifee) ListenClose(net network.Network, ma multiaddr.Multiaddr) {}
 
 // HandlePeerFound is called when a peer is discovered
 func (n *coordinatorNotifee) HandlePeerFound(pi peer.AddrInfo) {
