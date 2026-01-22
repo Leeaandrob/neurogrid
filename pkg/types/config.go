@@ -59,6 +59,21 @@ func Llama70BConfig() *LlamaConfig {
 	}
 }
 
+// Llama3_70BConfig returns the configuration for Llama 3.3 70B Instruct.
+func Llama3_70BConfig() *LlamaConfig {
+	return &LlamaConfig{
+		HiddenSize:       8192,
+		IntermediateSize: 28672,
+		NumLayers:        80,
+		NumHeads:         64,
+		NumKVHeads:       8, // GQA: 8 KV heads for 64 query heads
+		HeadDim:          128,
+		VocabSize:        128256, // Llama 3 has larger vocab
+		MaxSeqLen:        8192,   // 8K default, supports up to 128K
+		RMSNormEps:       1e-5,   // Llama 3 uses 1e-5
+	}
+}
+
 // TinyLlamaConfig returns the configuration for TinyLlama 1.1B.
 func TinyLlamaConfig() *LlamaConfig {
 	return &LlamaConfig{

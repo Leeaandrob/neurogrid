@@ -3,6 +3,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -587,4 +588,116 @@ func TestDistributedModel_ContextCancellation(t *testing.T) {
 	if err == nil {
 		t.Error("expected error from cancelled context")
 	}
+}
+
+// TestDistributedModel_LoadToCluster_Scenario1 tests the TASK-024 acceptance criteria:
+// Scenario 1: Load model to cluster
+// Given scheduler has assigned layers to 5 peers
+// When LoadToCluster is called
+// Then embeddings and lm_head load to coordinator
+// And each layer loads to its assigned peer
+// And all layers report loaded status
+func TestDistributedModel_LoadToCluster_Scenario1(t *testing.T) {
+	// Create mock model with 10 layers (2 per peer)
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "model.safetensors")
+
+	tensors := map[string][]byte{
+		"model.embed_tokens.weight": make([]byte, 1024),
+		"lm_head.weight":            make([]byte, 1024),
+	}
+
+	// Add 10 layers of weights
+	for layer := 0; layer < 10; layer++ {
+		prefix := fmt.Sprintf("model.layers.%d.", layer)
+		tensors[prefix+"self_attn.q_proj.weight"] = make([]byte, 512)
+		tensors[prefix+"self_attn.k_proj.weight"] = make([]byte, 512)
+		tensors[prefix+"self_attn.v_proj.weight"] = make([]byte, 512)
+		tensors[prefix+"self_attn.o_proj.weight"] = make([]byte, 512)
+		tensors[prefix+"mlp.gate_proj.weight"] = make([]byte, 1024)
+		tensors[prefix+"mlp.up_proj.weight"] = make([]byte, 1024)
+		tensors[prefix+"mlp.down_proj.weight"] = make([]byte, 1024)
+		tensors[prefix+"input_layernorm.weight"] = make([]byte, 128)
+		tensors[prefix+"post_attention_layernorm.weight"] = make([]byte, 128)
+	}
+
+	err := model.CreateMockSafeTensors(path, tensors)
+	if err != nil {
+		t.Fatalf("CreateMockSafeTensors failed: %v", err)
+	}
+
+	// Create config matching our mock
+	config := types.Llama7BConfig()
+	config.NumLayers = 10
+
+	dm, err := model.NewDistributedModel(model.DistributedModelConfig{
+		ModelConfig: config,
+		ModelPath:   tmpDir,
+		LocalPeerID: "peer-0", // Coordinator is peer-0
+	})
+	if err != nil {
+		t.Fatalf("NewDistributedModel failed: %v", err)
+	}
+	defer dm.Close()
+
+	// Create scheduler
+	sched := scheduler.NewScheduler(scheduler.ModelConfig{
+		HiddenSize:       int64(config.HiddenSize),
+		IntermediateSize: int64(config.IntermediateSize),
+		NumLayers:        config.NumLayers,
+		NumKVHeads:       config.NumKVHeads,
+		HeadDim:          config.HeadDim,
+		MaxSeqLen:        config.MaxSeqLen,
+		VocabSize:        int64(config.VocabSize),
+	})
+
+	// Register 5 peers with enough VRAM for 2 layers each
+	// Each peer gets ~1GB for VRAM (enough for mock layers)
+	vramPerPeer := uint64(1024 * 1024 * 1024) // 1GB
+	for i := 0; i < 5; i++ {
+		peerID := fmt.Sprintf("peer-%d", i)
+		sched.RegisterPeer(peerID, vramPerPeer, 0)
+	}
+
+	dm.SetScheduler(sched)
+
+	// Load to cluster
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err = dm.LoadToCluster(ctx)
+	if err != nil {
+		t.Fatalf("LoadToCluster failed: %v", err)
+	}
+
+	// Verify: embeddings and lm_head load to coordinator
+	if dm.Embeddings() == nil || len(dm.Embeddings()) == 0 {
+		t.Error("embeddings not loaded to coordinator")
+	}
+	if dm.LMHead() == nil || len(dm.LMHead()) == 0 {
+		t.Error("lm_head not loaded to coordinator")
+	}
+
+	// Verify: each layer loads to its assigned peer (via status tracking)
+	for layer := 0; layer < 10; layer++ {
+		status := dm.GetLayerStatus(layer)
+		if status != model.LoadStatusLoaded {
+			t.Errorf("layer %d not loaded, status: %d", layer, status)
+		}
+	}
+
+	// Verify: all layers report loaded status
+	if !dm.AllLayersLoaded() {
+		t.Error("AllLayersLoaded returned false, expected true")
+	}
+
+	// Verify loaded count
+	if dm.LoadedCount() != 10 {
+		t.Errorf("LoadedCount: expected 10, got %d", dm.LoadedCount())
+	}
+
+	t.Logf("PASS: Scenario 1 - Load model to cluster with 5 peers")
+	t.Logf("  - Embeddings loaded: %d bytes", len(dm.Embeddings()))
+	t.Logf("  - LMHead loaded: %d bytes", len(dm.LMHead()))
+	t.Logf("  - All %d layers loaded successfully", dm.LoadedCount())
 }

@@ -2,12 +2,15 @@
 package model
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"github.com/neurogrid/engine/pkg/scheduler"
+	"github.com/neurogrid/engine/pkg/transport"
 	"github.com/neurogrid/engine/pkg/types"
 )
 
@@ -16,6 +19,7 @@ type DistributedModel struct {
 	config      *types.LlamaConfig
 	scheduler   *scheduler.Scheduler
 	loader      *WeightLoader
+	router      *transport.TransportRouter
 	localPeerID string
 
 	// Embeddings and output head (on coordinator)
@@ -83,6 +87,11 @@ func NewDistributedModel(config DistributedModelConfig) (*DistributedModel, erro
 // SetScheduler sets the scheduler for layer assignments.
 func (m *DistributedModel) SetScheduler(s *scheduler.Scheduler) {
 	m.scheduler = s
+}
+
+// SetRouter sets the transport router for remote layer transfer.
+func (m *DistributedModel) SetRouter(r *transport.TransportRouter) {
+	m.router = r
 }
 
 // LoadToCluster loads all model weights to the cluster according to assignments.
@@ -245,11 +254,122 @@ func (m *DistributedModel) sendLayerToPeer(ctx context.Context, assign scheduler
 		return fmt.Errorf("failed to load weights: %w", err)
 	}
 
-	// In a real implementation, we would serialize and send to peer
-	// For now, just verify the weights are loaded
-	_ = weights
+	// Serialize layer weights
+	data, err := SerializeLayerWeights(weights)
+	if err != nil {
+		return fmt.Errorf("failed to serialize weights: %w", err)
+	}
+
+	// Send via router if available
+	if m.router != nil {
+		// Use layer ID as seqID for weight transfer
+		err = m.router.RouteActivation(ctx, assign.LayerID, uint64(assign.LayerID), data)
+		if err != nil {
+			return fmt.Errorf("failed to send to peer %s: %w", assign.PeerID, err)
+		}
+	}
 
 	return nil
+}
+
+// SerializeLayerWeights serializes all layer weights into a single byte buffer.
+// Format: [count(uint32)][name_len(uint32)][name][data_len(uint32)][data]...
+func SerializeLayerWeights(weights *LayerWeights) ([]byte, error) {
+	var buf bytes.Buffer
+
+	// Helper to write a tensor
+	writeTensor := func(name string, data []byte) error {
+		// Write name length and name
+		nameBytes := []byte(name)
+		if err := binary.Write(&buf, binary.LittleEndian, uint32(len(nameBytes))); err != nil {
+			return err
+		}
+		buf.Write(nameBytes)
+
+		// Write data length and data
+		if err := binary.Write(&buf, binary.LittleEndian, uint32(len(data))); err != nil {
+			return err
+		}
+		buf.Write(data)
+		return nil
+	}
+
+	// Write all tensors
+	tensors := map[string][]byte{
+		"q_proj":    weights.QWeight,
+		"k_proj":    weights.KWeight,
+		"v_proj":    weights.VWeight,
+		"o_proj":    weights.OWeight,
+		"gate_proj": weights.GateWeight,
+		"up_proj":   weights.UpWeight,
+		"down_proj": weights.DownWeight,
+		"attn_norm": weights.AttnNorm,
+		"ffn_norm":  weights.FFNNorm,
+	}
+
+	// Write count
+	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(tensors))); err != nil {
+		return nil, err
+	}
+
+	for name, data := range tensors {
+		if err := writeTensor(name, data); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+// DeserializeLayerWeights deserializes a byte buffer into layer weights.
+func DeserializeLayerWeights(layerID int, data []byte) (*LayerWeights, error) {
+	buf := bytes.NewReader(data)
+
+	// Read count
+	var count uint32
+	if err := binary.Read(buf, binary.LittleEndian, &count); err != nil {
+		return nil, err
+	}
+
+	weights := &LayerWeights{LayerID: layerID}
+	tensors := make(map[string][]byte)
+
+	for i := uint32(0); i < count; i++ {
+		// Read name
+		var nameLen uint32
+		if err := binary.Read(buf, binary.LittleEndian, &nameLen); err != nil {
+			return nil, err
+		}
+		nameBytes := make([]byte, nameLen)
+		if _, err := buf.Read(nameBytes); err != nil {
+			return nil, err
+		}
+
+		// Read data
+		var dataLen uint32
+		if err := binary.Read(buf, binary.LittleEndian, &dataLen); err != nil {
+			return nil, err
+		}
+		tensorData := make([]byte, dataLen)
+		if _, err := buf.Read(tensorData); err != nil {
+			return nil, err
+		}
+
+		tensors[string(nameBytes)] = tensorData
+	}
+
+	// Map to struct fields
+	weights.QWeight = tensors["q_proj"]
+	weights.KWeight = tensors["k_proj"]
+	weights.VWeight = tensors["v_proj"]
+	weights.OWeight = tensors["o_proj"]
+	weights.GateWeight = tensors["gate_proj"]
+	weights.UpWeight = tensors["up_proj"]
+	weights.DownWeight = tensors["down_proj"]
+	weights.AttnNorm = tensors["attn_norm"]
+	weights.FFNNorm = tensors["ffn_norm"]
+
+	return weights, nil
 }
 
 // Embeddings returns the loaded embedding matrix.
@@ -269,17 +389,20 @@ func (m *DistributedModel) GetLayerStatus(layerID int) LoadStatus {
 	return m.layerStatus[layerID]
 }
 
-// AllLayersLoaded returns true if all layers are loaded.
+// AllLayersLoaded returns true if all transformer layers are loaded.
+// This only checks layers 0 to totalLayers-1, excluding embedding (-1) and output (totalLayers).
 func (m *DistributedModel) AllLayersLoaded() bool {
 	m.statusMu.RLock()
 	defer m.statusMu.RUnlock()
 
-	for _, status := range m.layerStatus {
-		if status != LoadStatusLoaded {
+	// Check only transformer layers (0 to totalLayers-1)
+	for layerID := 0; layerID < m.totalLayers; layerID++ {
+		status, ok := m.layerStatus[layerID]
+		if !ok || status != LoadStatusLoaded {
 			return false
 		}
 	}
-	return len(m.layerStatus) > 0
+	return m.totalLayers > 0
 }
 
 // LoadedCount returns the number of loaded layers.

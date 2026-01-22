@@ -174,3 +174,21 @@ func GetHostInfo(h host.Host) peer.AddrInfo {
 		Addrs: h.Addrs(),
 	}
 }
+
+// NewTestHost creates a minimal libp2p host for testing.
+// Disables NAT traversal features that require network configuration.
+func NewTestHost(ctx context.Context, listenPort int) (host.Host, error) {
+	tcpAddr := fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", listenPort)
+
+	opts := []libp2p.Option{
+		libp2p.ListenAddrStrings(tcpAddr),
+		libp2p.DisableRelay(),
+	}
+
+	h, err := libp2p.New(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create test host: %w", err)
+	}
+
+	return h, nil
+}

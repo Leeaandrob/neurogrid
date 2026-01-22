@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/neurogrid/engine/api"
 	"github.com/neurogrid/engine/gpu/bindings"
+	"github.com/neurogrid/engine/p2p"
 	"github.com/neurogrid/engine/pkg/inference"
 	"github.com/neurogrid/engine/pkg/model"
 	"github.com/neurogrid/engine/pkg/scheduler"
@@ -37,29 +39,34 @@ const (
 
 // CoordinatorConfig holds coordinator configuration
 type CoordinatorConfig struct {
-	HTTPPort   int
-	P2PPort    int
-	GPUID      int
-	ModelPath  string
-	ModelName  string
-	MinPeers   int
-	LogLevel   string
-	EnableCORS bool
+	HTTPPort       int
+	P2PPort        int
+	GPUID          int
+	ModelPath      string
+	ModelName      string
+	MinPeers       int
+	LogLevel       string
+	EnableCORS     bool
+	BootstrapPeers []peer.AddrInfo // Direct peers to connect to (for WAN connections)
+	Role           string          // "coordinator" or "performer"
 }
 
 // Coordinator orchestrates distributed inference
 type Coordinator struct {
-	config    CoordinatorConfig
-	host      host.Host
-	ctx       context.Context
-	cancel    context.CancelFunc
-	scheduler *scheduler.Scheduler
-	router    *transport.TransportRouter
-	engine    *inference.Engine
-	server    *api.Server
-	peers     []peer.AddrInfo
-	peersMu   sync.RWMutex
-	startTime time.Time
+	config          CoordinatorConfig
+	host            host.Host
+	ctx             context.Context
+	cancel          context.CancelFunc
+	scheduler       *scheduler.Scheduler
+	router          *transport.TransportRouter
+	engine          *inference.Engine
+	server          *api.Server
+	peers           []peer.AddrInfo
+	peersMu         sync.RWMutex
+	startTime       time.Time
+	p2pProtocol     *p2p.Protocol
+	remoteExecutors map[string]*inference.RemoteLayerExecutor // Peer ID -> executor
+	modelConfig     *types.LlamaConfig
 }
 
 // NewCoordinator creates a new coordinator instance
@@ -83,27 +90,54 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	}
 
 	return &Coordinator{
-		config:    config,
-		host:      h,
-		ctx:       ctx,
-		cancel:    cancel,
-		peers:     make([]peer.AddrInfo, 0),
-		startTime: time.Now(),
+		config:          config,
+		host:            h,
+		ctx:             ctx,
+		cancel:          cancel,
+		peers:           make([]peer.AddrInfo, 0),
+		startTime:       time.Now(),
+		remoteExecutors: make(map[string]*inference.RemoteLayerExecutor),
 	}, nil
 }
 
 // Start starts the coordinator
 func (c *Coordinator) Start() error {
 	log.Println("Starting NeuroGrid coordinator...")
+	log.Printf("Role: %s", c.config.Role)
+	log.Printf("Coordinator peer ID: %s", c.host.ID())
 
-	// Setup mDNS discovery
+	// Print multiaddrs for other peers to connect
+	for _, addr := range c.host.Addrs() {
+		fullAddr := fmt.Sprintf("%s/p2p/%s", addr.String(), c.host.ID())
+		log.Printf("Listening on: %s", fullAddr)
+	}
+
+	// Connect to bootstrap peers first (for WAN connections)
+	if len(c.config.BootstrapPeers) > 0 {
+		log.Printf("Connecting to %d bootstrap peers...", len(c.config.BootstrapPeers))
+		for _, peerInfo := range c.config.BootstrapPeers {
+			log.Printf("Connecting to bootstrap peer: %s", peerInfo.ID)
+			ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
+			err := c.host.Connect(ctx, peerInfo)
+			cancel()
+			if err != nil {
+				log.Printf("Warning: Failed to connect to bootstrap peer %s: %v", peerInfo.ID, err)
+			} else {
+				log.Printf("Connected to bootstrap peer: %s", peerInfo.ID)
+				c.peersMu.Lock()
+				c.peers = append(c.peers, peerInfo)
+				c.peersMu.Unlock()
+			}
+		}
+	}
+
+	// Setup mDNS discovery (for LAN connections)
 	notifee := &coordinatorNotifee{coordinator: c}
 	mdnsService := mdns.NewMdnsService(c.host, ServiceTag, notifee)
 	if err := mdnsService.Start(); err != nil {
 		return fmt.Errorf("failed to start mDNS: %w", err)
 	}
 
-	log.Printf("Coordinator peer ID: %s", c.host.ID())
 	log.Printf("Discovering workers (minimum %d required)...", c.config.MinPeers)
 
 	// Wait for minimum peers
@@ -249,11 +283,75 @@ func (c *Coordinator) initializeComponents() error {
 		LocalPeerID: c.host.ID().String(),
 	}
 
+	// Store model config for later use
+	c.modelConfig = llamaConfig
+
 	// Create inference engine
 	c.engine = inference.NewEngine(engineConfig)
 	c.engine.SetScheduler(c.scheduler)
 	c.engine.SetRouter(c.router)
 	c.engine.SetAssignments(assignments)
+
+	// Create P2P protocol for tensor transfer
+	c.p2pProtocol = p2p.NewProtocol(c.host)
+
+	// Create RemoteLayerExecutors for each remote peer
+	// Group layers by peer to determine layer ranges
+	peerLayers := make(map[string][]int) // Peer ID -> list of layer IDs
+	for _, assignment := range assignments {
+		if assignment.PeerID != c.host.ID().String() && assignment.LayerID >= 0 && assignment.LayerID < llamaConfig.NumLayers {
+			peerLayers[assignment.PeerID] = append(peerLayers[assignment.PeerID], assignment.LayerID)
+		}
+	}
+
+	// Create executor for each remote peer
+	for peerIDStr, layers := range peerLayers {
+		if len(layers) == 0 {
+			continue
+		}
+
+		// Find the peer.ID from our peers list
+		var targetPeerID peer.ID
+		c.peersMu.RLock()
+		for _, p := range c.peers {
+			if p.ID.String() == peerIDStr {
+				targetPeerID = p.ID
+				break
+			}
+		}
+		c.peersMu.RUnlock()
+
+		if targetPeerID == "" {
+			log.Printf("Warning: Cannot find peer %s in connected peers list", peerIDStr)
+			continue
+		}
+
+		// Determine layer range (min, max)
+		startLayer, endLayer := layers[0], layers[0]
+		for _, l := range layers {
+			if l < startLayer {
+				startLayer = l
+			}
+			if l > endLayer {
+				endLayer = l
+			}
+		}
+
+		// Create RemoteLayerExecutor
+		remoteExec := inference.NewRemoteLayerExecutor(inference.RemoteLayerExecutorConfig{
+			Host:         c.host,
+			TargetPeerID: targetPeerID,
+			StartLayerID: startLayer,
+			EndLayerID:   endLayer,
+			Config:       llamaConfig,
+			Timeout:      60 * time.Second,
+		})
+
+		c.remoteExecutors[peerIDStr] = remoteExec
+		c.engine.RegisterRemoteExecutor(peerIDStr, remoteExec)
+
+		log.Printf("Created RemoteLayerExecutor for peer %s: layers %d-%d", peerIDStr, startLayer, endLayer)
+	}
 
 	// Load tokenizer from model directory
 	tokenizer, err := model.NewSentencePieceTokenizer(c.config.ModelPath)
@@ -296,10 +394,113 @@ func (c *Coordinator) initializeComponents() error {
 		}
 
 		log.Printf("Model weights loaded successfully")
+
+		// Distribute weights to remote peers
+		if len(peerLayers) > 0 {
+			log.Printf("Distributing weights to %d remote peers...", len(peerLayers))
+			if err := c.distributeWeightsToRemotePeers(weightLoader, assignments); err != nil {
+				log.Printf("Warning: Weight distribution failed: %v", err)
+				log.Printf("Remote peers will need to load weights locally")
+			} else {
+				log.Printf("Weight distribution complete")
+			}
+		}
 	}
 
 	log.Printf("Inference engine initialized with %d peers", len(c.peers)+1)
 	return nil
+}
+
+// distributeWeightsToRemotePeers sends layer weights to remote peers via P2P.
+func (c *Coordinator) distributeWeightsToRemotePeers(weightLoader *model.WeightLoader, assignments []scheduler.LayerAssignment) error {
+	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Minute)
+	defer cancel()
+
+	// Group assignments by peer
+	peerAssignments := make(map[string][]scheduler.LayerAssignment)
+	for _, a := range assignments {
+		if a.PeerID != c.host.ID().String() && a.LayerID >= 0 && a.LayerID < c.modelConfig.NumLayers {
+			peerAssignments[a.PeerID] = append(peerAssignments[a.PeerID], a)
+		}
+	}
+
+	// Send weights to each peer
+	for peerIDStr, layerAssignments := range peerAssignments {
+		// Find peer.ID
+		var targetPeerID peer.ID
+		c.peersMu.RLock()
+		for _, p := range c.peers {
+			if p.ID.String() == peerIDStr {
+				targetPeerID = p.ID
+				break
+			}
+		}
+		c.peersMu.RUnlock()
+
+		if targetPeerID == "" {
+			log.Printf("Warning: Skipping weight distribution to unknown peer %s", peerIDStr)
+			continue
+		}
+
+		log.Printf("Sending %d layer weights to peer %s...", len(layerAssignments), peerIDStr)
+
+		for _, a := range layerAssignments {
+			// Load layer weights
+			weights, err := weightLoader.LoadLayerWeights(a.LayerID)
+			if err != nil {
+				log.Printf("Warning: Failed to load weights for layer %d: %v", a.LayerID, err)
+				continue
+			}
+
+			// Serialize weights
+			data, err := model.SerializeLayerWeights(weights)
+			if err != nil {
+				log.Printf("Warning: Failed to serialize weights for layer %d: %v", a.LayerID, err)
+				continue
+			}
+
+			// Send via P2P protocol
+			err = c.p2pProtocol.SendWeights(ctx, targetPeerID, a.LayerID, data)
+			if err != nil {
+				log.Printf("Warning: Failed to send weights for layer %d to peer %s: %v", a.LayerID, peerIDStr, err)
+				continue
+			}
+
+			log.Printf("  Layer %d: %.2f MB sent", a.LayerID, float64(len(data))/(1024*1024))
+		}
+	}
+
+	return nil
+}
+
+// GetClusterInfo implements api.ClusterInfoProvider
+func (c *Coordinator) GetClusterInfo() api.ClusterInfo {
+	c.peersMu.RLock()
+	numPeers := len(c.peers)
+	c.peersMu.RUnlock()
+
+	// Get layer assignments from router
+	layerAssignments := make(map[int]string)
+	if c.router != nil {
+		layerAssignments = c.router.GetAllLayerAssignments()
+	}
+
+	// Get total and loaded layers
+	totalLayers := 0
+	loadedLayers := 0
+	if c.modelConfig != nil {
+		totalLayers = c.modelConfig.NumLayers
+		loadedLayers = totalLayers // Assume all loaded for now
+	}
+
+	return api.ClusterInfo{
+		PeerID:           c.host.ID().String(),
+		ConnectedPeers:   numPeers,
+		LayerAssignments: layerAssignments,
+		MemoryUsage:      make(map[string]uint64), // TODO: implement
+		TotalLayers:      totalLayers,
+		LoadedLayers:     loadedLayers,
+	}
 }
 
 // startHTTPServer starts the HTTP API server
@@ -313,6 +514,9 @@ func (c *Coordinator) startHTTPServer() error {
 	}
 
 	c.server = api.NewServer(c.engine, serverConfig)
+
+	// Set cluster info provider
+	c.server.SetClusterInfoProvider(c)
 
 	// Start server in goroutine
 	go func() {
@@ -397,6 +601,8 @@ func getModelConfig(modelName string) scheduler.ModelConfig {
 		return scheduler.DefaultLlama7BConfig()
 	case "llama-13b":
 		return scheduler.DefaultLlama13BConfig()
+	case "llama-70b", "llama3-70b", "llama-3.3-70b":
+		return scheduler.DefaultLlama3_70BConfig()
 	case "tinyllama", "tinyllama-1.1b":
 		return scheduler.DefaultTinyLlamaConfig()
 	default:
@@ -416,29 +622,58 @@ func main() {
 	minPeers := flag.Int("min-peers", 0, "Minimum number of workers to wait for (0 = local only)")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	enableCORS := flag.Bool("cors", true, "Enable CORS headers")
+	bootstrapStr := flag.String("bootstrap", "", "Bootstrap peer multiaddr (e.g., /ip4/192.168.1.100/tcp/9000/p2p/12D3KooW...)")
+	role := flag.String("role", "coordinator", "Node role: coordinator (orchestrates inference) or performer (executes layers)")
 	flag.Parse()
+
+	// Parse bootstrap peers
+	var bootstrapPeers []peer.AddrInfo
+	if *bootstrapStr != "" {
+		for _, addrStr := range strings.Split(*bootstrapStr, ",") {
+			addrStr = strings.TrimSpace(addrStr)
+			if addrStr == "" {
+				continue
+			}
+			maddr, err := multiaddr.NewMultiaddr(addrStr)
+			if err != nil {
+				log.Fatalf("Invalid bootstrap multiaddr %q: %v", addrStr, err)
+			}
+			peerInfo, err := peer.AddrInfoFromP2pAddr(maddr)
+			if err != nil {
+				log.Fatalf("Failed to parse peer info from %q: %v", addrStr, err)
+			}
+			bootstrapPeers = append(bootstrapPeers, *peerInfo)
+			log.Printf("Bootstrap peer: %s", peerInfo.ID)
+		}
+	}
 
 	// Create coordinator config
 	config := CoordinatorConfig{
-		HTTPPort:   *httpPort,
-		P2PPort:    *p2pPort,
-		GPUID:      *gpuID,
-		ModelPath:  *modelPath,
-		ModelName:  *modelName,
-		MinPeers:   *minPeers,
-		LogLevel:   *logLevel,
-		EnableCORS: *enableCORS,
+		HTTPPort:       *httpPort,
+		P2PPort:        *p2pPort,
+		GPUID:          *gpuID,
+		ModelPath:      *modelPath,
+		ModelName:      *modelName,
+		MinPeers:       *minPeers,
+		LogLevel:       *logLevel,
+		EnableCORS:     *enableCORS,
+		BootstrapPeers: bootstrapPeers,
+		Role:           *role,
 	}
 
 	log.Println("================================================")
 	log.Println("    NeuroGrid Distributed Inference Engine      ")
 	log.Println("================================================")
+	log.Printf("Role: %s", config.Role)
 	log.Printf("Model: %s", config.ModelName)
 	log.Printf("HTTP Port: %d", config.HTTPPort)
 	log.Printf("P2P Port: %d", config.P2PPort)
 	log.Printf("GPU: %d", config.GPUID)
 	if config.ModelPath != "" {
 		log.Printf("Model Path: %s", config.ModelPath)
+	}
+	if len(config.BootstrapPeers) > 0 {
+		log.Printf("Bootstrap Peers: %d", len(config.BootstrapPeers))
 	}
 
 	// Create and start coordinator

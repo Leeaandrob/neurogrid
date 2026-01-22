@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/neurogrid/engine/pkg/model"
 	"github.com/neurogrid/engine/pkg/scheduler"
 	"github.com/neurogrid/engine/pkg/transport"
 	"github.com/neurogrid/engine/pkg/types"
@@ -82,6 +83,9 @@ type Engine struct {
 	seqCounter   uint64
 	layerExecutor LayerExecutor
 
+	// Remote layer executors for distributed inference
+	remoteExecutors map[string]LayerExecutor // Peer ID -> executor for that peer's layers
+
 	// Embedding and output head (stored as raw bytes for CPU fallback)
 	embeddings []byte // Token embedding matrix [vocabSize, hiddenSize] in FP16
 	lmHead     []byte // Output projection [hiddenSize, vocabSize] in FP16
@@ -96,11 +100,27 @@ type Engine struct {
 // NewEngine creates a new distributed inference engine.
 func NewEngine(config EngineConfig) *Engine {
 	return &Engine{
-		config:      config.ModelConfig,
-		kvCaches:    NewKVCacheManager(),
-		sampler:     NewSampler(42), // Default seed
-		localPeerID: config.LocalPeerID,
+		config:          config.ModelConfig,
+		kvCaches:        NewKVCacheManager(),
+		sampler:         NewSampler(42), // Default seed
+		localPeerID:     config.LocalPeerID,
+		remoteExecutors: make(map[string]LayerExecutor),
 	}
+}
+
+// RegisterRemoteExecutor registers a remote layer executor for a specific peer.
+// The executor will be used for all layers assigned to that peer.
+func (e *Engine) RegisterRemoteExecutor(peerID string, exec LayerExecutor) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.remoteExecutors[peerID] = exec
+}
+
+// UnregisterRemoteExecutor removes a remote layer executor for a peer.
+func (e *Engine) UnregisterRemoteExecutor(peerID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.remoteExecutors, peerID)
 }
 
 // SetScheduler sets the layer scheduler.
@@ -158,6 +178,102 @@ func (e *Engine) LoadLMHead(lmHead []byte) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.lmHead = lmHead
+}
+
+// LoadModel loads a model from the specified path using the model loader.
+// It loads embeddings, LM head, and validates weight shapes against config.
+// For distributed inference, use LoadModelDistributed instead.
+func (e *Engine) LoadModel(ctx context.Context, modelPath string, useMmap bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.config == nil {
+		return fmt.Errorf("model config not set")
+	}
+
+	// Create loader based on strategy
+	loader, err := model.NewLoader(modelPath, useMmap)
+	if err != nil {
+		return fmt.Errorf("failed to create model loader: %w", err)
+	}
+	defer loader.Close()
+
+	// Validate model layer count matches config
+	numLayers := loader.CountLayers()
+	if numLayers != e.config.NumLayers {
+		log.Printf("[LoadModel] Warning: model has %d layers, config expects %d", numLayers, e.config.NumLayers)
+	}
+
+	// Load embeddings
+	embData, embInfo, err := loader.LoadTensor("model.embed_tokens.weight")
+	if err != nil {
+		return fmt.Errorf("failed to load embeddings: %w", err)
+	}
+	e.embeddings = embData
+	log.Printf("[LoadModel] Loaded embeddings: shape=%v, dtype=%s, size=%d bytes",
+		embInfo.Shape, embInfo.Dtype, len(embData))
+
+	// Load LM head (may be tied to embeddings)
+	lmHeadData, lmHeadInfo, err := loader.LoadTensor("lm_head.weight")
+	if err != nil {
+		// Fall back to tied embeddings (common in Llama)
+		log.Printf("[LoadModel] lm_head.weight not found, using tied embeddings")
+		lmHeadData = embData
+		lmHeadInfo = embInfo
+	}
+	e.lmHead = lmHeadData
+	log.Printf("[LoadModel] Loaded LM head: shape=%v, dtype=%s, size=%d bytes",
+		lmHeadInfo.Shape, lmHeadInfo.Dtype, len(lmHeadData))
+
+	// Validate shapes if we have a WeightLoader
+	if wl, ok := loader.(*model.WeightLoader); ok {
+		if err := wl.ValidateShapes(e.config); err != nil {
+			log.Printf("[LoadModel] Warning: shape validation issues: %v", err)
+		}
+	}
+
+	log.Printf("[LoadModel] Model loaded successfully from %s", modelPath)
+	return nil
+}
+
+// LoadModelDistributed loads a model for distributed inference using the scheduler.
+// It loads embeddings and LM head locally, and prepares layer weights for distribution.
+func (e *Engine) LoadModelDistributed(ctx context.Context, modelPath string) (*model.DistributedModel, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.config == nil {
+		return nil, fmt.Errorf("model config not set")
+	}
+	if e.scheduler == nil {
+		return nil, fmt.Errorf("scheduler not set")
+	}
+
+	// Create distributed model
+	dm, err := model.NewDistributedModel(model.DistributedModelConfig{
+		ModelConfig: e.config,
+		ModelPath:   modelPath,
+		LocalPeerID: e.localPeerID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create distributed model: %w", err)
+	}
+
+	// Set the scheduler
+	dm.SetScheduler(e.scheduler)
+
+	// Load to cluster
+	if err := dm.LoadToCluster(ctx); err != nil {
+		dm.Close()
+		return nil, fmt.Errorf("failed to load to cluster: %w", err)
+	}
+
+	// Store embeddings and LM head in engine
+	e.embeddings = dm.Embeddings()
+	e.lmHead = dm.LMHead()
+
+	log.Printf("[LoadModelDistributed] Model loaded for distributed inference from %s", modelPath)
+	return dm, nil
 }
 
 // InitializeKVCaches creates KV caches for all layers based on assignments.
@@ -544,9 +660,23 @@ func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, p
 		return hidden, make([]byte, e.config.NumKVHeads*e.config.HeadDim*2), make([]byte, e.config.NumKVHeads*e.config.HeadDim*2), nil
 	}
 
-	// Remote execution - send activation to peer and wait for result
+	// Remote execution - use registered remote executor for this peer
+	e.mu.RLock()
+	remoteExec, hasRemoteExec := e.remoteExecutors[peerID]
+	e.mu.RUnlock()
+
+	if hasRemoteExec {
+		// Use the remote layer executor to forward to peer
+		output, k, v, err := remoteExec.Forward(ctx, layerID, hidden, position)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("remote layer %d forward failed (peer %s): %w", layerID, peerID, err)
+		}
+		return output, k, v, nil
+	}
+
+	// Fallback to router-based activation transfer (legacy path)
 	if e.router == nil {
-		return nil, nil, nil, fmt.Errorf("router not set for remote execution")
+		return nil, nil, nil, fmt.Errorf("no remote executor or router for peer %s", peerID)
 	}
 
 	seqID := atomic.LoadUint64(&e.seqCounter)
@@ -554,8 +684,7 @@ func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, p
 		return nil, nil, nil, fmt.Errorf("route activation failed: %w", err)
 	}
 
-	// In a real implementation, we'd wait for the response
-	// For now, return the input as a passthrough
+	// Legacy path: passthrough (caller needs to handle response separately)
 	return hidden, nil, nil, nil
 }
 
@@ -666,4 +795,12 @@ func (e *Engine) KVCaches() *KVCacheManager {
 // Assignments returns the layer assignments.
 func (e *Engine) Assignments() []scheduler.LayerAssignment {
 	return e.assignments
+}
+
+// ForwardLayerPublic is a public wrapper around forwardLayer for testing purposes.
+// It executes a single layer forward pass, routing to local or remote executor as needed.
+func (e *Engine) ForwardLayerPublic(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, []byte, []byte, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.forwardLayer(ctx, layerID, hidden, position)
 }

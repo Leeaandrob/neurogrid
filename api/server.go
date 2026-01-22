@@ -41,14 +41,30 @@ func DefaultServerConfig() ServerConfig {
 	}
 }
 
+// ClusterInfoProvider provides cluster information.
+type ClusterInfoProvider interface {
+	GetClusterInfo() ClusterInfo
+}
+
+// ClusterInfo contains information about the cluster.
+type ClusterInfo struct {
+	PeerID           string            `json:"peer_id"`
+	ConnectedPeers   int               `json:"connected_peers"`
+	LayerAssignments map[int]string    `json:"layer_assignments"`
+	MemoryUsage      map[string]uint64 `json:"memory_usage"`
+	TotalLayers      int               `json:"total_layers"`
+	LoadedLayers     int               `json:"loaded_layers"`
+}
+
 // Server is the HTTP API server.
 type Server struct {
-	engine     *inference.Engine
-	config     ServerConfig
-	server     *http.Server
-	mux        *http.ServeMux
-	startTime  time.Time
-	reqCounter uint64
+	engine          *inference.Engine
+	config          ServerConfig
+	server          *http.Server
+	mux             *http.ServeMux
+	startTime       time.Time
+	reqCounter      uint64
+	clusterProvider ClusterInfoProvider
 }
 
 // NewServer creates a new API server.
@@ -64,12 +80,20 @@ func NewServer(engine *inference.Engine, config ServerConfig) *Server {
 	return s
 }
 
+// SetClusterInfoProvider sets the cluster info provider.
+func (s *Server) SetClusterInfoProvider(provider ClusterInfoProvider) {
+	s.clusterProvider = provider
+}
+
 // setupRoutes configures the HTTP routes.
 func (s *Server) setupRoutes() {
 	// API endpoints
 	s.mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 	s.mux.HandleFunc("/v1/models", s.handleListModels)
 	s.mux.HandleFunc("/v1/models/", s.handleGetModel)
+
+	// Cluster endpoints
+	s.mux.HandleFunc("/v1/cluster/info", s.handleClusterInfo)
 
 	// Health and status
 	s.mux.HandleFunc("/health", s.handleHealth)
@@ -231,6 +255,30 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	s.sendJSON(w, resp, http.StatusOK)
 }
 
+// handleClusterInfo handles GET /v1/cluster/info.
+func (s *Server) handleClusterInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.sendError(w, "Method not allowed", "invalid_request", "method_not_allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.clusterProvider == nil {
+		// Return empty cluster info if no provider
+		resp := ClusterInfo{
+			PeerID:           "",
+			ConnectedPeers:   0,
+			LayerAssignments: make(map[int]string),
+			MemoryUsage:      make(map[string]uint64),
+			TotalLayers:      0,
+			LoadedLayers:     0,
+		}
+		s.sendJSON(w, resp, http.StatusOK)
+		return
+	}
+
+	info := s.clusterProvider.GetClusterInfo()
+	s.sendJSON(w, info, http.StatusOK)
+}
 
 // handleListModels handles GET /v1/models.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {

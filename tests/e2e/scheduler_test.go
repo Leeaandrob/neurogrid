@@ -321,6 +321,100 @@ func TestScheduler_ComputeAssignments_InsufficientVRAM(t *testing.T) {
 	t.Log("PASS: Insufficient VRAM returns error")
 }
 
+// TestScheduler_ComputeAssignments_HeterogeneousVRAM validates Scenario 1 from TASK-017
+// Given 5 GPUs with VRAM: 24GB, 8GB, 8GB, 8GB, 8GB
+// And 32 layers each requiring ~250MB
+// When ComputeAssignments is called
+// Then all 32 layers are assigned
+// And larger GPU gets more layers
+// And no GPU exceeds its VRAM limit
+func TestScheduler_ComputeAssignments_HeterogeneousVRAM(t *testing.T) {
+	config := scheduler.DefaultLlama7BConfig()
+	config.NumLayers = 32
+	sched := scheduler.NewScheduler(config)
+
+	// Register 5 GPUs with heterogeneous VRAM: 24GB, 8GB, 8GB, 8GB, 8GB
+	sched.RegisterPeer("gpu-0", 24*1024*1024*1024, 0) // 24GB
+	sched.RegisterPeer("gpu-1", 8*1024*1024*1024, 0)  // 8GB
+	sched.RegisterPeer("gpu-2", 8*1024*1024*1024, 0)  // 8GB
+	sched.RegisterPeer("gpu-3", 8*1024*1024*1024, 0)  // 8GB
+	sched.RegisterPeer("gpu-4", 8*1024*1024*1024, 0)  // 8GB
+
+	assignments, err := sched.ComputeAssignments()
+	if err != nil {
+		t.Fatalf("ComputeAssignments failed: %v", err)
+	}
+
+	// Should have embedding + 32 layers + output = 34 assignments
+	expectedAssignments := 34
+	if len(assignments) != expectedAssignments {
+		t.Errorf("Expected %d assignments, got %d", expectedAssignments, len(assignments))
+	}
+
+	// Count layers per peer and total memory per peer
+	peerCounts := make(map[string]int)
+	peerMemory := make(map[string]uint64)
+	for _, a := range assignments {
+		peerCounts[a.PeerID]++
+		peerMemory[a.PeerID] += a.MemoryNeeded
+	}
+
+	// Validate: gpu-0 (24GB) should have more layers than any 8GB GPU
+	for peerID, count := range peerCounts {
+		if peerID == "gpu-0" {
+			continue
+		}
+		if peerCounts["gpu-0"] < count {
+			t.Errorf("gpu-0 (24GB) should have more layers than %s (8GB): gpu-0=%d, %s=%d",
+				peerID, peerCounts["gpu-0"], peerID, count)
+		}
+	}
+
+	// Validate: no GPU exceeds its VRAM limit
+	vramLimits := map[string]uint64{
+		"gpu-0": 24 * 1024 * 1024 * 1024,
+		"gpu-1": 8 * 1024 * 1024 * 1024,
+		"gpu-2": 8 * 1024 * 1024 * 1024,
+		"gpu-3": 8 * 1024 * 1024 * 1024,
+		"gpu-4": 8 * 1024 * 1024 * 1024,
+	}
+
+	for peerID, usedMemory := range peerMemory {
+		limit := vramLimits[peerID]
+		if usedMemory > limit {
+			t.Errorf("Peer %s exceeds VRAM limit: used %d MB, limit %d MB",
+				peerID, usedMemory/(1024*1024), limit/(1024*1024))
+		}
+	}
+
+	t.Logf("PASS: Scenario 1 - Heterogeneous VRAM distribution:")
+	for peerID, count := range peerCounts {
+		t.Logf("  %s: %d layers, %d MB used", peerID, count, peerMemory[peerID]/(1024*1024))
+	}
+}
+
+// TestScheduler_ComputeAssignments_InsufficientVRAM_Scenario2 validates Scenario 2 from TASK-017
+// Given 2 GPUs with 4GB each
+// And 80 layers each requiring 250MB (total 20GB needed)
+// When ComputeAssignments is called
+// Then error is returned indicating insufficient VRAM
+func TestScheduler_ComputeAssignments_InsufficientVRAM_Scenario2(t *testing.T) {
+	config := scheduler.DefaultLlama7BConfig()
+	config.NumLayers = 80 // 80 layers requiring ~250MB each = ~20GB
+	sched := scheduler.NewScheduler(config)
+
+	// Register 2 GPUs with 4GB each = 8GB total
+	sched.RegisterPeer("gpu-0", 4*1024*1024*1024, 0) // 4GB
+	sched.RegisterPeer("gpu-1", 4*1024*1024*1024, 0) // 4GB
+
+	_, err := sched.ComputeAssignments()
+	if err == nil {
+		t.Error("Expected error for insufficient VRAM (80 layers ~20GB, only 8GB available)")
+	} else {
+		t.Logf("PASS: Scenario 2 - Insufficient VRAM correctly returns error: %v", err)
+	}
+}
+
 // TestScheduler_ValidateAssignments validates assignment validation
 func TestScheduler_ValidateAssignments(t *testing.T) {
 	config := scheduler.DefaultLlama7BConfig()

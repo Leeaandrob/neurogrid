@@ -128,6 +128,107 @@ func (r *TransportRouter) RouteActivation(ctx context.Context, layerID int, seqI
 	return fmt.Errorf("transport not found for peer %s", peerID)
 }
 
+// ReceiveActivation receives activation data from any registered transport.
+// It polls all transports and returns the first activation received.
+// This is typically used by a worker waiting for incoming activations.
+func (r *TransportRouter) ReceiveActivation(ctx context.Context) (int, uint64, []byte, string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// Create channels for results
+	type recvResult struct {
+		layerID int
+		seqID   uint64
+		data    []byte
+		peerID  string
+		err     error
+	}
+
+	resultChan := make(chan recvResult, len(r.localTransports)+len(r.remoteTransports))
+
+	// Try to receive from all transports concurrently
+	var wg sync.WaitGroup
+
+	// Poll local transports
+	for deviceID, transport := range r.localTransports {
+		wg.Add(1)
+		go func(devID int, t Transport) {
+			defer wg.Done()
+			layerID, seqID, data, err := t.RecvActivation(ctx)
+			if err == nil {
+				resultChan <- recvResult{layerID, seqID, data, t.PeerInfo().ID, nil}
+			}
+		}(deviceID, transport)
+	}
+
+	// Poll remote transports
+	for peerID, transport := range r.remoteTransports {
+		wg.Add(1)
+		go func(pID string, t Transport) {
+			defer wg.Done()
+			layerID, seqID, data, err := t.RecvActivation(ctx)
+			if err == nil {
+				resultChan <- recvResult{layerID, seqID, data, pID, nil}
+			}
+		}(peerID, transport)
+	}
+
+	// Wait for first result or context cancellation
+	select {
+	case result := <-resultChan:
+		return result.layerID, result.seqID, result.data, result.peerID, result.err
+	case <-ctx.Done():
+		return 0, 0, nil, "", ctx.Err()
+	}
+}
+
+// UpdateLayerAssignments updates layer assignments in bulk.
+// This is typically called after the scheduler computes new assignments.
+func (r *TransportRouter) UpdateLayerAssignments(assignments map[int]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for layerID, peerID := range assignments {
+		r.layerToPeer[layerID] = peerID
+	}
+}
+
+// GetAllLayerAssignments returns a copy of all layer-to-peer assignments.
+func (r *TransportRouter) GetAllLayerAssignments() map[int]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make(map[int]string, len(r.layerToPeer))
+	for k, v := range r.layerToPeer {
+		result[k] = v
+	}
+	return result
+}
+
+// GetRegisteredPeers returns the list of registered remote peer IDs.
+func (r *TransportRouter) GetRegisteredPeers() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	peers := make([]string, 0, len(r.remoteTransports))
+	for peerID := range r.remoteTransports {
+		peers = append(peers, peerID)
+	}
+	return peers
+}
+
+// GetRegisteredDevices returns the list of registered local device IDs.
+func (r *TransportRouter) GetRegisteredDevices() []int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	devices := make([]int, 0, len(r.localTransports))
+	for deviceID := range r.localTransports {
+		devices = append(devices, deviceID)
+	}
+	return devices
+}
+
 // Close closes all registered transports.
 func (r *TransportRouter) Close() error {
 	r.mu.Lock()

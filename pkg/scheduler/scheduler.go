@@ -65,6 +65,21 @@ func DefaultTinyLlamaConfig() ModelConfig {
 	}
 }
 
+// DefaultLlama3_70BConfig returns the default configuration for Llama 3.3 70B.
+func DefaultLlama3_70BConfig() ModelConfig {
+	return ModelConfig{
+		HiddenSize:       8192,
+		IntermediateSize: 28672,
+		NumLayers:        80,
+		NumHeads:         64,
+		NumKVHeads:       8,   // GQA: 8 KV heads
+		HeadDim:          128, // 8192 / 64 heads
+		MaxSeqLen:        8192,
+		VocabSize:        128256,
+		RMSNormEps:       1e-5,
+	}
+}
+
 // LayerAssignment represents a layer-to-peer assignment.
 type LayerAssignment struct {
 	LayerID      int
