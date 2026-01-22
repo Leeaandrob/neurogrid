@@ -597,11 +597,11 @@ func (n *coordinatorNotifee) HandlePeerFound(pi peer.AddrInfo) {
 // getModelConfig returns configuration for the specified model
 func getModelConfig(modelName string) scheduler.ModelConfig {
 	switch modelName {
-	case "llama-7b":
+	case "llama-7b", "llama-2-7b":
 		return scheduler.DefaultLlama7BConfig()
-	case "llama-13b":
+	case "llama-13b", "llama-2-13b":
 		return scheduler.DefaultLlama13BConfig()
-	case "llama-70b", "llama3-70b", "llama-3.3-70b":
+	case "llama-70b", "llama-2-70b", "llama3-70b", "llama-3.3-70b":
 		return scheduler.DefaultLlama3_70BConfig()
 	case "tinyllama", "tinyllama-1.1b":
 		return scheduler.DefaultTinyLlamaConfig()
