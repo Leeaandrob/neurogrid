@@ -40,16 +40,17 @@ const (
 
 // CoordinatorConfig holds coordinator configuration
 type CoordinatorConfig struct {
-	HTTPPort       int
-	P2PPort        int
-	GPUID          int
-	ModelPath      string
-	ModelName      string
-	MinPeers       int
-	LogLevel       string
-	EnableCORS     bool
-	BootstrapPeers []peer.AddrInfo // Direct peers to connect to (for WAN connections)
-	Role           string          // "coordinator" or "performer"
+	HTTPPort           int
+	P2PPort            int
+	GPUID              int
+	ModelPath          string
+	ModelName          string
+	MinPeers           int
+	LogLevel           string
+	EnableCORS         bool
+	BootstrapPeers     []peer.AddrInfo // Direct peers to connect to (for WAN connections)
+	Role               string          // "coordinator" or "performer"
+	SkipWeightTransfer bool            // Skip sending weights to workers (they have local models)
 }
 
 // Coordinator orchestrates distributed inference
@@ -399,14 +400,18 @@ func (c *Coordinator) initializeComponents() error {
 
 		log.Printf("Model weights loaded successfully")
 
-		// Distribute weights to remote peers
+		// Distribute weights to remote peers (unless workers have local models)
 		if len(peerLayers) > 0 {
-			log.Printf("Distributing weights to %d remote peers...", len(peerLayers))
-			if err := c.distributeWeightsToRemotePeers(weightLoader, assignments); err != nil {
-				log.Printf("Warning: Weight distribution failed: %v", err)
-				log.Printf("Remote peers will need to load weights locally")
+			if c.config.SkipWeightTransfer {
+				log.Printf("Skipping weight distribution to %d remote peers (workers have local models)", len(peerLayers))
 			} else {
-				log.Printf("Weight distribution complete")
+				log.Printf("Distributing weights to %d remote peers...", len(peerLayers))
+				if err := c.distributeWeightsToRemotePeers(weightLoader, assignments); err != nil {
+					log.Printf("Warning: Weight distribution failed: %v", err)
+					log.Printf("Remote peers will need to load weights locally")
+				} else {
+					log.Printf("Weight distribution complete")
+				}
 			}
 		}
 	}
@@ -678,6 +683,7 @@ func main() {
 	enableCORS := flag.Bool("cors", true, "Enable CORS headers")
 	bootstrapStr := flag.String("bootstrap", "", "Bootstrap peer multiaddr (e.g., /ip4/192.168.1.100/tcp/9000/p2p/12D3KooW...)")
 	role := flag.String("role", "coordinator", "Node role: coordinator (orchestrates inference) or performer (executes layers)")
+	skipWeightTransfer := flag.Bool("skip-weight-transfer", false, "Skip sending weights to workers (use when workers have local models)")
 	flag.Parse()
 
 	// Parse bootstrap peers
@@ -703,16 +709,17 @@ func main() {
 
 	// Create coordinator config
 	config := CoordinatorConfig{
-		HTTPPort:       *httpPort,
-		P2PPort:        *p2pPort,
-		GPUID:          *gpuID,
-		ModelPath:      *modelPath,
-		ModelName:      *modelName,
-		MinPeers:       *minPeers,
-		LogLevel:       *logLevel,
-		EnableCORS:     *enableCORS,
-		BootstrapPeers: bootstrapPeers,
-		Role:           *role,
+		HTTPPort:           *httpPort,
+		P2PPort:            *p2pPort,
+		GPUID:              *gpuID,
+		ModelPath:          *modelPath,
+		ModelName:          *modelName,
+		MinPeers:           *minPeers,
+		LogLevel:           *logLevel,
+		EnableCORS:         *enableCORS,
+		BootstrapPeers:     bootstrapPeers,
+		Role:               *role,
+		SkipWeightTransfer: *skipWeightTransfer,
 	}
 
 	log.Println("================================================")
