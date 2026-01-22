@@ -34,7 +34,7 @@ const (
 	ServiceTag = "neurogrid-worker"
 
 	// PeerDiscoveryTimeout is the maximum time to wait for peers
-	PeerDiscoveryTimeout = 60 * time.Second
+	PeerDiscoveryTimeout = 300 * time.Second // 5 minutes for distributed setup
 )
 
 // CoordinatorConfig holds coordinator configuration
