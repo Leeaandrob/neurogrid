@@ -59,6 +59,21 @@ func Llama70BConfig() *LlamaConfig {
 	}
 }
 
+// TinyLlamaConfig returns the configuration for TinyLlama 1.1B.
+func TinyLlamaConfig() *LlamaConfig {
+	return &LlamaConfig{
+		HiddenSize:       2048,
+		IntermediateSize: 5632,
+		NumLayers:        22,
+		NumHeads:         32,
+		NumKVHeads:       4, // GQA: 4 KV heads
+		HeadDim:          64,
+		VocabSize:        32000,
+		MaxSeqLen:        2048,
+		RMSNormEps:       1e-6,
+	}
+}
+
 // KVDim returns the dimension of keys/values based on KV heads.
 func (c *LlamaConfig) KVDim() int {
 	return c.NumKVHeads * c.HeadDim

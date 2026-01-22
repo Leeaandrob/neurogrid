@@ -113,15 +113,17 @@ func TestServer_MetricsEndpoint(t *testing.T) {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
 
-	var resp map[string]interface{}
-	json.NewDecoder(w.Body).Decode(&resp)
+	// Prometheus metrics are returned as text format
+	body := w.Body.String()
 
-	if _, ok := resp["requests_total"]; !ok {
-		t.Error("expected requests_total in metrics")
+	// Check that we get Prometheus metrics format (contains TYPE declarations)
+	if !strings.Contains(body, "# TYPE") {
+		t.Error("expected Prometheus metrics format with TYPE declarations")
 	}
 
-	if _, ok := resp["uptime_seconds"]; !ok {
-		t.Error("expected uptime_seconds in metrics")
+	// Check for Go runtime metrics (always present)
+	if !strings.Contains(body, "go_goroutines") {
+		t.Error("expected go_goroutines metric in response")
 	}
 }
 
@@ -556,17 +558,15 @@ func TestServer_FullWorkflow(t *testing.T) {
 		t.Fatalf("chat completion failed: %d - %s", chatW.Code, chatW.Body.String())
 	}
 
-	// 4. Check metrics increased
+	// 4. Check metrics endpoint (Prometheus format)
 	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	metricsW := httptest.NewRecorder()
 	server.Mux().ServeHTTP(metricsW, metricsReq)
 
-	var metrics map[string]interface{}
-	json.NewDecoder(metricsW.Body).Decode(&metrics)
-
-	// Note: requests_total might vary due to test execution order
-	if metrics["requests_total"] == nil {
-		t.Error("expected requests_total in metrics")
+	metricsBody := metricsW.Body.String()
+	// Verify Prometheus text format (contains TYPE declarations)
+	if !strings.Contains(metricsBody, "# TYPE") {
+		t.Error("expected Prometheus metrics format with TYPE declarations")
 	}
 }
 

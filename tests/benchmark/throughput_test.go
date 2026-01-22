@@ -440,7 +440,10 @@ func TestThroughputMetrics(t *testing.T) {
 		}
 	}
 
-	avgLatency := totalLatency / time.Duration(len(latencies))
+	var avgLatency time.Duration
+	if len(latencies) > 0 {
+		avgLatency = totalLatency / time.Duration(len(latencies))
+	}
 
 	// Report
 	t.Logf("=== Throughput Metrics ===")

@@ -252,7 +252,7 @@ func runRequest(endpoint, model, prompt string, maxTokens int) (BenchmarkResult,
 	if resp.StatusCode != http.StatusOK {
 		result.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))
 		result.TotalLatency = totalLatency
-		return result, fmt.Errorf(result.Error)
+		return result, fmt.Errorf("%s", result.Error)
 	}
 
 	var chatResp ChatCompletionResponse
@@ -326,7 +326,7 @@ func runStreamingRequest(endpoint, model, prompt string, maxTokens int) (Benchma
 		body, _ := io.ReadAll(resp.Body)
 		result.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body))
 		result.TotalLatency = time.Since(startTime)
-		return result, fmt.Errorf(result.Error)
+		return result, fmt.Errorf("%s", result.Error)
 	}
 
 	// Read SSE stream and measure token timing

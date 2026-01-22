@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/neurogrid/engine/pkg/inference"
+	"github.com/neurogrid/engine/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -71,7 +74,9 @@ func (s *Server) setupRoutes() {
 	// Health and status
 	s.mux.HandleFunc("/health", s.handleHealth)
 	s.mux.HandleFunc("/ready", s.handleReady)
-	s.mux.HandleFunc("/metrics", s.handleMetrics)
+
+	// Prometheus metrics endpoint
+	s.mux.Handle("/metrics", promhttp.Handler())
 
 	// Root
 	s.mux.HandleFunc("/", s.handleRoot)
@@ -123,11 +128,15 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// loggingMiddleware logs HTTP requests.
+// loggingMiddleware logs HTTP requests and records metrics.
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		reqID := atomic.AddUint64(&s.reqCounter, 1)
+
+		// Track active requests
+		metrics.ActiveRequests.Inc()
+		defer metrics.ActiveRequests.Dec()
 
 		// Wrap response writer to capture status
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -136,6 +145,12 @@ func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 
 		duration := time.Since(start)
 		log.Printf("[%d] %s %s %d %v", reqID, r.Method, r.URL.Path, rw.statusCode, duration)
+
+		// Record metrics (skip /metrics endpoint to avoid recursion)
+		if r.URL.Path != "/metrics" {
+			metrics.RequestsTotal.WithLabelValues(r.Method, r.URL.Path, strconv.Itoa(rw.statusCode)).Inc()
+			metrics.RequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration.Seconds())
+		}
 	})
 }
 
@@ -161,6 +176,14 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// Flush implements http.Flusher interface.
+// This is required for SSE streaming to work through the logging middleware.
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // handleRoot handles the root endpoint.
@@ -208,16 +231,6 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	s.sendJSON(w, resp, http.StatusOK)
 }
 
-// handleMetrics handles the metrics endpoint.
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]interface{}{
-		"requests_total": atomic.LoadUint64(&s.reqCounter),
-		"uptime_seconds": time.Since(s.startTime).Seconds(),
-		"model":          s.config.ModelName,
-	}
-
-	s.sendJSON(w, resp, http.StatusOK)
-}
 
 // handleListModels handles GET /v1/models.
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
@@ -335,7 +348,7 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	// Build prompt
 	prompt := buildLlamaPrompt(req.Messages)
 
-	// Generate response (non-streaming for now, simulated streaming)
+	// Build generation request
 	genReq := &inference.GenerateRequest{
 		Prompt:      prompt,
 		MaxTokens:   req.MaxTokens,
@@ -344,11 +357,6 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	}
 
 	ctx := r.Context()
-	genResp, err := s.engine.Generate(ctx, genReq)
-	if err != nil {
-		sse.WriteError(err.Error(), "server_error")
-		return
-	}
 
 	// Send first chunk with role
 	if err := sse.WriteEvent(streamState.CreateRoleChunk()); err != nil {
@@ -356,31 +364,32 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Simulate streaming by sending words
-	words := strings.Fields(genResp.Text)
-	for i, word := range words {
-		select {
-		case <-ctx.Done():
-			return
-		default:
+	// Stream tokens as they are generated
+	var lastStopReason string
+	err = s.engine.GenerateStream(ctx, genReq, func(token inference.StreamToken) error {
+		// Send content chunk for each token
+		if token.Text != "" {
+			if err := sse.WriteEvent(streamState.CreateContentChunk(token.Text)); err != nil {
+				return err
+			}
 		}
 
-		content := word
-		if i < len(words)-1 {
-			content += " "
+		// Track stop reason for final chunk
+		if token.IsFinal {
+			lastStopReason = token.StopReason
 		}
 
-		if err := sse.WriteEvent(streamState.CreateContentChunk(content)); err != nil {
-			log.Printf("Error writing content chunk: %v", err)
-			return
-		}
+		return nil
+	})
 
-		// Small delay to simulate real streaming
-		time.Sleep(10 * time.Millisecond)
+	if err != nil {
+		log.Printf("Error during streaming generation: %v", err)
+		sse.WriteError(err.Error(), "server_error")
+		return
 	}
 
 	// Send final chunk with finish reason
-	if err := sse.WriteEvent(streamState.CreateFinalChunk(genResp.StopReason)); err != nil {
+	if err := sse.WriteEvent(streamState.CreateFinalChunk(lastStopReason)); err != nil {
 		log.Printf("Error writing final chunk: %v", err)
 		return
 	}

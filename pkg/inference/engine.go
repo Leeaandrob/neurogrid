@@ -30,6 +30,18 @@ type GenerateResponse struct {
 	StopReason string
 }
 
+// StreamToken represents a single token in a streaming response.
+type StreamToken struct {
+	Token      int
+	Text       string
+	IsFirst    bool
+	IsFinal    bool
+	StopReason string
+}
+
+// TokenCallback is called for each generated token during streaming.
+type TokenCallback func(token StreamToken) error
+
 // Tokenizer interface for encoding/decoding text.
 type Tokenizer interface {
 	Encode(text string) ([]int, error)
@@ -282,6 +294,114 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		TokenCount: len(outputTokens),
 		StopReason: stopReason,
 	}, nil
+}
+
+// GenerateStream performs streaming text generation, calling the callback for each token.
+func (e *Engine) GenerateStream(ctx context.Context, req *GenerateRequest, callback TokenCallback) error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.tokenizer == nil {
+		return fmt.Errorf("tokenizer not set")
+	}
+
+	// Tokenize input
+	inputTokens, err := e.tokenizer.Encode(req.Prompt)
+	if err != nil {
+		return fmt.Errorf("tokenization failed: %w", err)
+	}
+	log.Printf("[GenerateStream] Input tokens: %d", len(inputTokens))
+
+	// Get sequence ID for this request
+	seqID := atomic.AddUint64(&e.seqCounter, 1)
+
+	// Clear KV caches for new sequence
+	e.kvCaches.ClearAll()
+
+	// Prefill phase - process all input tokens
+	hidden, err := e.prefill(ctx, inputTokens, seqID)
+	if err != nil {
+		return fmt.Errorf("prefill failed: %w", err)
+	}
+
+	// Autoregressive decode with streaming
+	tokenCount := 0
+
+	for i := 0; i < req.MaxTokens; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Forward pass through all layers
+		logits, err := e.forwardAllLayers(ctx, hidden, len(inputTokens)+i, seqID)
+		if err != nil {
+			return fmt.Errorf("forward pass failed at step %d: %w", i, err)
+		}
+
+		// Sample next token
+		nextToken := e.sampler.Sample(logits, req.Temperature, req.TopP)
+		tokenCount++
+
+		// Decode single token to text
+		tokenText, err := e.tokenizer.Decode([]int{nextToken})
+		if err != nil {
+			tokenText = "" // Continue even if decode fails
+		}
+
+		// Determine if this is final
+		isFinal := false
+		stopReason := ""
+
+		// Check for EOS
+		if nextToken == e.tokenizer.EOSToken() {
+			isFinal = true
+			stopReason = "eos"
+		}
+
+		// Check for stop tokens
+		for _, stop := range req.StopTokens {
+			if nextToken == stop {
+				isFinal = true
+				stopReason = "stop_token"
+				break
+			}
+		}
+
+		// Check max tokens
+		if i == req.MaxTokens-1 && !isFinal {
+			isFinal = true
+			stopReason = "max_tokens"
+		}
+
+		// Send token via callback
+		streamToken := StreamToken{
+			Token:      nextToken,
+			Text:       tokenText,
+			IsFirst:    i == 0,
+			IsFinal:    isFinal,
+			StopReason: stopReason,
+		}
+
+		if err := callback(streamToken); err != nil {
+			return fmt.Errorf("callback failed: %w", err)
+		}
+
+		// Stop if final
+		if isFinal {
+			break
+		}
+
+		// Get embedding for next token
+		hidden, err = e.embedToken(nextToken)
+		if err != nil {
+			return fmt.Errorf("embed token failed: %w", err)
+		}
+	}
+
+	log.Printf("[GenerateStream] Generated %d tokens", tokenCount)
+	return nil
 }
 
 // prefill processes all input tokens through the model.
