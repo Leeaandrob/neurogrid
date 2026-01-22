@@ -233,14 +233,56 @@ func (w *Worker) loadLocalWeights() error {
 			continue
 		}
 		w.layerWeights[layerID] = weights
-		log.Printf("Loaded layer %d", layerID)
+
+		// Upload weights to GPU
+		gpuWeights, err := bindings.CreateLayerWeightsFromHost(
+			weights.QWeight,
+			weights.KWeight,
+			weights.VWeight,
+			weights.OWeight,
+			weights.GateWeight,
+			weights.UpWeight,
+			weights.DownWeight,
+			weights.AttnNorm,
+			weights.FFNNorm,
+			w.modelConfig,
+		)
+		if err != nil {
+			log.Printf("Warning: Failed to upload layer %d to GPU: %v", layerID, err)
+			continue
+		}
+		w.gpuWeights[layerID] = gpuWeights
+
+		// Initialize KV cache for this layer
+		cache := inference.NewDistributedKVCache(
+			inference.KVCacheConfig{
+				LayerID:    layerID,
+				NumKVHeads: w.modelConfig.NumKVHeads,
+				HeadDim:    w.modelConfig.HeadDim,
+				MaxSeqLen:  w.modelConfig.MaxSeqLen,
+			},
+			w.host.ID().String(),
+			w.config.GPUID,
+			true, // local
+		)
+		w.kvCaches.RegisterCache(cache)
+
+		// Update layer range
+		if w.startLayerID == -1 || layerID < w.startLayerID {
+			w.startLayerID = layerID
+		}
+		if layerID > w.endLayerID {
+			w.endLayerID = layerID
+		}
+
+		log.Printf("Loaded layer %d to GPU", layerID)
 	}
 
 	w.weightsMu.Lock()
 	w.weightsReady = true
 	w.weightsMu.Unlock()
 
-	log.Printf("Loaded %d layers from local storage", len(w.layerWeights))
+	log.Printf("Loaded %d layers from local storage to GPU", len(w.gpuWeights))
 	return nil
 }
 
