@@ -413,7 +413,8 @@ extern "C" int cuda_layer_forward(
 
     int result;
 
-    // Debug helper - check a buffer for NaN
+    // Debug helper - check a buffer for NaN (disabled for performance)
+#ifdef DEBUG_CUDA
     auto checkNaN = [](const half* d_buf, int size, const char* name) {
         half* h_buf = (half*)malloc(size * sizeof(half));
         cudaMemcpy(h_buf, d_buf, size * sizeof(half), cudaMemcpyDeviceToHost);
@@ -437,19 +438,25 @@ extern "C" int cuda_layer_forward(
 
     // Check input
     checkNaN((const half*)input, hidden_size, "INPUT");
+#endif
 
     // Save residual
     CUDA_CHECK(cudaMemcpy(residual, input, num_tokens * hidden_size * sizeof(half),
                           cudaMemcpyDeviceToDevice));
 
     // Check attn_norm weights
+#ifdef DEBUG_CUDA
     checkNaN(w->attn_norm, hidden_size, "ATTN_NORM_W");
+#endif
 
     // 1. Input RMSNorm
     result = cuda_rmsnorm(normed, input, w->attn_norm, num_tokens, hidden_size, rms_norm_eps);
+#ifdef DEBUG_CUDA
     checkNaN(normed, hidden_size, "AFTER_RMSNORM");
+#endif
     if (result != 0) goto cleanup;
 
+#ifdef DEBUG_CUDA
     // Debug: Check weight scales
     {
         float* h_scale = (float*)malloc(hidden_size * sizeof(float));
@@ -458,22 +465,29 @@ extern "C" int cuda_layer_forward(
                 h_scale[0], h_scale[1], h_scale[2], h_scale[3], h_scale[4]);
         free(h_scale);
     }
+#endif
 
     // 2. Q, K, V projections (INT8 GEMM with dequant)
     // Weights are stored as [out_dim, in_dim], need transpose_b=true
     // Q: [hidden_size, hidden_size] -> transpose to get [hidden_size, hidden_size]
     result = cuda_gemm_int8(q, normed, w->q_proj, w->q_scale, num_tokens, hidden_size, hidden_size, true);
+#ifdef DEBUG_CUDA
     checkNaN(q, hidden_size, "AFTER_Q_PROJ");
+#endif
     if (result != 0) goto cleanup;
 
     // K: [kv_dim, hidden_size] -> transpose to get [hidden_size, kv_dim]
     result = cuda_gemm_int8(k, normed, w->k_proj, w->k_scale, num_tokens, hidden_size, kv_dim, true);
+#ifdef DEBUG_CUDA
     checkNaN(k, kv_dim, "AFTER_K_PROJ");
+#endif
     if (result != 0) goto cleanup;
 
     // V: [kv_dim, hidden_size] -> transpose to get [hidden_size, kv_dim]
     result = cuda_gemm_int8(v, normed, w->v_proj, w->v_scale, num_tokens, hidden_size, kv_dim, true);
+#ifdef DEBUG_CUDA
     checkNaN(v, kv_dim, "AFTER_V_PROJ");
+#endif
     if (result != 0) goto cleanup;
 
     // 3. Reshape for attention: [batch, seq, hidden] -> [batch, seq, num_heads, head_dim]
@@ -484,11 +498,15 @@ extern "C" int cuda_layer_forward(
         // Already in correct layout for our purposes
 
         result = cuda_rope(q, q, positions, batch_size, seq_len, num_heads, head_dim);
+#ifdef DEBUG_CUDA
         checkNaN(q, hidden_size, "AFTER_Q_ROPE");
+#endif
         if (result != 0) goto cleanup;
 
         result = cuda_rope(k, k, positions, batch_size, seq_len, num_kv_heads, head_dim);
+#ifdef DEBUG_CUDA
         checkNaN(k, kv_dim, "AFTER_K_ROPE");
+#endif
         if (result != 0) goto cleanup;
     }
 
@@ -510,19 +528,25 @@ extern "C" int cuda_layer_forward(
             true  // causal
         );
     }
+#ifdef DEBUG_CUDA
     checkNaN(attn_out, hidden_size, "AFTER_ATTENTION");
+#endif
     if (result != 0) goto cleanup;
 
     // 5. Output projection
     // O: [hidden_size, hidden_size] -> transpose to get [hidden_size, hidden_size]
     result = cuda_gemm_int8(normed, attn_out, w->o_proj, w->o_scale,
                             num_tokens, hidden_size, hidden_size, true);
+#ifdef DEBUG_CUDA
     checkNaN(normed, hidden_size, "AFTER_O_PROJ");
+#endif
     if (result != 0) goto cleanup;
 
     // 6. Residual add
     result = cuda_add(normed, normed, residual, num_tokens * hidden_size);
+#ifdef DEBUG_CUDA
     checkNaN(normed, hidden_size, "AFTER_RESIDUAL1");
+#endif
     if (result != 0) goto cleanup;
 
     // Save new residual
