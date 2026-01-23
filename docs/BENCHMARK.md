@@ -107,6 +107,53 @@ This document tracks performance benchmarks for the NeuroGrid distributed infere
 
 ---
 
+### Llama 2 13B (2026-01-23)
+
+**Model Configuration:**
+- Parameters: 13B
+- Layers: 40 transformer layers
+- Hidden Size: 5120
+- Vocab Size: 32,000
+- Precision: FP16
+- VRAM Usage (Coordinator): 16.84 GB
+
+**Layer Distribution:**
+- Coordinator (RTX 4090): 20 layers (odd: 1,3,5,...,39)
+- Worker (RTX 2080 Ti): 20 layers (even: 0,2,4,...,38)
+
+**Weight Distribution:**
+- ~605 MB per layer transferred
+- Total: ~12.1 GB transferred to worker
+- Transfer time: ~120 seconds (20 layers × 6s/layer)
+
+#### Performance Metrics
+
+| Tokens | Total Time | Avg ms/token | ms/token (after 1st) | Throughput |
+|--------|------------|--------------|----------------------|------------|
+| 1      | 4.74s      | 4740ms       | -                    | 0.21 tps   |
+| 10     | 6.91s      | 691ms        | 241ms                | 1.45 tps   |
+| 20     | 10.69s     | 535ms        | 313ms                | 1.87 tps   |
+| 50     | 17.95s     | 359ms        | 270ms                | 2.78 tps   |
+
+**Key Findings:**
+- First token latency: ~4.7s (includes embedding lookup, 40-layer forward pass)
+- Sustained throughput: **270ms/token** (~3.7 tps)
+- Network overhead per layer: ~6-7ms (estimated)
+- Activation data per transfer: ~10KB (5120 × 2 bytes)
+
+**Full Model Comparison:**
+
+| Metric | TinyLlama 1.1B | Llama 2 7B | Llama 2 13B |
+|--------|----------------|------------|-------------|
+| First token | 1.56s | 3.27s | 4.74s |
+| Sustained ms/token | 91ms | 184ms | 270ms |
+| Throughput (tps) | 10-11 | ~5 | ~3.7 |
+| Layers | 22 | 32 | 40 |
+| Hidden size | 2048 | 4096 | 5120 |
+| VRAM (coord) | ~2GB | 10.24GB | 16.84GB |
+
+---
+
 ## Performance Analysis
 
 ### Bottlenecks Identified
@@ -176,6 +223,7 @@ time curl -s http://localhost:8090/v1/chat/completions \
 | 2024-01-23 | 0.1.0 | Initial benchmark with TinyLlama 1.1B |
 | 2024-01-23 | 0.1.1 | Fixed PrefetchCoordinator blocking, removed debug logging |
 | 2026-01-23 | 0.2.0 | Added Llama 2 7B benchmarks, network weight transfer working |
+| 2026-01-23 | 0.3.0 | Added Llama 2 13B benchmarks (40 layers, 16.84GB VRAM) |
 
 ---
 
