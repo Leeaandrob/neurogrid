@@ -2,7 +2,7 @@
 # CUDA + Go build system
 
 SHELL := /bin/bash
-.PHONY: all build test clean cuda install-deps lint fmt flatbuffers
+.PHONY: all binaries test clean cuda install-deps lint fmt flatbuffers
 
 # Directories
 BUILD_DIR := build
@@ -43,7 +43,7 @@ ENGINE_OBJECTS := $(ENGINE_CU_OBJECTS) $(ENGINE_CPP_OBJECTS)
 LIB_NAME := libgpu_engine.so
 
 # Default target
-all: cuda build
+all: cuda binaries
 
 # Build CUDA library only (no Go binary)
 cuda-only: $(BUILD_DIR)/$(LIB_NAME)
@@ -73,7 +73,7 @@ $(BUILD_DIR)/$(LIB_NAME): $(CUDA_OBJECTS) $(ENGINE_OBJECTS)
 cuda: $(BUILD_DIR)/$(LIB_NAME)
 
 # Build Go binaries (optional, if cmd exists)
-build: cuda
+binaries: cuda
 	@if [ -d "./cmd/test-layer" ] && [ -n "$$(ls -A ./cmd/test-layer/*.go 2>/dev/null)" ]; then \
 		CGO_ENABLED=1 \
 		CGO_CFLAGS="-I$(CUDA_INCLUDE)" \
@@ -359,7 +359,7 @@ help:
 	@echo "CUDA Targets:"
 	@echo "  all           - Build CUDA library and Go binaries"
 	@echo "  cuda          - Build CUDA shared library only"
-	@echo "  build         - Build Go binaries (requires cuda)"
+	@echo "  binaries      - Build Go binaries (requires cuda)"
 	@echo "  check-cuda    - Verify CUDA installation"
 	@echo ""
 	@echo "Model Download Targets:"

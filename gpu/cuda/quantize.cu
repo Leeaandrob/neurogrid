@@ -220,7 +220,6 @@ __global__ void quantize_weights_kernel(
     int total = K * N;
 
     if (idx < total) {
-        int k = idx / N;
         int n = idx % N;
         float val = __half2float(weights[idx]);
         float scaled = val / scales[n];
