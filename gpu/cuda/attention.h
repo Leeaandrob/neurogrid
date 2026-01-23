@@ -22,6 +22,22 @@ int cuda_basic_attention(
     bool causal
 );
 
+// Basic attention with GQA support (for prompt processing)
+// Q: [batch, num_heads, seq_len, head_dim]
+// K, V: [batch, num_kv_heads, seq_len, head_dim]
+int cuda_basic_attention_gqa(
+    void* output,
+    const void* query,
+    const void* key,
+    const void* value,
+    int batch_size,
+    int num_heads,
+    int num_kv_heads,
+    int seq_len,
+    int head_dim,
+    bool causal
+);
+
 // KV Cache management
 int cuda_kvcache_create(
     void** cache,

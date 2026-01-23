@@ -13,6 +13,7 @@ import (
 
 	"github.com/neurogrid/engine/pkg/inference"
 	"github.com/neurogrid/engine/pkg/metrics"
+	"github.com/neurogrid/engine/pkg/model"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -353,8 +354,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build prompt from messages
-	prompt := buildLlamaPrompt(req.Messages)
+	// Build prompt from messages using the model-specific chat template
+	prompt := buildPromptForModel(req.Messages, s.config.ModelName)
 
 	// Generate response
 	genReq := &inference.GenerateRequest{
@@ -393,8 +394,8 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	// Create stream state for consistent ID/timestamp across chunks
 	streamState := NewStreamState(s.config.ModelName, time.Now().Unix())
 
-	// Build prompt
-	prompt := buildLlamaPrompt(req.Messages)
+	// Build prompt using model-specific chat template
+	prompt := buildPromptForModel(req.Messages, s.config.ModelName)
 
 	// Build generation request
 	genReq := &inference.GenerateRequest{
@@ -448,32 +449,29 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-// buildLlamaPrompt builds a TinyLlama-format prompt from messages.
-// TinyLlama uses ChatML-like format with special tokens.
-func buildLlamaPrompt(messages []Message) string {
-	var prompt strings.Builder
-
-	for _, msg := range messages {
-		switch msg.Role {
-		case "system":
-			prompt.WriteString("<|system|>\n")
-			prompt.WriteString(msg.Content)
-			prompt.WriteString("</s>\n")
-		case "user":
-			prompt.WriteString("<|user|>\n")
-			prompt.WriteString(msg.Content)
-			prompt.WriteString("</s>\n")
-		case "assistant":
-			prompt.WriteString("<|assistant|>\n")
-			prompt.WriteString(msg.Content)
-			prompt.WriteString("</s>\n")
+// buildPromptForModel builds a prompt using the appropriate chat template for the model.
+// Different models use different chat formats (Llama 2, Llama 3, TinyLlama, Mistral, etc.)
+func buildPromptForModel(messages []Message, modelName string) string {
+	// Convert API messages to model messages
+	modelMessages := make([]model.Message, len(messages))
+	for i, msg := range messages {
+		modelMessages[i] = model.Message{
+			Role:    msg.Role,
+			Content: msg.Content,
 		}
 	}
 
-	// Add generation prompt for assistant response
-	prompt.WriteString("<|assistant|>\n")
+	// Get the appropriate chat template for this model
+	chatTemplate := model.ChatTemplateFactory(modelName)
 
-	return prompt.String()
+	// Format the messages using the model-specific template
+	return chatTemplate.Format(modelMessages)
+}
+
+// buildLlamaPrompt is kept for backward compatibility.
+// It delegates to buildPromptForModel with an empty model name (defaults to Llama 2).
+func buildLlamaPrompt(messages []Message) string {
+	return buildPromptForModel(messages, "")
 }
 
 // sendJSON sends a JSON response.

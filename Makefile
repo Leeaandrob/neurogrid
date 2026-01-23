@@ -204,6 +204,16 @@ download-llama13b-chat: build-download
 	@echo "Downloading Llama 2 13B Chat..."
 	$(BUILD_DIR)/download --repo llama13b-chat --output $(MODELS_DIR)/llama-13b-chat --token "$$HF_TOKEN"
 
+# Download Mistral 7B v0.3 (base model)
+download-mistral7b: build-download
+	@echo "Downloading Mistral 7B v0.3..."
+	$(BUILD_DIR)/download --repo mistral7b --output $(MODELS_DIR)/mistral-7b
+
+# Download Mistral 7B Instruct v0.3 (chat model)
+download-mistral7b-instruct: build-download
+	@echo "Downloading Mistral 7B Instruct v0.3..."
+	$(BUILD_DIR)/download --repo mistral7b-instruct --output $(MODELS_DIR)/mistral-7b-instruct
+
 # Run download tests
 test-download:
 	@echo "Running download tests..."
@@ -363,13 +373,15 @@ help:
 	@echo "  check-cuda    - Verify CUDA installation"
 	@echo ""
 	@echo "Model Download Targets:"
-	@echo "  build-download      - Build download CLI binary"
-	@echo "  download-tinyllama  - Download TinyLlama 1.1B (2.2 GB, no auth)"
-	@echo "  download-llama7b    - Download Llama 2 7B (13 GB, requires HF_TOKEN)"
-	@echo "  download-llama7b-chat - Download Llama 2 7B Chat (13 GB, requires HF_TOKEN)"
-	@echo "  download-llama13b   - Download Llama 2 13B (26 GB, requires HF_TOKEN)"
-	@echo "  download-llama13b-chat - Download Llama 2 13B Chat (26 GB, requires HF_TOKEN)"
-	@echo "  test-download       - Run download tests"
+	@echo "  build-download           - Build download CLI binary"
+	@echo "  download-tinyllama       - Download TinyLlama 1.1B (2.2 GB, no auth)"
+	@echo "  download-llama7b         - Download Llama 2 7B (13 GB, requires HF_TOKEN)"
+	@echo "  download-llama7b-chat    - Download Llama 2 7B Chat (13 GB, requires HF_TOKEN)"
+	@echo "  download-llama13b        - Download Llama 2 13B (26 GB, requires HF_TOKEN)"
+	@echo "  download-llama13b-chat   - Download Llama 2 13B Chat (26 GB, requires HF_TOKEN)"
+	@echo "  download-mistral7b       - Download Mistral 7B v0.3 (15 GB, no auth)"
+	@echo "  download-mistral7b-instruct - Download Mistral 7B Instruct v0.3 (15 GB, no auth)"
+	@echo "  test-download            - Run download tests"
 	@echo ""
 	@echo "Distributed Inference Targets:"
 	@echo "  build-worker      - Build worker binary"

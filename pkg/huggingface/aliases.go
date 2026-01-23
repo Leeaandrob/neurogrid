@@ -7,11 +7,13 @@ import (
 
 // Model aliases mapping short names to full HuggingFace repo IDs.
 var modelAliases = map[string]string{
-	"tinyllama":     "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-	"llama7b":       "meta-llama/Llama-2-7b-hf",
-	"llama7b-chat":  "meta-llama/Llama-2-7b-chat-hf",
-	"llama13b":      "meta-llama/Llama-2-13b-hf",
-	"llama13b-chat": "meta-llama/Llama-2-13b-chat-hf",
+	"tinyllama":        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+	"llama7b":          "meta-llama/Llama-2-7b-hf",
+	"llama7b-chat":     "meta-llama/Llama-2-7b-chat-hf",
+	"llama13b":         "meta-llama/Llama-2-13b-hf",
+	"llama13b-chat":    "meta-llama/Llama-2-13b-chat-hf",
+	"mistral7b":        "mistralai/Mistral-7B-v0.3",
+	"mistral7b-instruct": "mistralai/Mistral-7B-Instruct-v0.3",
 }
 
 // ResolveAlias resolves a model alias to a full HuggingFace repo ID.

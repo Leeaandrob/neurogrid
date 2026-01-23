@@ -252,20 +252,25 @@ extern "C" int cuda_mul(void* c, const void* a, const void* b, size_t num_elemen
 // Applies rotary embeddings to Q and K tensors
 // Input/Output: [batch, seq, num_heads, head_dim]
 
-__global__ void rope_kernel(
+// RoPE style constants (must match kernels.h)
+#define ROPE_STYLE_SPLIT_HALF   0  // Llama 2, TinyLlama, Mistral
+#define ROPE_STYLE_INTERLEAVED  1  // Llama 3, GPT-NeoX
+
+__global__ void rope_kernel_styled(
     half* __restrict__ output,
     const half* __restrict__ input,
     const int* __restrict__ positions,
     int batch_size,
     int seq_len,
     int num_heads,
-    int head_dim
+    int head_dim,
+    int rope_style
 ) {
     // Grid: (batch * seq * num_heads, head_dim / 2)
     int batch_seq_head = blockIdx.x;
-    int half_idx = threadIdx.x;  // 0 to head_dim/2 - 1
+    int pair_idx = threadIdx.x;  // 0 to head_dim/2 - 1
 
-    if (half_idx >= head_dim / 2) return;
+    if (pair_idx >= head_dim / 2) return;
 
     int batch = batch_seq_head / (seq_len * num_heads);
     int seq = (batch_seq_head / num_heads) % seq_len;
@@ -276,7 +281,7 @@ __global__ void rope_kernel(
 
     // Compute frequency for this dimension
     // inv_freq = 1 / (10000 ^ (2i / head_dim))
-    float inv_freq = 1.0f / powf(10000.0f, 2.0f * half_idx / float(head_dim));
+    float inv_freq = 1.0f / powf(10000.0f, 2.0f * pair_idx / float(head_dim));
     float theta = float(pos) * inv_freq;
     float cos_theta = cosf(theta);
     float sin_theta = sinf(theta);
@@ -286,9 +291,17 @@ __global__ void rope_kernel(
                seq * num_heads * head_dim +
                head * head_dim;
 
-    // Load x1 and x2 (first and second half of head_dim)
-    int idx1 = base + half_idx;
-    int idx2 = base + half_idx + head_dim / 2;
+    // Compute indices based on RoPE style
+    int idx1, idx2;
+    if (rope_style == ROPE_STYLE_INTERLEAVED) {
+        // Llama 3 style: pair adjacent elements (0,1), (2,3), (4,5)...
+        idx1 = base + pair_idx * 2;
+        idx2 = base + pair_idx * 2 + 1;
+    } else {
+        // Split-half style (default): pair first half with second half (0,64), (1,65)...
+        idx1 = base + pair_idx;
+        idx2 = base + pair_idx + head_dim / 2;
+    }
 
     float x1 = __half2float(input[idx1]);
     float x2 = __half2float(input[idx2]);
@@ -302,6 +315,41 @@ __global__ void rope_kernel(
     output[idx2] = __float2half(x2_rot);
 }
 
+// RoPE with explicit style parameter
+extern "C" int cuda_rope_styled(
+    void* output,
+    const void* input,
+    const int* positions,
+    int batch_size,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_style
+) {
+    int num_blocks = batch_size * seq_len * num_heads;
+    int block_size = head_dim / 2;
+
+    // Ensure block_size is valid
+    if (block_size > 1024) {
+        block_size = 1024;
+    }
+
+    rope_kernel_styled<<<num_blocks, block_size>>>(
+        (half*)output,
+        (const half*)input,
+        positions,
+        batch_size,
+        seq_len,
+        num_heads,
+        head_dim,
+        rope_style
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// Default RoPE (split-half style for Llama 2 / TinyLlama / Mistral compatibility)
 extern "C" int cuda_rope(
     void* output,
     const void* input,
@@ -311,27 +359,8 @@ extern "C" int cuda_rope(
     int num_heads,
     int head_dim
 ) {
-    int num_blocks = batch_size * seq_len * num_heads;
-    int block_size = head_dim / 2;
-
-    // Ensure block_size is valid
-    if (block_size > 1024) {
-        // For very large head_dim, use multiple threads per element
-        block_size = 1024;
-    }
-
-    rope_kernel<<<num_blocks, block_size>>>(
-        (half*)output,
-        (const half*)input,
-        positions,
-        batch_size,
-        seq_len,
-        num_heads,
-        head_dim
-    );
-
-    CUDA_CHECK(cudaGetLastError());
-    return 0;
+    return cuda_rope_styled(output, input, positions, batch_size, seq_len,
+                            num_heads, head_dim, ROPE_STYLE_SPLIT_HALF);
 }
 
 // ============================================================================

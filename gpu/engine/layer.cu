@@ -14,6 +14,9 @@
 #include "../cuda/attention.h"
 #include "../cuda/memory.h"
 
+// Enable debug output (disabled for clean testing)
+// #define DEBUG_CUDA 1
+
 // Error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -521,10 +524,10 @@ extern "C" int cuda_layer_forward(
             batch_size, num_heads, num_kv_heads, head_dim, position
         );
     } else {
-        // Multiple tokens or no cache - use full attention
-        result = cuda_basic_attention(
+        // Multiple tokens or no cache - use full attention with GQA support
+        result = cuda_basic_attention_gqa(
             attn_out, q, k, v,
-            batch_size, num_heads, seq_len, head_dim,
+            batch_size, num_heads, num_kv_heads, seq_len, head_dim,
             true  // causal
         );
     }

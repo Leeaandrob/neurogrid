@@ -111,13 +111,70 @@ func (t *Llama3ChatTemplate) Format(messages []Message) string {
 	return result.String()
 }
 
+// TinyLlamaChatTemplate formats messages according to TinyLlama chat format (ChatML style).
+// TinyLlama uses <|system|>, <|user|>, and <|assistant|> tags.
+type TinyLlamaChatTemplate struct{}
+
+// NewTinyLlamaChatTemplate creates a new TinyLlama chat template.
+func NewTinyLlamaChatTemplate() *TinyLlamaChatTemplate {
+	return &TinyLlamaChatTemplate{}
+}
+
+// Format formats messages according to TinyLlama ChatML format.
+//
+// Format:
+//
+//	<|system|>
+//	{system}</s>
+//	<|user|>
+//	{user}</s>
+//	<|assistant|>
+//	{assistant}</s>
+func (t *TinyLlamaChatTemplate) Format(messages []Message) string {
+	var result strings.Builder
+
+	for _, msg := range messages {
+		switch msg.Role {
+		case "system":
+			result.WriteString("<|system|>\n")
+			result.WriteString(msg.Content)
+			result.WriteString("</s>\n")
+		case "user":
+			result.WriteString("<|user|>\n")
+			result.WriteString(msg.Content)
+			result.WriteString("</s>\n")
+		case "assistant":
+			result.WriteString("<|assistant|>\n")
+			result.WriteString(msg.Content)
+			result.WriteString("</s>\n")
+		}
+	}
+
+	// Add assistant header for generation
+	result.WriteString("<|assistant|>\n")
+
+	return result.String()
+}
+
 // ChatTemplateFactory returns the appropriate chat template for a model.
 // It selects the template based on the model name or config.
+// For more advanced detection, use LoadModelConfig() and DetectChatTemplate().
 func ChatTemplateFactory(modelName string) ChatTemplate {
-	// Check for Llama 3 models
-	if strings.Contains(strings.ToLower(modelName), "llama-3") ||
-		strings.Contains(strings.ToLower(modelName), "llama3") {
+	lower := strings.ToLower(modelName)
+
+	// Check for TinyLlama models (ChatML style)
+	if strings.Contains(lower, "tinyllama") {
+		return NewTinyLlamaChatTemplate()
+	}
+
+	// Check for Llama 3 models (new header style)
+	if strings.Contains(lower, "llama-3") || strings.Contains(lower, "llama3") {
 		return NewLlama3ChatTemplate()
+	}
+
+	// Check for Mistral/Mixtral models
+	if strings.Contains(lower, "mistral") || strings.Contains(lower, "mixtral") {
+		return NewMistralChatTemplate()
 	}
 
 	// Default to Llama 2 format

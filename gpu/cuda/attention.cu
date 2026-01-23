@@ -255,6 +255,182 @@ extern "C" int cuda_basic_attention(
 }
 
 // ============================================================================
+// GQA Expand Kernel
+// ============================================================================
+// Expands K or V from [batch, num_kv_heads, seq, head_dim] to [batch, num_heads, seq, head_dim]
+// by repeating each KV head for multiple query heads
+
+__global__ void expand_kv_for_gqa_kernel(
+    half* __restrict__ output,          // [batch * num_heads * seq * head_dim]
+    const half* __restrict__ input,     // [batch * num_kv_heads * seq * head_dim]
+    int batch_size,
+    int num_heads,
+    int num_kv_heads,
+    int seq_len,
+    int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * num_heads * seq_len * head_dim;
+
+    if (idx >= total) return;
+
+    // Decode output index
+    int d = idx % head_dim;
+    int s = (idx / head_dim) % seq_len;
+    int h = (idx / (head_dim * seq_len)) % num_heads;
+    int b = idx / (head_dim * seq_len * num_heads);
+
+    // Map query head to KV head
+    int heads_per_kv = num_heads / num_kv_heads;
+    int kv_h = h / heads_per_kv;
+
+    // Compute input index
+    int in_idx = b * num_kv_heads * seq_len * head_dim +
+                 kv_h * seq_len * head_dim +
+                 s * head_dim +
+                 d;
+
+    output[idx] = input[in_idx];
+}
+
+// ============================================================================
+// Basic Attention with GQA Support
+// ============================================================================
+
+extern "C" int cuda_basic_attention_gqa(
+    void* output,
+    const void* query,
+    const void* key,
+    const void* value,
+    int batch_size,
+    int num_heads,
+    int num_kv_heads,
+    int seq_len,
+    int head_dim,
+    bool causal
+) {
+    // If num_heads == num_kv_heads, use basic attention (MHA)
+    if (num_heads == num_kv_heads) {
+        return cuda_basic_attention(output, query, key, value,
+                                    batch_size, num_heads, seq_len, head_dim, causal);
+    }
+
+    // GQA: need to expand K and V to match query heads
+    int total_heads = batch_size * num_heads;
+    int qk_size = seq_len * seq_len;
+    int head_size = seq_len * head_dim;
+
+    // Allocate expanded K and V
+    half* k_expanded;
+    half* v_expanded;
+    half* scores;
+
+    CUDA_CHECK(cudaMalloc(&k_expanded, total_heads * head_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&v_expanded, total_heads * head_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&scores, total_heads * qk_size * sizeof(half)));
+
+    // Expand K and V
+    int total_elements = batch_size * num_heads * seq_len * head_dim;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    expand_kv_for_gqa_kernel<<<num_blocks, block_size>>>(
+        k_expanded, (const half*)key,
+        batch_size, num_heads, num_kv_heads, seq_len, head_dim
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    expand_kv_for_gqa_kernel<<<num_blocks, block_size>>>(
+        v_expanded, (const half*)value,
+        batch_size, num_heads, num_kv_heads, seq_len, head_dim
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 1: Compute Q @ K^T for all heads
+    int result = cuda_batched_gemm_fp16(
+        scores,
+        query,
+        k_expanded,
+        total_heads,
+        seq_len,      // M
+        head_dim,     // K
+        seq_len,      // N
+        false,        // no transpose Q
+        true,         // transpose K
+        head_size,    // stride_a (Q)
+        head_size,    // stride_b (K expanded)
+        qk_size       // stride_c (scores)
+    );
+    if (result != 0) {
+        cudaFree(k_expanded);
+        cudaFree(v_expanded);
+        cudaFree(scores);
+        return result;
+    }
+
+    // Step 2: Scale by 1/sqrt(head_dim)
+    float scale = 1.0f / sqrtf((float)head_dim);
+    result = cuda_scale(scores, scores, scale, total_heads * qk_size);
+    if (result != 0) {
+        cudaFree(k_expanded);
+        cudaFree(v_expanded);
+        cudaFree(scores);
+        return result;
+    }
+
+    // Step 3: Apply causal mask if needed
+    if (causal) {
+        dim3 block(16, 16);
+        dim3 grid(total_heads,
+                  (seq_len + block.x - 1) / block.x,
+                  (seq_len + block.y - 1) / block.y);
+
+        apply_causal_mask_kernel<<<grid, block>>>(
+            scores,
+            seq_len,
+            seq_len
+        );
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // Step 4: Softmax along last dimension
+    int num_rows = total_heads * seq_len;
+    int softmax_block_size = min(1024, seq_len);
+    softmax_block_size = ((softmax_block_size + 31) / 32) * 32;
+    int shared_size = (softmax_block_size / 32) * sizeof(float);
+
+    softmax_rows_kernel<<<num_rows, softmax_block_size, shared_size>>>(
+        scores,
+        scores,
+        num_rows,
+        seq_len
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 5: Compute scores @ V
+    result = cuda_batched_gemm_fp16(
+        output,
+        scores,
+        v_expanded,
+        total_heads,
+        seq_len,      // M
+        seq_len,      // K
+        head_dim,     // N
+        false,        // no transpose scores
+        false,        // no transpose V
+        qk_size,      // stride_a (scores)
+        head_size,    // stride_b (V expanded)
+        head_size     // stride_c (output)
+    );
+
+    cudaFree(k_expanded);
+    cudaFree(v_expanded);
+    cudaFree(scores);
+
+    return result;
+}
+
+// ============================================================================
 // KV Cache Structure
 // ============================================================================
 

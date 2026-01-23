@@ -27,7 +27,11 @@ int cuda_add(void* c, const void* a, const void* b, size_t num_elements);
 // Element-wise multiplication: c = a * b
 int cuda_mul(void* c, const void* a, const void* b, size_t num_elements);
 
-// Rotary Position Embeddings
+// RoPE style constants
+#define ROPE_STYLE_SPLIT_HALF   0  // Llama 2, TinyLlama, Mistral: pairs (0,64), (1,65)...
+#define ROPE_STYLE_INTERLEAVED  1  // Llama 3, GPT-NeoX: pairs (0,1), (2,3)...
+
+// Rotary Position Embeddings with configurable style
 int cuda_rope(
     void* output,
     const void* input,
@@ -36,6 +40,18 @@ int cuda_rope(
     int seq_len,
     int num_heads,
     int head_dim
+);
+
+// Rotary Position Embeddings with explicit style parameter
+int cuda_rope_styled(
+    void* output,
+    const void* input,
+    const int* positions,
+    int batch_size,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_style  // ROPE_STYLE_SPLIT_HALF or ROPE_STYLE_INTERLEAVED
 );
 
 // Softmax along last dimension

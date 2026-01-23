@@ -32,11 +32,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  download --repo meta-llama/Llama-2-7b-hf --token $HF_TOKEN")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Supported aliases:")
-		fmt.Fprintln(os.Stderr, "  tinyllama     -> TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-		fmt.Fprintln(os.Stderr, "  llama7b       -> meta-llama/Llama-2-7b-hf")
-		fmt.Fprintln(os.Stderr, "  llama7b-chat  -> meta-llama/Llama-2-7b-chat-hf")
-		fmt.Fprintln(os.Stderr, "  llama13b      -> meta-llama/Llama-2-13b-hf")
-		fmt.Fprintln(os.Stderr, "  llama13b-chat -> meta-llama/Llama-2-13b-chat-hf")
+		fmt.Fprintln(os.Stderr, "  tinyllama          -> TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+		fmt.Fprintln(os.Stderr, "  llama7b            -> meta-llama/Llama-2-7b-hf")
+		fmt.Fprintln(os.Stderr, "  llama7b-chat       -> meta-llama/Llama-2-7b-chat-hf")
+		fmt.Fprintln(os.Stderr, "  llama13b           -> meta-llama/Llama-2-13b-hf")
+		fmt.Fprintln(os.Stderr, "  llama13b-chat      -> meta-llama/Llama-2-13b-chat-hf")
+		fmt.Fprintln(os.Stderr, "  mistral7b          -> mistralai/Mistral-7B-v0.3")
+		fmt.Fprintln(os.Stderr, "  mistral7b-instruct -> mistralai/Mistral-7B-Instruct-v0.3")
 		os.Exit(1)
 	}
 
