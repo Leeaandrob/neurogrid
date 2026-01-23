@@ -58,20 +58,52 @@ This document tracks performance benchmarks for the NeuroGrid distributed infere
 
 ---
 
-### Llama 2 7B (Pending)
+### Llama 2 7B (2026-01-23)
 
 **Model Configuration:**
 - Parameters: 7B
 - Layers: 32 transformer layers
 - Hidden Size: 4096
 - Vocab Size: 32,000
-- Precision: BF16 → FP16
+- Precision: FP16
+- VRAM Usage (Coordinator): 10.24 GB
 
-**Expected Layer Distribution:**
-- Coordinator (RTX 4090): ~20 layers
-- Worker (RTX 2080 Ti): ~12 layers
+**Layer Distribution:**
+- Coordinator (RTX 4090): 16 layers (odd: 1,3,5,...,31)
+- Worker (RTX 2080 Ti): 16 layers (even: 0,2,4,...,30)
 
-*Results pending...*
+**Weight Distribution:**
+- Worker receives weights from coordinator over network
+- ~386 MB per layer transferred
+- Total: ~6.2 GB transferred to worker
+- Transfer time: ~64 seconds (16 layers × 4s/layer)
+
+#### Performance Metrics
+
+| Tokens | Total Time | Avg ms/token | ms/token (after 1st) | Throughput |
+|--------|------------|--------------|----------------------|------------|
+| 1      | 3.27s      | 3270ms       | -                    | 0.31 tps   |
+| 10     | 5.49s      | 549ms        | 247ms                | 1.82 tps   |
+| 20     | 7.17s      | 359ms        | 205ms                | 2.79 tps   |
+| 50     | 12.28s     | 246ms        | 184ms                | 4.07 tps   |
+
+**Key Findings:**
+- First token latency: ~3.3s (includes embedding lookup, 32-layer forward pass)
+- Sustained throughput: **180-200ms/token** (~5 tps)
+- Network overhead per layer: ~5-6ms (estimated, higher due to 4096 hidden size)
+- Activation data per transfer: ~8KB (4096 × 2 bytes)
+
+**Comparison with TinyLlama:**
+
+| Metric | TinyLlama 1.1B | Llama 2 7B | Ratio |
+|--------|----------------|------------|-------|
+| First token | 1.56s | 3.27s | 2.1x |
+| Sustained ms/token | 91ms | 184ms | 2.0x |
+| Throughput (tps) | 10-11 | 5 | 0.5x |
+| Layers | 22 | 32 | 1.5x |
+| Hidden size | 2048 | 4096 | 2x |
+
+**Note:** Output quality from base Llama 2 (not chat-tuned) shows typical behavior for non-instruction-tuned models.
 
 ---
 
@@ -143,6 +175,7 @@ time curl -s http://localhost:8090/v1/chat/completions \
 |------|---------|---------|
 | 2024-01-23 | 0.1.0 | Initial benchmark with TinyLlama 1.1B |
 | 2024-01-23 | 0.1.1 | Fixed PrefetchCoordinator blocking, removed debug logging |
+| 2026-01-23 | 0.2.0 | Added Llama 2 7B benchmarks, network weight transfer working |
 
 ---
 
@@ -151,3 +184,5 @@ time curl -s http://localhost:8090/v1/chat/completions \
 - All benchmarks performed on local network (low latency)
 - Results may vary based on network conditions and GPU utilization
 - First token latency includes tokenization and embedding lookup
+- **Network Weight Transfer**: Worker nodes do not require local model files; weights are distributed from coordinator at startup
+- Weight transfer uses libp2p P2P protocol with acknowledgment for reliability
