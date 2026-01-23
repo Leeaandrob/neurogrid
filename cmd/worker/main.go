@@ -43,6 +43,13 @@ type WorkerConfig struct {
 	BootstrapPeers []peer.AddrInfo // Coordinator address for WAN connections
 }
 
+// chunkBuffer accumulates weight chunks for a layer
+type chunkBuffer struct {
+	chunks      [][]byte
+	totalChunks int
+	received    int
+}
+
 // Worker represents a distributed inference worker node (performer role)
 type Worker struct {
 	config       WorkerConfig
@@ -64,6 +71,8 @@ type Worker struct {
 	reqCounter   uint64
 	weightsReady bool
 	weightsMu    sync.RWMutex
+	chunkBuffers map[int]*chunkBuffer // Layer ID -> chunk buffer
+	chunkMu      sync.Mutex
 }
 
 // NewWorker creates a new worker instance
@@ -99,6 +108,7 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 		startTime:    time.Now(),
 		startLayerID: -1,
 		endLayerID:   -1,
+		chunkBuffers: make(map[int]*chunkBuffer),
 	}, nil
 }
 
@@ -431,81 +441,128 @@ func (w *Worker) handleWeights(layerID int, chunkIndex int, totalChunks int, dat
 	log.Printf("Received weight chunk %d/%d for layer %d (%d bytes)",
 		chunkIndex+1, totalChunks, layerID, len(data))
 
-	// For simplicity, assume single chunk (small layers)
-	// In production, would need to reassemble chunks
-	if totalChunks == 1 || chunkIndex == totalChunks-1 {
-		// Deserialize weights
-		weights, err := model.DeserializeLayerWeights(layerID, data)
-		if err != nil {
-			log.Printf("Error deserializing weights for layer %d: %v", layerID, err)
-			return
+	// Accumulate chunks before deserializing
+	w.chunkMu.Lock()
+
+	// Initialize buffer for this layer if needed
+	buf, exists := w.chunkBuffers[layerID]
+	if !exists {
+		buf = &chunkBuffer{
+			chunks:      make([][]byte, totalChunks),
+			totalChunks: totalChunks,
+			received:    0,
 		}
-
-		w.layerWeights[layerID] = weights
-		log.Printf("Loaded weights for layer %d from coordinator (CPU)", layerID)
-
-		// Upload weights to GPU
-		if w.modelConfig != nil {
-			gpuWeights, err := bindings.CreateLayerWeightsFromHost(
-				weights.QWeight,
-				weights.KWeight,
-				weights.VWeight,
-				weights.OWeight,
-				weights.GateWeight,
-				weights.UpWeight,
-				weights.DownWeight,
-				weights.AttnNorm,
-				weights.FFNNorm,
-				w.modelConfig,
-			)
-			if err != nil {
-				log.Printf("Error uploading weights for layer %d to GPU: %v", layerID, err)
-				// Continue without GPU weights - will fail at execution time
-			} else {
-				w.gpuWeights[layerID] = gpuWeights
-				log.Printf("Loaded weights for layer %d to GPU", layerID)
-			}
-		}
-
-		// Update layer range
-		if w.startLayerID == -1 || layerID < w.startLayerID {
-			w.startLayerID = layerID
-		}
-		if layerID > w.endLayerID {
-			w.endLayerID = layerID
-		}
-
-		// Initialize KV cache for this layer if we have config
-		if w.modelConfig != nil {
-			cache := inference.NewDistributedKVCache(
-				inference.KVCacheConfig{
-					LayerID:    layerID,
-					NumKVHeads: w.modelConfig.NumKVHeads,
-					HeadDim:    w.modelConfig.HeadDim,
-					MaxSeqLen:  w.modelConfig.MaxSeqLen,
-				},
-				w.host.ID().String(),
-				w.config.GPUID,
-				true, // local
-			)
-			w.kvCaches.RegisterCache(cache)
-		}
-
-		// Mark weights ready once we have at least one layer
-		w.weightsMu.Lock()
-		w.weightsReady = true
-		w.weightsMu.Unlock()
-
-		// Send acknowledgment
-		ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
-		defer cancel()
-
-		w.peersMu.RLock()
-		for _, p := range w.peers {
-			w.protocol.SendWeightsAck(ctx, p.ID, layerID)
-		}
-		w.peersMu.RUnlock()
+		w.chunkBuffers[layerID] = buf
 	}
+
+	// Store chunk data (make a copy since data may be reused)
+	buf.chunks[chunkIndex] = make([]byte, len(data))
+	copy(buf.chunks[chunkIndex], data)
+	buf.received++
+
+	// Check if all chunks received
+	allReceived := buf.received == buf.totalChunks
+	w.chunkMu.Unlock()
+
+	if !allReceived {
+		log.Printf("Waiting for more chunks for layer %d (%d/%d received)",
+			layerID, buf.received, buf.totalChunks)
+		return
+	}
+
+	// All chunks received - concatenate and deserialize
+	log.Printf("All chunks received for layer %d, concatenating %d chunks...", layerID, totalChunks)
+
+	// Calculate total size and concatenate
+	w.chunkMu.Lock()
+	buf = w.chunkBuffers[layerID]
+	totalSize := 0
+	for _, chunk := range buf.chunks {
+		totalSize += len(chunk)
+	}
+
+	fullData := make([]byte, 0, totalSize)
+	for _, chunk := range buf.chunks {
+		fullData = append(fullData, chunk...)
+	}
+
+	// Clean up buffer
+	delete(w.chunkBuffers, layerID)
+	w.chunkMu.Unlock()
+
+	log.Printf("Layer %d: concatenated %d bytes from %d chunks", layerID, len(fullData), totalChunks)
+
+	// Deserialize weights from full data
+	weights, err := model.DeserializeLayerWeights(layerID, fullData)
+	if err != nil {
+		log.Printf("Error deserializing weights for layer %d: %v", layerID, err)
+		return
+	}
+
+	w.layerWeights[layerID] = weights
+	log.Printf("Loaded weights for layer %d from coordinator (CPU)", layerID)
+
+	// Upload weights to GPU
+	if w.modelConfig != nil {
+		gpuWeights, err := bindings.CreateLayerWeightsFromHost(
+			weights.QWeight,
+			weights.KWeight,
+			weights.VWeight,
+			weights.OWeight,
+			weights.GateWeight,
+			weights.UpWeight,
+			weights.DownWeight,
+			weights.AttnNorm,
+			weights.FFNNorm,
+			w.modelConfig,
+		)
+		if err != nil {
+			log.Printf("Error uploading weights for layer %d to GPU: %v", layerID, err)
+			// Continue without GPU weights - will fail at execution time
+		} else {
+			w.gpuWeights[layerID] = gpuWeights
+			log.Printf("Loaded weights for layer %d to GPU", layerID)
+		}
+	}
+
+	// Update layer range
+	if w.startLayerID == -1 || layerID < w.startLayerID {
+		w.startLayerID = layerID
+	}
+	if layerID > w.endLayerID {
+		w.endLayerID = layerID
+	}
+
+	// Initialize KV cache for this layer if we have config
+	if w.modelConfig != nil {
+		cache := inference.NewDistributedKVCache(
+			inference.KVCacheConfig{
+				LayerID:    layerID,
+				NumKVHeads: w.modelConfig.NumKVHeads,
+				HeadDim:    w.modelConfig.HeadDim,
+				MaxSeqLen:  w.modelConfig.MaxSeqLen,
+			},
+			w.host.ID().String(),
+			w.config.GPUID,
+			true, // local
+		)
+		w.kvCaches.RegisterCache(cache)
+	}
+
+	// Mark weights ready once we have at least one layer
+	w.weightsMu.Lock()
+	w.weightsReady = true
+	w.weightsMu.Unlock()
+
+	// Send acknowledgment
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+
+	w.peersMu.RLock()
+	for _, p := range w.peers {
+		w.protocol.SendWeightsAck(ctx, p.ID, layerID)
+	}
+	w.peersMu.RUnlock()
 }
 
 // sendLayerStatus sends the list of locally loaded layers to the coordinator
