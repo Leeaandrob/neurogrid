@@ -163,6 +163,7 @@ func (e *Engine) SetAssignments(assignments []scheduler.LayerAssignment) {
 	defer e.mu.Unlock()
 	e.assignments = assignments
 	e.prefetch = scheduler.NewPrefetchCoordinator(assignments, 16)
+	e.prefetch.Start(1) // Start prefetch worker to prevent queue blocking
 }
 
 // LoadEmbeddings loads the token embedding matrix.
@@ -605,7 +606,9 @@ func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, p
 		}
 	}
 
-	if peerID == e.localPeerID {
+	isLocal := peerID == e.localPeerID
+
+	if isLocal {
 		// Local execution
 		if e.layerExecutor != nil {
 			return e.layerExecutor.Forward(ctx, layerID, hidden, position)

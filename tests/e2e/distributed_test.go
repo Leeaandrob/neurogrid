@@ -453,9 +453,13 @@ func TestRemoteExecutor(t *testing.T) {
 	})
 	defer remoteExec.Close()
 
+	// Create shared protocol on local host for response routing
+	localProtocol := p2p.NewProtocol(localHost)
+
 	// Create remote layer executor on local host to forward to remote
 	remoteLayerExec := inference.NewRemoteLayerExecutor(inference.RemoteLayerExecutorConfig{
 		Host:         localHost,
+		Protocol:     localProtocol, // Shared protocol for response routing
 		TargetPeerID: remoteHost.ID(),
 		StartLayerID: 11,
 		EndLayerID:   21,
@@ -549,9 +553,13 @@ func TestEngine_RemoteExecutorIntegration(t *testing.T) {
 	mockLocalExec := &mockLayerExecutor{prefix: "local_processed_"}
 	localEngine.SetLayerExecutor(mockLocalExec)
 
+	// Create shared protocol on local host for response routing
+	localProtocol := p2p.NewProtocol(localHost)
+
 	// Create remote layer executor to forward to remote peer
 	remoteLayerExec := inference.NewRemoteLayerExecutor(inference.RemoteLayerExecutorConfig{
 		Host:         localHost,
+		Protocol:     localProtocol, // Shared protocol for response routing
 		TargetPeerID: remoteHost.ID(),
 		StartLayerID: 11,
 		EndLayerID:   21,
@@ -1003,9 +1011,13 @@ func TestDistributed_FullActivationRoundtrip(t *testing.T) {
 	})
 	defer remoteExecutor.Close()
 
+	// Create shared protocol on local host for response routing
+	localProtocol := p2p.NewProtocol(localHost)
+
 	// Create remote layer executor (sends requests to remote)
 	remoteLayerExec := inference.NewRemoteLayerExecutor(inference.RemoteLayerExecutorConfig{
 		Host:         localHost,
+		Protocol:     localProtocol, // Shared protocol for response routing
 		TargetPeerID: remoteHost.ID(),
 		StartLayerID: 11,
 		EndLayerID:   21,

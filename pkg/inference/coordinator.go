@@ -21,6 +21,7 @@ type DistributedInferenceCoordinator struct {
 	engine      *Engine
 	peerManager *p2p.PeerManager
 	config      *types.LlamaConfig
+	protocol    *p2p.Protocol // Shared protocol for all remote executors
 
 	// Weight distribution
 	weightDistributor *WeightDistributor
@@ -48,6 +49,7 @@ type CoordinatorConfig struct {
 	Host          host.Host
 	Engine        *Engine
 	PeerManager   *p2p.PeerManager
+	Protocol      *p2p.Protocol // Shared protocol for tensor transfer (required)
 	ModelConfig   *types.LlamaConfig
 	Assignments   []scheduler.LayerAssignment
 	LocalPeerID   string
@@ -61,11 +63,16 @@ func NewDistributedInferenceCoordinator(config CoordinatorConfig) *DistributedIn
 		timeout = 60 * time.Second
 	}
 
+	if config.Protocol == nil {
+		panic("CoordinatorConfig.Protocol is required - must provide shared protocol")
+	}
+
 	dic := &DistributedInferenceCoordinator{
 		host:            config.Host,
 		engine:          config.Engine,
 		peerManager:     config.PeerManager,
 		config:          config.ModelConfig,
+		protocol:        config.Protocol,
 		peerAssignments: make(map[string][]int),
 		localLayers:     make([]int, 0),
 		localWeights:    make(map[int]*CPULayerWeights),
@@ -207,9 +214,10 @@ func (dic *DistributedInferenceCoordinator) setupRemoteExecutor(peerID peer.ID, 
 
 	peerIDStr := peerID.String()
 
-	// Create remote layer executor
+	// Create remote layer executor with shared protocol
 	exec := NewRemoteLayerExecutor(RemoteLayerExecutorConfig{
 		Host:         dic.host,
+		Protocol:     dic.protocol, // Use shared protocol for response routing
 		TargetPeerID: peerID,
 		StartLayerID: startLayer,
 		EndLayerID:   endLayer,

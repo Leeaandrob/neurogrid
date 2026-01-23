@@ -253,6 +253,11 @@ func (c *Coordinator) initializeComponents() error {
 		return fmt.Errorf("failed to compute assignments: %w", err)
 	}
 	log.Printf("Layer assignments computed: %d layers distributed", len(assignments))
+	// Debug: Print detailed assignments
+	for _, a := range assignments {
+		isLocal := a.PeerID == c.host.ID().String()
+		log.Printf("[DEBUG] Layer %d -> Peer %s (local=%v)", a.LayerID, a.PeerID[:16]+"...", isLocal)
+	}
 
 	// Create transport router
 	c.router = transport.NewTransportRouter()
@@ -342,9 +347,11 @@ func (c *Coordinator) initializeComponents() error {
 			}
 		}
 
-		// Create RemoteLayerExecutor
+		// Create RemoteLayerExecutor with shared protocol
+		// All executors must share the same protocol to ensure response routing works correctly
 		remoteExec := inference.NewRemoteLayerExecutor(inference.RemoteLayerExecutorConfig{
 			Host:         c.host,
+			Protocol:     c.p2pProtocol, // Share protocol across all executors
 			TargetPeerID: targetPeerID,
 			StartLayerID: startLayer,
 			EndLayerID:   endLayer,
@@ -517,7 +524,7 @@ func (c *Coordinator) startHTTPServer() error {
 	serverConfig := api.ServerConfig{
 		Addr:         fmt.Sprintf(":%d", c.config.HTTPPort),
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
+		WriteTimeout: 600 * time.Second, // 10 minutes for slow inference
 		ModelName:    c.config.ModelName,
 		EnableCORS:   c.config.EnableCORS,
 	}
@@ -599,15 +606,16 @@ func (n *networkNotifee) Connected(net network.Network, conn network.Conn) {
 		return
 	}
 
+	// Atomic check-and-add to prevent race condition duplicates
+	n.coordinator.peersMu.Lock()
+	defer n.coordinator.peersMu.Unlock()
+
 	// Check if already in peers list
-	n.coordinator.peersMu.RLock()
 	for _, p := range n.coordinator.peers {
 		if p.ID == peerID {
-			n.coordinator.peersMu.RUnlock()
 			return // Already registered
 		}
 	}
-	n.coordinator.peersMu.RUnlock()
 
 	// Add new peer
 	pi := peer.AddrInfo{
@@ -615,10 +623,8 @@ func (n *networkNotifee) Connected(net network.Network, conn network.Conn) {
 		Addrs: []multiaddr.Multiaddr{conn.RemoteMultiaddr()},
 	}
 
-	n.coordinator.peersMu.Lock()
 	n.coordinator.peers = append(n.coordinator.peers, pi)
 	peerCount := len(n.coordinator.peers)
-	n.coordinator.peersMu.Unlock()
 
 	log.Printf("Worker connected: %s (total workers: %d)", peerID, peerCount)
 }
@@ -637,6 +643,11 @@ func (n *networkNotifee) ListenClose(net network.Network, ma multiaddr.Multiaddr
 
 // HandlePeerFound is called when a peer is discovered
 func (n *coordinatorNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	// Don't add self
+	if pi.ID == n.coordinator.host.ID() {
+		return
+	}
+
 	log.Printf("Discovered worker: %s", pi.ID)
 
 	// Connect to the peer
@@ -645,11 +656,19 @@ func (n *coordinatorNotifee) HandlePeerFound(pi peer.AddrInfo) {
 		return
 	}
 
-	// Add to peers list
+	// Atomic check-and-add to prevent duplicate peers
 	n.coordinator.peersMu.Lock()
-	n.coordinator.peers = append(n.coordinator.peers, pi)
-	n.coordinator.peersMu.Unlock()
+	defer n.coordinator.peersMu.Unlock()
 
+	// Check if already in peers list
+	for _, p := range n.coordinator.peers {
+		if p.ID == pi.ID {
+			return // Already registered
+		}
+	}
+
+	// Add new peer
+	n.coordinator.peers = append(n.coordinator.peers, pi)
 	log.Printf("Connected to worker: %s (total: %d)", pi.ID, len(n.coordinator.peers))
 }
 
