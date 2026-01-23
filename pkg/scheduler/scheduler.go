@@ -80,6 +80,21 @@ func DefaultLlama3_70BConfig() ModelConfig {
 	}
 }
 
+// DefaultMistral7BConfig returns the default configuration for Mistral 7B.
+func DefaultMistral7BConfig() ModelConfig {
+	return ModelConfig{
+		HiddenSize:       4096,
+		IntermediateSize: 14336, // Mistral uses larger FFN than Llama 7B
+		NumLayers:        32,
+		NumHeads:         32,
+		NumKVHeads:       8,     // GQA: 8 KV heads
+		HeadDim:          128,   // 4096 / 32 heads
+		MaxSeqLen:        32768, // Mistral supports longer context
+		VocabSize:        32768, // Larger vocab than Llama
+		RMSNormEps:       1e-5,
+	}
+}
+
 // LayerAssignment represents a layer-to-peer assignment.
 type LayerAssignment struct {
 	LayerID      int

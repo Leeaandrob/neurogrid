@@ -683,6 +683,8 @@ func getModelConfig(modelName string) scheduler.ModelConfig {
 		return scheduler.DefaultLlama3_70BConfig()
 	case "tinyllama", "tinyllama-1.1b":
 		return scheduler.DefaultTinyLlamaConfig()
+	case "mistral-7b", "mistral-7b-instruct":
+		return scheduler.DefaultMistral7BConfig()
 	default:
 		// Default to 7B config
 		log.Printf("Unknown model %s, defaulting to llama-7b config", modelName)
@@ -692,7 +694,7 @@ func getModelConfig(modelName string) scheduler.ModelConfig {
 
 func main() {
 	// Parse command line flags
-	httpPort := flag.Int("http-port", 8080, "HTTP API port")
+	httpPort := flag.Int("http-port", 8090, "HTTP API port")
 	p2pPort := flag.Int("p2p-port", 9000, "libp2p port for peer communication")
 	gpuID := flag.Int("gpu", 0, "Local GPU device ID")
 	modelPath := flag.String("model", "", "Path to model weights")

@@ -5,168 +5,91 @@
 </p>
 
 <p align="center">
-  <a href="#features">Features</a> •
   <a href="#quick-start">Quick Start</a> •
-  <a href="#benchmarks">Benchmarks</a> •
+  <a href="#supported-models">Models</a> •
   <a href="#api">API</a> •
-  <a href="#license">License</a>
+  <a href="#distributed-mode">Distributed</a> •
+  <a href="#benchmarks">Benchmarks</a>
 </p>
 
 ---
 
-NeuroGrid is a high-performance inference engine for Large Language Models (LLMs), built from scratch in **Go + CUDA**. Designed for distributed inference across federated GPU networks using Pipeline Parallelism.
-
-## Features
-
-### v0.1.0 - Current Release
-
-- **GPU-Accelerated Inference** - Full CUDA/cuBLAS pipeline for FP16 inference
-- **Llama Architecture Support** - TinyLlama-1.1B, Llama-2, and compatible models
-- **BF16 → FP16 Conversion** - Automatic weight conversion during loading
-- **SafeTensors Support** - Native loading of HuggingFace model format
-- **SentencePiece Tokenizer** - Full tokenization pipeline
-- **OpenAI-Compatible API** - Drop-in replacement for `/v1/chat/completions`
-- **P2P Networking Foundation** - libp2p with mDNS discovery
-- **Single-GPU Local Mode** - Standalone operation with `--min-peers 0`
-
-### GPU Kernels
-
-| Kernel | Description | Precision |
-|--------|-------------|-----------|
-| GEMM | Matrix multiplication (cuBLAS) | FP16/INT8 |
-| RMSNorm | Root Mean Square Normalization | FP16 |
-| SiLU | Sigmoid Linear Unit activation | FP16 |
-| RoPE | Rotary Position Embeddings | FP16 |
-| Attention | Multi-head attention | FP16 |
-| Quantize | INT8 per-row quantization | INT8 |
-
-## Requirements
-
-- **Go:** 1.21+
-- **CUDA Toolkit:** 11.x or 12.x
-- **cuBLAS:** Included with CUDA Toolkit
-- **GPU:** NVIDIA GPU with Compute Capability 7.0+ (RTX 20/30/40/50 series)
-- **OS:** Linux (tested on Ubuntu 22.04/24.04)
-- **RAM:** 8GB+ (for model loading)
-- **VRAM:** 6GB+ (for TinyLlama-1.1B)
+NeuroGrid is a high-performance inference engine for Large Language Models (LLMs), built from scratch in **Go + CUDA**. Designed for both single-GPU and distributed inference across multiple machines.
 
 ## Quick Start
 
-### 1. Install Dependencies
-
 ```bash
-# Ubuntu/Debian
-sudo apt-get install build-essential
+# 1. Download a model
+make download-tinyllama          # Small model for testing (~2.2GB)
 
-# CUDA Toolkit (if not installed)
-# Download from: https://developer.nvidia.com/cuda-downloads
-```
+# 2. Build and run
+make run
 
-### 2. Build
-
-```bash
-# Clone repository
-git clone https://github.com/Leeaandrob/neurogrid.git
-cd neurogrid
-
-# Build CUDA library and Go binaries
-make build
-
-# Verify build
-./build/neurogrid --help
-```
-
-### 3. Download Model
-
-```bash
-# Download TinyLlama-1.1B (recommended for testing)
-./scripts/download_model.sh tinyllama
-
-# Or manually:
-# Place SafeTensors files in ./models/tinyllama/
-```
-
-### 4. Run Server
-
-```bash
-# Start inference server (single GPU, local mode)
-make run-coordinator
-
-# Or with explicit options:
-LD_LIBRARY_PATH=./build:/usr/local/cuda/lib64 \
-  ./build/neurogrid \
-  --http-port 8080 \
-  --gpu 0 \
-  --model ./models/tinyllama \
-  --model-name tinyllama \
-  --min-peers 0
-```
-
-### 5. Test Inference
-
-```bash
-curl -X POST http://localhost:8080/v1/chat/completions \
+# 3. Test the API
+curl -X POST http://localhost:8090/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "tinyllama",
-    "messages": [{"role": "user", "content": "The capital of France is"}],
-    "max_tokens": 50,
-    "temperature": 0.7
-  }'
+  -d '{"model": "tinyllama", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-## Benchmarks
+That's it! The server auto-detects the model and starts on port `8090`.
 
-### Performance Metrics (TinyLlama-1.1B, RTX GPU)
+## Requirements
 
-| Metric | Value | Description |
-|--------|-------|-------------|
-| **TTFT** | ~1.3s (P50) | Time To First Token |
-| **TPOT** | ~145ms/token | Time Per Output Token |
-| **ITL** | ~145ms | Inter-Token Latency |
-| **TPS** | ~6.9 tokens/sec | Generation throughput |
+| Requirement | Version |
+|-------------|---------|
+| Go | 1.21+ |
+| CUDA Toolkit | 11.x or 12.x |
+| GPU | NVIDIA with Compute 7.0+ (RTX 20/30/40/50) |
+| OS | Linux (Ubuntu 22.04/24.04) |
 
-### Run Benchmarks
+## Supported Models
+
+| Model | Size | VRAM | Download Command |
+|-------|------|------|------------------|
+| TinyLlama 1.1B | ~2.2GB | ~3GB | `make download-tinyllama` |
+| Mistral 7B Instruct | ~15GB | ~14GB | `make download-mistral7b-instruct` |
+| Llama 2 7B | ~13GB | ~14GB | `make download-llama7b` ¹ |
+| Llama 2 13B | ~26GB | ~26GB | `make download-llama13b` ¹ |
+
+¹ Requires `HF_TOKEN` environment variable (get token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens))
+
+### Download Any HuggingFace Model
 
 ```bash
-# Build benchmark tool
-go build -o build/benchmark ./tools/benchmark/
+# Generic download - works with any public model
+make download REPO=mistralai/Mistral-Nemo-Instruct-2407
+make download REPO=Qwen/Qwen2.5-7B-Instruct
+make download REPO=google/gemma-2-9b-it
 
-# Run benchmark
-./build/benchmark -n 100 -c 1 -max-tokens 50
-
-# Options:
-#   -n            Number of requests (default: 100)
-#   -c            Concurrency (default: 1)
-#   -max-tokens   Max tokens to generate (default: 50)
-#   -prompt       Prompt length: short, medium, long
-#   -json         Output as JSON
-#   -warmup       Warmup requests (default: 3)
+# For gated models (Llama, etc.)
+export HF_TOKEN=your_token
+make download REPO=meta-llama/Llama-3.3-70B-Instruct
 ```
 
-### Sample Output
+## Running the Server
 
+### Single Node (Recommended for most users)
+
+```bash
+# Auto-detect model and run
+make run
+
+# Or run with specific model
+make run-mistral      # Mistral 7B Instruct
+make run-tinyllama    # TinyLlama 1.1B
+make run-llama7b      # Llama 2 7B
+
+# Custom configuration
+make run HTTP_PORT=8080 GPU_ID=1 LOG_LEVEL=debug
 ```
-╔══════════════════════════════════════════════════════════════╗
-║                     Benchmark Results                        ║
-╠══════════════════════════════════════════════════════════════╣
-║ Total Requests:     100                                      ║
-║ Successful:         100                                      ║
-║ Failed:             0                                        ║
-╠══════════════════════════════════════════════════════════════╣
-║                    TTFT (Time To First Token)                ║
-╠══════════════════════════════════════════════════════════════╣
-║ P50:        1307.00 ms                                       ║
-║ P90:        2208.00 ms                                       ║
-║ P99:        2790.00 ms                                       ║
-╠══════════════════════════════════════════════════════════════╣
-║                       Throughput                             ║
-╠══════════════════════════════════════════════════════════════╣
-║ Requests/sec:       7.17                                     ║
-║ Output Tokens/sec:  92.83                                    ║
-║ Generation TPS:     6.86                                     ║
-╚══════════════════════════════════════════════════════════════╝
-```
+
+### Configuration Options
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HTTP_PORT` | 8090 | API server port |
+| `GPU_ID` | 0 | CUDA device ID |
+| `LOG_LEVEL` | info | Log verbosity (debug, info, warn, error) |
 
 ## API
 
@@ -176,37 +99,120 @@ go build -o build/benchmark ./tools/benchmark/
 POST /v1/chat/completions
 ```
 
-### Request Format
+### Request
 
-```json
-{
-  "model": "tinyllama",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
-  ],
-  "max_tokens": 100,
-  "temperature": 0.7
-}
+```bash
+curl -X POST http://localhost:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistral-7b",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "max_tokens": 100,
+    "temperature": 0.7
+  }'
 ```
 
-### Response Format
+### Response
 
 ```json
 {
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
   "created": 1769027418,
-  "model": "tinyllama",
+  "model": "mistral-7b",
   "choices": [{
     "index": 0,
     "message": {
       "role": "assistant",
-      "content": "Hello! How can I help you today?"
+      "content": "The capital of France is Paris."
     },
     "finish_reason": "eos"
   }]
 }
+```
+
+### Health Check
+
+```bash
+curl http://localhost:8090/health
+# {"status":"healthy","model":"mistral-7b","timestamp":1769027418,"version":"1.0.0"}
+```
+
+## Distributed Mode
+
+For multi-GPU inference across machines using Pipeline Parallelism.
+
+### Setup (3-machine example)
+
+```bash
+# Machine 1: Worker with GPU 0
+make run-worker GPU_ID=0 P2P_PORT=9001
+
+# Machine 2: Worker with GPU 0
+make run-worker GPU_ID=0 P2P_PORT=9002
+
+# Machine 3: Coordinator (connects to workers automatically via mDNS)
+make run-coordinator MIN_PEERS=2
+```
+
+Workers are discovered automatically on the local network. The coordinator distributes model layers across available GPUs.
+
+## Building from Source
+
+### Prerequisites
+
+```bash
+# Verify CUDA installation
+nvcc --version
+nvidia-smi
+
+# Verify Go installation
+go version
+```
+
+### Build Commands
+
+```bash
+# Build everything (CUDA library + binaries)
+make build-all
+
+# Build CUDA library only
+make cuda
+
+# Build specific binary
+make build-coordinator
+make build-worker
+
+# Clean build artifacts
+make clean
+```
+
+### Run Tests
+
+```bash
+make test           # CUDA tests
+make test-e2e       # End-to-end tests (no CUDA required)
+make test-all       # All tests
+```
+
+## Benchmarks
+
+### Performance (Mistral 7B on RTX 4090)
+
+| Metric | Value |
+|--------|-------|
+| TTFT (Time to First Token) | ~1.3s |
+| Generation Speed | ~6.9 tokens/sec |
+| GPU Memory | ~14GB |
+
+### Run Benchmarks
+
+```bash
+make bench-quick     # Quick benchmark
+make bench-full      # Full benchmark suite
 ```
 
 ## Project Structure
@@ -214,114 +220,61 @@ POST /v1/chat/completions
 ```
 neurogrid-engine/
 ├── cmd/
-│   ├── neurogrid/           # Main server binary
-│   ├── download/            # Model download utility
-│   └── worker/              # Worker node (distributed mode)
-├── api/                     # HTTP API server
+│   ├── neurogrid/     # Main server (coordinator)
+│   ├── worker/        # Distributed worker node
+│   └── download/      # Model download utility
 ├── gpu/
-│   ├── cuda/                # CUDA kernels (.cu/.h)
-│   ├── engine/              # C++ layer implementation
-│   └── bindings/            # CGO Go ↔ CUDA bindings
+│   ├── cuda/          # CUDA kernels
+│   ├── engine/        # C++ layer implementation
+│   └── bindings/      # Go ↔ CUDA bindings
 ├── pkg/
-│   ├── inference/           # Inference engine
-│   ├── model/               # Model loading & tokenizer
-│   ├── scheduler/           # Layer scheduling
-│   ├── transport/           # GPU transport layer
-│   └── types/               # Core types (Tensor, Config)
-├── p2p/                     # libp2p networking
-├── tests/                   # Test suites
-├── tools/
-│   └── benchmark/           # Benchmark tool
-├── docs/                    # Documentation
-├── Makefile
-└── go.mod
+│   ├── inference/     # Inference engine
+│   ├── model/         # Model loading & tokenizer
+│   ├── scheduler/     # Layer distribution
+│   └── huggingface/   # HF model downloader
+├── api/               # HTTP API server
+├── p2p/               # libp2p networking
+└── Makefile
 ```
 
-## Configuration
+## Troubleshooting
 
-### Supported Models
+### CUDA Library Not Found
 
-| Model | Parameters | VRAM Required |
-|-------|------------|---------------|
-| TinyLlama-1.1B | 1.1B | ~3GB |
-| Llama-2-7B | 7B | ~14GB |
-| Llama-2-13B | 13B | ~26GB |
-
-### Environment Variables
+If you see `libgpu_engine.so: cannot open shared object file`:
 
 ```bash
-export CUDA_PATH=/usr/local/cuda
-export LD_LIBRARY_PATH=$CUDA_PATH/lib64:./build:$LD_LIBRARY_PATH
+# Option 1: Use make (handles LD_LIBRARY_PATH automatically)
+make run
+
+# Option 2: Set LD_LIBRARY_PATH manually
+export LD_LIBRARY_PATH=$(pwd)/build:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+./build/neurogrid --model ./models/tinyllama --model-name tinyllama
 ```
 
-### Command Line Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--http-port` | 8080 | HTTP API port |
-| `--p2p-port` | 9000 | P2P networking port |
-| `--gpu` | 0 | GPU device ID |
-| `--model` | - | Path to model directory |
-| `--model-name` | - | Model identifier |
-| `--min-peers` | 0 | Minimum peers (0 = local only) |
-| `--cors` | true | Enable CORS headers |
-
-## Building from Source
-
-### Prerequisites
+### No Model Found
 
 ```bash
-# Check CUDA installation
-nvcc --version
-nvidia-smi
+# Check available models
+ls ./models/
 
-# Check Go installation
-go version
+# Download a model
+make download-tinyllama
 ```
 
-### Build Commands
+### GPU Out of Memory
+
+Try a smaller model:
+```bash
+make download-tinyllama
+make run-tinyllama
+```
+
+## Help
 
 ```bash
-# Full build (CUDA + Go)
-make build
-
-# CUDA library only
-make cuda
-
-# Run tests
-make test
-
-# Run specific test
-CGO_LDFLAGS="-L$(pwd)/build -lgpu_engine" \
-  go test -v -tags cuda ./tests/... -run TestGEMMFP16
-
-# Clean
-make clean
+make help   # Show all available commands
 ```
-
-## Documentation
-
-- [Architecture Overview](docs/architecture/)
-- [Architecture Decision Records](docs/architecture/decisions/)
-- [Product Requirements](docs/prps/)
-- [Changelog](CHANGELOG.md)
-
-## Roadmap
-
-### v0.2.0 (Planned)
-- [ ] Streaming responses (SSE)
-- [ ] KV cache optimization
-- [ ] Flash Attention integration
-
-### v0.3.0 (Planned)
-- [ ] CUDA graphs optimization
-- [ ] Speculative decoding
-- [ ] Multi-GPU distributed inference
-
-### Future
-- [ ] INT4 quantization
-- [ ] Tensor parallelism
-- [ ] Production monitoring (Prometheus/Grafana)
 
 ## License
 
@@ -329,33 +282,19 @@ make clean
 
 - ✅ Free for students, researchers, and academic use
 - ✅ Free for personal learning and non-commercial projects
-- ✅ Free for non-commercial open source projects
 - ❌ Commercial use requires a license
 
-For commercial licensing inquiries, contact: **leandrobar93@gmail.com**
-
-See [LICENSE](LICENSE) for full terms.
-
-## Contributing
-
-Contributions are welcome for non-commercial purposes. By contributing, you agree that your contributions will be subject to the project's license terms.
+Contact: **leandrobar93@gmail.com**
 
 ## Acknowledgments
 
-- [cuBLAS](https://developer.nvidia.com/cublas) - NVIDIA's GPU-accelerated BLAS library
-- [libp2p](https://libp2p.io/) - Modular peer-to-peer networking stack
-- [SentencePiece](https://github.com/google/sentencepiece) - Tokenization library
-- [SafeTensors](https://github.com/huggingface/safetensors) - Safe tensor serialization
-
-## Contact
-
-- **Author:** Leandro Barbosa
-- **Email:** leandrobar93@gmail.com
-- **Commercial Inquiries:** leandrobar93@gmail.com
+- [cuBLAS](https://developer.nvidia.com/cublas) - NVIDIA's GPU-accelerated BLAS
+- [libp2p](https://libp2p.io/) - Peer-to-peer networking
+- [HuggingFace](https://huggingface.co/) - Model hub
 
 ---
 
 <p align="center">
   <strong>NeuroGrid Engine v0.1.0</strong><br>
-  Built with ❤️ and CUDA
+  Built with Go + CUDA
 </p>

@@ -42,27 +42,28 @@ ENGINE_OBJECTS := $(ENGINE_CU_OBJECTS) $(ENGINE_CPP_OBJECTS)
 # Output library
 LIB_NAME := libgpu_engine.so
 
-# Default target
-all: cuda binaries
+# Default target - build CUDA library and main binary
+all: build-coordinator
+	@echo "Build complete. Run with: make run"
 
 # Build CUDA library only (no Go binary)
 cuda-only: $(BUILD_DIR)/$(LIB_NAME)
 	@echo "Built $(BUILD_DIR)/$(LIB_NAME)"
 
 # Create build directory
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+.build-dir:
+	@mkdir -p $(BUILD_DIR)
 
 # Compile CUDA sources
-$(BUILD_DIR)/%.o: $(CUDA_DIR)/%.cu | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: $(CUDA_DIR)/%.cu | .build-dir
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
 # Compile engine CUDA sources
-$(BUILD_DIR)/engine_%.o: $(ENGINE_DIR)/%.cu | $(BUILD_DIR)
+$(BUILD_DIR)/engine_%.o: $(ENGINE_DIR)/%.cu | .build-dir
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
 
 # Compile engine C++ sources
-$(BUILD_DIR)/%.o: $(ENGINE_DIR)/%.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: $(ENGINE_DIR)/%.cpp | .build-dir
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Build shared library
@@ -72,16 +73,10 @@ $(BUILD_DIR)/$(LIB_NAME): $(CUDA_OBJECTS) $(ENGINE_OBJECTS)
 
 cuda: $(BUILD_DIR)/$(LIB_NAME)
 
-# Build Go binaries (optional, if cmd exists)
-binaries: cuda
-	@if [ -d "./cmd/test-layer" ] && [ -n "$$(ls -A ./cmd/test-layer/*.go 2>/dev/null)" ]; then \
-		CGO_ENABLED=1 \
-		CGO_CFLAGS="-I$(CUDA_INCLUDE)" \
-		CGO_LDFLAGS="-L$(PWD)/$(BUILD_DIR) -L$(CUDA_LIB) -lgpu_engine -lcudart -lcublas" \
-		go build -tags cuda -o $(BUILD_DIR)/test-layer ./cmd/test-layer; \
-	else \
-		echo "No cmd/test-layer Go files found, skipping binary build"; \
-	fi
+# Alias: 'make build' = 'make build-coordinator'
+build: cuda
+	@$(MAKE) --no-print-directory build-coordinator
+	@echo "Build complete: $(BUILD_DIR)/neurogrid"
 
 # Run tests
 test: cuda
@@ -214,6 +209,46 @@ download-mistral7b-instruct: build-download
 	@echo "Downloading Mistral 7B Instruct v0.3..."
 	$(BUILD_DIR)/download --repo mistral7b-instruct --output $(MODELS_DIR)/mistral-7b-instruct
 
+#==============================================================================
+# Generic Download (any HuggingFace model)
+#==============================================================================
+
+# Download any model from HuggingFace
+# Usage: make download REPO=mistralai/Mistral-Nemo-Instruct-2407
+#        make download REPO=meta-llama/Llama-3.3-70B-Instruct
+#        make download REPO=Qwen/Qwen2.5-7B-Instruct
+REPO ?=
+OUTPUT_DIR ?=
+
+download: build-download
+	@if [ -z "$(REPO)" ]; then \
+		echo ""; \
+		echo "❌ ERROR: REPO is required"; \
+		echo ""; \
+		echo "Usage: make download REPO=<org/model-name>"; \
+		echo ""; \
+		echo "Examples:"; \
+		echo "  make download REPO=mistralai/Mistral-Nemo-Instruct-2407"; \
+		echo "  make download REPO=meta-llama/Llama-3.3-70B-Instruct"; \
+		echo "  make download REPO=Qwen/Qwen2.5-7B-Instruct"; \
+		echo "  make download REPO=google/gemma-2-9b-it"; \
+		echo ""; \
+		echo "For gated models (Llama, etc), set HF_TOKEN first:"; \
+		echo "  export HF_TOKEN=your_token"; \
+		echo "  make download REPO=meta-llama/Llama-3.3-70B-Instruct"; \
+		echo ""; \
+		exit 1; \
+	fi
+	@# Derive output directory from repo name if not specified
+	$(eval _MODEL_NAME := $(shell echo "$(REPO)" | sed 's|.*/||' | tr '[:upper:]' '[:lower:]'))
+	@if [ -n "$(OUTPUT_DIR)" ]; then \
+		echo "Downloading $(REPO) to $(OUTPUT_DIR)..."; \
+		$(BUILD_DIR)/download --repo "$(REPO)" --output "$(OUTPUT_DIR)"; \
+	else \
+		echo "Downloading $(REPO) to $(MODELS_DIR)/$(_MODEL_NAME)..."; \
+		$(BUILD_DIR)/download --repo "$(REPO)" --output "$(MODELS_DIR)/$(_MODEL_NAME)"; \
+	fi
+
 # Run download tests
 test-download:
 	@echo "Running download tests..."
@@ -248,22 +283,118 @@ build-distributed: build-worker build-coordinator
 build-all: cuda build-distributed build-download
 
 #==============================================================================
-# Run Distributed Inference
+# Run Configuration
 #==============================================================================
 
-HTTP_PORT ?= 8080
+# Server defaults
+HTTP_PORT ?= 8090
 P2P_PORT ?= 9000
 GPU_ID ?= 0
-MODEL_PATH ?= ./models/llama-2-7b
-MODEL_NAME ?= llama-7b
 MIN_PEERS ?= 0
+LOG_LEVEL ?= info
+
+# Model auto-detection: finds first available model in ./models/
+# Priority: tinyllama > mistral-7b-instruct > llama-7b > llama-13b
+define detect_model
+$(shell \
+	if [ -d "./models/tinyllama" ]; then echo "tinyllama ./models/tinyllama"; \
+	elif [ -d "./models/mistral-7b-instruct" ]; then echo "mistral-7b ./models/mistral-7b-instruct"; \
+	elif [ -d "./models/mistral-7b" ]; then echo "mistral-7b ./models/mistral-7b"; \
+	elif [ -d "./models/llama-7b" ]; then echo "llama-7b ./models/llama-7b"; \
+	elif [ -d "./models/llama-7b-chat" ]; then echo "llama-7b ./models/llama-7b-chat"; \
+	elif [ -d "./models/llama-13b" ]; then echo "llama-13b ./models/llama-13b"; \
+	else echo ""; fi)
+endef
+
+# Extract model name and path from detection
+DETECTED := $(detect_model)
+MODEL_NAME ?= $(word 1,$(DETECTED))
+MODEL_PATH ?= $(word 2,$(DETECTED))
+
+#==============================================================================
+# Quick Start Targets (User-Friendly)
+#==============================================================================
+
+# Main entry point: build and run with auto-detected model
+run: build-coordinator check-model
+	@echo ""
+	@echo "════════════════════════════════════════════════════════════"
+	@echo "  NeuroGrid Engine - Starting Server"
+	@echo "════════════════════════════════════════════════════════════"
+	@echo "  Model:    $(MODEL_NAME)"
+	@echo "  Path:     $(MODEL_PATH)"
+	@echo "  API:      http://localhost:$(HTTP_PORT)"
+	@echo "  GPU:      $(GPU_ID)"
+	@echo "════════════════════════════════════════════════════════════"
+	@echo ""
+	LD_LIBRARY_PATH=$(PWD)/$(BUILD_DIR):$(CUDA_LIB) \
+	$(BUILD_DIR)/neurogrid \
+		--http-port $(HTTP_PORT) \
+		--gpu $(GPU_ID) \
+		--model $(MODEL_PATH) \
+		--model-name $(MODEL_NAME) \
+		--min-peers 0 \
+		--log-level $(LOG_LEVEL)
+
+# Alias for 'run'
+serve: run
+
+# Check if model exists
+check-model:
+	@if [ -z "$(MODEL_NAME)" ] || [ -z "$(MODEL_PATH)" ]; then \
+		echo ""; \
+		echo "❌ ERROR: No model found in ./models/"; \
+		echo ""; \
+		echo "Download a model first:"; \
+		echo "  make download-tinyllama        # Smallest, ~2.2GB (recommended for testing)"; \
+		echo "  make download-mistral7b-instruct  # ~15GB"; \
+		echo "  make download-llama7b          # ~13GB (requires HF_TOKEN)"; \
+		echo ""; \
+		exit 1; \
+	fi
+	@if [ ! -d "$(MODEL_PATH)" ]; then \
+		echo ""; \
+		echo "❌ ERROR: Model directory not found: $(MODEL_PATH)"; \
+		echo ""; \
+		echo "Download a model first: make download-tinyllama"; \
+		exit 1; \
+	fi
+
+#==============================================================================
+# Run with Specific Models
+#==============================================================================
+
+run-tinyllama: build-coordinator
+	@if [ ! -d "./models/tinyllama" ]; then echo "Model not found. Run: make download-tinyllama"; exit 1; fi
+	LD_LIBRARY_PATH=$(PWD)/$(BUILD_DIR):$(CUDA_LIB) \
+	$(BUILD_DIR)/neurogrid --http-port $(HTTP_PORT) --gpu $(GPU_ID) \
+		--model ./models/tinyllama --model-name tinyllama --min-peers 0
+
+run-mistral: build-coordinator
+	@if [ ! -d "./models/mistral-7b-instruct" ]; then echo "Model not found. Run: make download-mistral7b-instruct"; exit 1; fi
+	LD_LIBRARY_PATH=$(PWD)/$(BUILD_DIR):$(CUDA_LIB) \
+	$(BUILD_DIR)/neurogrid --http-port $(HTTP_PORT) --gpu $(GPU_ID) \
+		--model ./models/mistral-7b-instruct --model-name mistral-7b --min-peers 0
+
+run-llama7b: build-coordinator
+	@if [ ! -d "./models/llama-7b" ]; then echo "Model not found. Run: make download-llama7b"; exit 1; fi
+	LD_LIBRARY_PATH=$(PWD)/$(BUILD_DIR):$(CUDA_LIB) \
+	$(BUILD_DIR)/neurogrid --http-port $(HTTP_PORT) --gpu $(GPU_ID) \
+		--model ./models/llama-7b --model-name llama-7b --min-peers 0
+
+#==============================================================================
+# Distributed Mode (Coordinator + Workers)
+#==============================================================================
 
 run-worker: build-worker
-	@echo "Starting worker on port $(P2P_PORT)..."
+	@echo "Starting worker on P2P port $(P2P_PORT)..."
 	LD_LIBRARY_PATH=$(PWD)/$(BUILD_DIR):$(CUDA_LIB) \
-	$(BUILD_DIR)/worker --port $(P2P_PORT) --gpu $(GPU_ID)
+	$(BUILD_DIR)/worker \
+		--port $(P2P_PORT) \
+		--gpu $(GPU_ID) \
+		--log-level $(LOG_LEVEL)
 
-run-coordinator: build-coordinator
+run-coordinator: build-coordinator check-model
 	@echo "Starting coordinator on port $(HTTP_PORT)..."
 	@echo "Model: $(MODEL_NAME) from $(MODEL_PATH)"
 	@echo "GPU: $(GPU_ID), Min Peers: $(MIN_PEERS)"
@@ -274,7 +405,8 @@ run-coordinator: build-coordinator
 		--gpu $(GPU_ID) \
 		--model $(MODEL_PATH) \
 		--model-name $(MODEL_NAME) \
-		--min-peers $(MIN_PEERS)
+		--min-peers $(MIN_PEERS) \
+		--log-level $(LOG_LEVEL)
 
 #==============================================================================
 # Test Targets
@@ -364,56 +496,70 @@ run-cluster: build-distributed
 #==============================================================================
 
 help:
-	@echo "NeuroGrid Engine Build System"
 	@echo ""
-	@echo "CUDA Targets:"
-	@echo "  all           - Build CUDA library and Go binaries"
-	@echo "  cuda          - Build CUDA shared library only"
-	@echo "  binaries      - Build Go binaries (requires cuda)"
-	@echo "  check-cuda    - Verify CUDA installation"
+	@echo "════════════════════════════════════════════════════════════════"
+	@echo "  NeuroGrid Engine - Build System"
+	@echo "════════════════════════════════════════════════════════════════"
 	@echo ""
-	@echo "Model Download Targets:"
-	@echo "  build-download           - Build download CLI binary"
-	@echo "  download-tinyllama       - Download TinyLlama 1.1B (2.2 GB, no auth)"
-	@echo "  download-llama7b         - Download Llama 2 7B (13 GB, requires HF_TOKEN)"
-	@echo "  download-llama7b-chat    - Download Llama 2 7B Chat (13 GB, requires HF_TOKEN)"
-	@echo "  download-llama13b        - Download Llama 2 13B (26 GB, requires HF_TOKEN)"
-	@echo "  download-llama13b-chat   - Download Llama 2 13B Chat (26 GB, requires HF_TOKEN)"
-	@echo "  download-mistral7b       - Download Mistral 7B v0.3 (15 GB, no auth)"
-	@echo "  download-mistral7b-instruct - Download Mistral 7B Instruct v0.3 (15 GB, no auth)"
-	@echo "  test-download            - Run download tests"
+	@echo "🚀 QUICK START:"
+	@echo "  make download-tinyllama   # Download smallest model (~2.2GB)"
+	@echo "  make run                  # Build & run server (auto-detects model)"
 	@echo ""
-	@echo "Distributed Inference Targets:"
-	@echo "  build-worker      - Build worker binary"
-	@echo "  build-coordinator - Build coordinator binary"
-	@echo "  build-distributed - Build all distributed binaries"
-	@echo "  build-all         - Build CUDA + all binaries"
+	@echo "════════════════════════════════════════════════════════════════"
 	@echo ""
-	@echo "Run Targets:"
-	@echo "  run-worker      - Start worker node (P2P_PORT=$(P2P_PORT))"
-	@echo "  run-coordinator - Start coordinator (HTTP_PORT=$(HTTP_PORT))"
-	@echo "  run-cluster     - Start test cluster"
+	@echo "📦 MODEL DOWNLOAD:"
+	@echo "  download-tinyllama          TinyLlama 1.1B    (~2.2GB, ~3GB VRAM)"
+	@echo "  download-mistral7b-instruct Mistral 7B Inst   (~15GB, ~14GB VRAM)"
+	@echo "  download-llama7b            Llama 2 7B        (~13GB, HF_TOKEN required)"
 	@echo ""
-	@echo "Test Targets:"
-	@echo "  test          - Run CUDA tests"
-	@echo "  test-e2e      - Run E2E tests (no CUDA)"
-	@echo "  test-go       - Run all Go tests"
-	@echo "  test-all      - Run all tests"
-	@echo "  bench         - Run CUDA benchmarks"
-	@echo "  coverage      - Generate coverage report"
+	@echo "  Generic download (any HuggingFace model):"
+	@echo "  download REPO=org/model     Download any model from HuggingFace"
 	@echo ""
-	@echo "Benchmark Targets (no CUDA):"
-	@echo "  bench-go        - Run Go benchmarks"
-	@echo "  bench-quick     - Quick benchmark run"
-	@echo "  bench-full      - Full benchmark suite with report"
-	@echo "  bench-profile   - Benchmarks with CPU/memory profiling"
-	@echo "  bench-throughput - Run throughput metrics test"
-	@echo "  bench-latency   - Run latency percentile test"
-	@echo "  bench-load      - Run sustained load test"
+	@echo "  Examples:"
+	@echo "    make download REPO=mistralai/Mistral-Nemo-Instruct-2407"
+	@echo "    make download REPO=Qwen/Qwen2.5-7B-Instruct"
+	@echo "    make download REPO=google/gemma-2-9b-it"
 	@echo ""
-	@echo "Other:"
-	@echo "  fmt           - Format code"
-	@echo "  lint          - Run linter"
-	@echo "  flatbuffers   - Generate FlatBuffers code"
-	@echo "  golden        - Generate PyTorch golden data"
-	@echo "  clean         - Remove build artifacts"
+	@echo "▶️  RUN SERVER (Single Node):"
+	@echo "  run                   Auto-detect model and start server"
+	@echo "  serve                 Alias for 'run'"
+	@echo "  run-tinyllama         Run with TinyLlama specifically"
+	@echo "  run-mistral           Run with Mistral 7B Instruct"
+	@echo "  run-llama7b           Run with Llama 2 7B"
+	@echo ""
+	@echo "🌐 DISTRIBUTED MODE:"
+	@echo "  run-coordinator       Start coordinator (needs MIN_PEERS=N)"
+	@echo "  run-worker            Start worker node"
+	@echo "  run-cluster           Start test cluster (coordinator + workers)"
+	@echo ""
+	@echo "  Example distributed setup:"
+	@echo "    Terminal 1: make run-worker GPU_ID=0 P2P_PORT=9001"
+	@echo "    Terminal 2: make run-worker GPU_ID=1 P2P_PORT=9002"
+	@echo "    Terminal 3: make run-coordinator MIN_PEERS=2"
+	@echo ""
+	@echo "🔧 BUILD:"
+	@echo "  cuda                  Build CUDA library (libgpu_engine.so)"
+	@echo "  build-coordinator     Build coordinator binary"
+	@echo "  build-worker          Build worker binary"
+	@echo "  build-all             Build everything"
+	@echo "  check-cuda            Verify CUDA installation"
+	@echo ""
+	@echo "🧪 TEST:"
+	@echo "  test                  Run CUDA tests"
+	@echo "  test-e2e              Run E2E tests (no CUDA)"
+	@echo "  test-all              Run all tests"
+	@echo "  bench-quick           Quick benchmark"
+	@echo ""
+	@echo "⚙️  CONFIGURATION (Environment Variables):"
+	@echo "  HTTP_PORT=8090        API port (default: 8090)"
+	@echo "  GPU_ID=0              GPU device ID (default: 0)"
+	@echo "  MIN_PEERS=0           Minimum workers for distributed (default: 0)"
+	@echo "  LOG_LEVEL=info        Log level: debug, info, warn, error"
+	@echo ""
+	@echo "  Example: make run HTTP_PORT=8080 GPU_ID=1 LOG_LEVEL=debug"
+	@echo ""
+	@echo "🧹 OTHER:"
+	@echo "  clean                 Remove build artifacts"
+	@echo "  fmt                   Format code"
+	@echo "  lint                  Run linter"
+	@echo ""
