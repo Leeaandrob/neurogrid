@@ -12,8 +12,9 @@ var modelAliases = map[string]string{
 	"llama7b-chat":     "meta-llama/Llama-2-7b-chat-hf",
 	"llama13b":         "meta-llama/Llama-2-13b-hf",
 	"llama13b-chat":    "meta-llama/Llama-2-13b-chat-hf",
-	"mistral7b":        "mistralai/Mistral-7B-v0.3",
-	"mistral7b-instruct": "mistralai/Mistral-7B-Instruct-v0.3",
+	"mistral7b":           "mistralai/Mistral-7B-v0.3",
+	"mistral7b-instruct":  "mistralai/Mistral-7B-Instruct-v0.3",
+	"mistral-nemo":        "mistralai/Mistral-Nemo-Instruct-2407",
 }
 
 // ResolveAlias resolves a model alias to a full HuggingFace repo ID.

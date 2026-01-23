@@ -135,8 +135,18 @@ func (d *Downloader) DownloadFile(ctx context.Context, file FileInfo, outputDir 
 		actualStart = 0
 	}
 
+	// Get total size from Content-Length if not available from API
+	totalSize := file.Size
+	if totalSize == 0 && resp.ContentLength > 0 {
+		totalSize = resp.ContentLength
+		if actualStart > 0 {
+			// If resuming, add the startByte to get actual total
+			totalSize += actualStart
+		}
+	}
+
 	// Download with progress tracking
-	if err := d.copyWithProgress(ctx, out, resp.Body, file, actualStart); err != nil {
+	if err := d.copyWithProgress(ctx, out, resp.Body, file, actualStart, totalSize); err != nil {
 		return err
 	}
 
@@ -210,7 +220,7 @@ func (d *Downloader) openOutputFile(path string, append bool) (*os.File, error) 
 	return os.OpenFile(path, flags, 0644)
 }
 
-func (d *Downloader) copyWithProgress(ctx context.Context, out io.Writer, in io.Reader, file FileInfo, startByte int64) error {
+func (d *Downloader) copyWithProgress(ctx context.Context, out io.Writer, in io.Reader, file FileInfo, startByte int64, totalSize int64) error {
 	buf := make([]byte, 32*1024) // 32KB buffer
 	downloaded := startByte
 	start := time.Now()
@@ -229,7 +239,7 @@ func (d *Downloader) copyWithProgress(ctx context.Context, out io.Writer, in io.
 			}
 
 			downloaded += int64(n)
-			d.reportProgress(file, downloaded, startByte, start)
+			d.reportProgress(file, downloaded, startByte, start, totalSize)
 		}
 
 		if readErr == io.EOF {
@@ -243,7 +253,7 @@ func (d *Downloader) copyWithProgress(ctx context.Context, out io.Writer, in io.
 	return nil
 }
 
-func (d *Downloader) reportProgress(file FileInfo, downloaded, startByte int64, start time.Time) {
+func (d *Downloader) reportProgress(file FileInfo, downloaded, startByte int64, start time.Time, totalSize int64) {
 	if d.progress == nil {
 		return
 	}
@@ -253,17 +263,26 @@ func (d *Downloader) reportProgress(file FileInfo, downloaded, startByte int64, 
 		return
 	}
 
+	// Use provided totalSize, fall back to file.Size
+	total := totalSize
+	if total <= 0 {
+		total = file.Size
+	}
+
 	speed := float64(downloaded-startByte) / elapsed
-	remaining := file.Size - downloaded
+	remaining := total - downloaded
+	if remaining < 0 {
+		remaining = 0
+	}
 	eta := time.Duration(0)
-	if speed > 0 {
+	if speed > 0 && remaining > 0 {
 		eta = time.Duration(float64(remaining)/speed) * time.Second
 	}
 
 	d.progress(DownloadProgress{
 		Filename:   file.Filename,
 		Downloaded: downloaded,
-		Total:      file.Size,
+		Total:      total,
 		Speed:      speed,
 		ETA:        eta,
 	})

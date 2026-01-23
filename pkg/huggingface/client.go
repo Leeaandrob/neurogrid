@@ -276,6 +276,16 @@ func (c *Client) DownloadFile(ctx context.Context, file FileInfo, outputDir stri
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
+	// Get total size from Content-Length if not available from API
+	totalSize := file.Size
+	if totalSize == 0 {
+		totalSize = resp.ContentLength
+		if totalSize > 0 && startByte > 0 {
+			// If resuming, add the startByte to get actual total
+			totalSize += startByte
+		}
+	}
+
 	// Open file for writing (append if resuming)
 	flags := os.O_CREATE | os.O_WRONLY
 	if startByte > 0 && resp.StatusCode == http.StatusPartialContent {
@@ -332,16 +342,19 @@ func (c *Client) DownloadFile(ctx context.Context, file FileInfo, outputDir stri
 				elapsed := time.Since(start).Seconds()
 				if elapsed > 0 {
 					speed := float64(downloaded-startByte) / elapsed
-					remaining := file.Size - downloaded
+					remaining := totalSize - downloaded
+					if remaining < 0 {
+						remaining = 0
+					}
 					eta := time.Duration(0)
-					if speed > 0 {
+					if speed > 0 && remaining > 0 {
 						eta = time.Duration(float64(remaining)/speed) * time.Second
 					}
 
 					progress(DownloadProgress{
 						Filename:   file.Filename,
 						Downloaded: downloaded,
-						Total:      file.Size,
+						Total:      totalSize,
 						Speed:      speed,
 						ETA:        eta,
 					})
