@@ -28,10 +28,12 @@ const (
 	ExtendedHeaderSize = 25
 
 	// Message types for the tensor protocol
-	MsgTypeActivation = 0x01 // Forward activation to remote peer
-	MsgTypeResponse   = 0x02 // Return computed hidden state
-	MsgTypeWeights    = 0x03 // Transfer layer weights
-	MsgTypeWeightsAck = 0x04 // Acknowledge weights received
+	MsgTypeActivation   = 0x01 // Forward activation to remote peer
+	MsgTypeResponse     = 0x02 // Return computed hidden state
+	MsgTypeWeights      = 0x03 // Transfer layer weights
+	MsgTypeWeightsAck   = 0x04 // Acknowledge weights received
+	MsgTypeLayerStatus  = 0x05 // Worker reports which layers it has locally
+	MsgTypeLayerRequest = 0x06 // Coordinator requests specific layers to be loaded
 
 	// WeightChunkSize is the maximum size of a weight chunk (1MB)
 	WeightChunkSize = 1024 * 1024
@@ -56,24 +58,34 @@ type TensorHandler func(msg *TensorMessage)
 // WeightsHandler is a callback for received weight chunks.
 type WeightsHandler func(layerID int, chunkIndex int, totalChunks int, data []byte)
 
+// LayerStatusHandler is a callback for when a peer reports its loaded layers.
+type LayerStatusHandler func(peerID peer.ID, loadedLayers []int)
+
+// LayerRequestHandler is a callback for when coordinator requests specific layers.
+type LayerRequestHandler func(peerID peer.ID, requestedLayers []int)
+
 // Protocol manages the tensor transfer protocol.
 type Protocol struct {
-	host              host.Host
-	handler           TensorHandler        // Legacy handler
-	activationHandler TensorHandler        // Handler for activation messages
-	responseHandler   TensorHandler        // Handler for response messages
-	weightsHandler    WeightsHandler       // Handler for weight chunks
-	pendingResponses  map[uint64]chan *TensorMessage // RequestID -> response channel
-	pendingWeightsAck map[string]chan struct{}       // peerID:layerID -> ack channel
-	mu                sync.RWMutex
+	host                host.Host
+	handler             TensorHandler                  // Legacy handler
+	activationHandler   TensorHandler                  // Handler for activation messages
+	responseHandler     TensorHandler                  // Handler for response messages
+	weightsHandler      WeightsHandler                 // Handler for weight chunks
+	layerStatusHandler  LayerStatusHandler             // Handler for layer status reports
+	layerRequestHandler LayerRequestHandler            // Handler for layer requests
+	pendingResponses    map[uint64]chan *TensorMessage // RequestID -> response channel
+	pendingWeightsAck   map[string]chan struct{}       // peerID:layerID -> ack channel
+	pendingLayerStatus  map[string]chan []int          // peerID -> layer status channel
+	mu                  sync.RWMutex
 }
 
 // NewProtocol creates a new tensor transfer protocol handler.
 func NewProtocol(h host.Host) *Protocol {
 	p := &Protocol{
-		host:              h,
-		pendingResponses:  make(map[uint64]chan *TensorMessage),
-		pendingWeightsAck: make(map[string]chan struct{}),
+		host:               h,
+		pendingResponses:   make(map[uint64]chan *TensorMessage),
+		pendingWeightsAck:  make(map[string]chan struct{}),
+		pendingLayerStatus: make(map[string]chan []int),
 	}
 
 	// Register stream handler
@@ -108,6 +120,20 @@ func (p *Protocol) OnWeightsReceived(handler WeightsHandler) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.weightsHandler = handler
+}
+
+// OnLayerStatusReceived sets the callback for layer status messages from workers.
+func (p *Protocol) OnLayerStatusReceived(handler LayerStatusHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.layerStatusHandler = handler
+}
+
+// OnLayerRequestReceived sets the callback for layer request messages from coordinator.
+func (p *Protocol) OnLayerRequestReceived(handler LayerRequestHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.layerRequestHandler = handler
 }
 
 // RegisterPendingRequest creates a pending response channel for a request ID.
@@ -164,7 +190,7 @@ func (p *Protocol) handleStream(s network.Stream) {
 
 	// Check if this is an extended header (message type byte)
 	msgType := firstByte[0]
-	if msgType >= MsgTypeActivation && msgType <= MsgTypeWeightsAck {
+	if msgType >= MsgTypeActivation && msgType <= MsgTypeLayerRequest {
 		// Extended header format
 		p.handleExtendedMessage(s, msgType)
 	} else {
@@ -209,6 +235,8 @@ func (p *Protocol) handleExtendedMessage(s network.Stream, msgType uint8) {
 	activationHandler := p.activationHandler
 	responseHandler := p.responseHandler
 	weightsHandler := p.weightsHandler
+	layerStatusHandler := p.layerStatusHandler
+	layerRequestHandler := p.layerRequestHandler
 	p.mu.RUnlock()
 
 	switch msgType {
@@ -252,7 +280,63 @@ func (p *Protocol) handleExtendedMessage(s network.Stream, msgType uint8) {
 			default:
 			}
 		}
+	case MsgTypeLayerStatus:
+		// Worker reporting which layers it has locally
+		// Data format: count (4B) + layerIDs (4B each)
+		peerID := s.Conn().RemotePeer()
+		layers := decodeLayerList(data)
+
+		// Check for pending layer status channel (coordinator waiting)
+		p.mu.RLock()
+		ch, ok := p.pendingLayerStatus[peerID.String()]
+		p.mu.RUnlock()
+		if ok {
+			select {
+			case ch <- layers:
+			default:
+			}
+		}
+
+		if layerStatusHandler != nil {
+			layerStatusHandler(peerID, layers)
+		}
+	case MsgTypeLayerRequest:
+		// Coordinator requesting worker to load specific layers
+		// Data format: count (4B) + layerIDs (4B each)
+		peerID := s.Conn().RemotePeer()
+		layers := decodeLayerList(data)
+		if layerRequestHandler != nil {
+			layerRequestHandler(peerID, layers)
+		}
 	}
+}
+
+// decodeLayerList decodes a list of layer IDs from binary format.
+// Format: count (4B) + layerIDs (4B each)
+func decodeLayerList(data []byte) []int {
+	if len(data) < 4 {
+		return nil
+	}
+	count := int(binary.BigEndian.Uint32(data[0:4]))
+	if len(data) < 4+count*4 {
+		return nil
+	}
+	layers := make([]int, count)
+	for i := 0; i < count; i++ {
+		layers[i] = int(binary.BigEndian.Uint32(data[4+i*4 : 8+i*4]))
+	}
+	return layers
+}
+
+// encodeLayerList encodes a list of layer IDs to binary format.
+// Format: count (4B) + layerIDs (4B each)
+func encodeLayerList(layers []int) []byte {
+	data := make([]byte, 4+len(layers)*4)
+	binary.BigEndian.PutUint32(data[0:4], uint32(len(layers)))
+	for i, layerID := range layers {
+		binary.BigEndian.PutUint32(data[4+i*4:8+i*4], uint32(layerID))
+	}
+	return data
 }
 
 // handleLegacyMessage processes messages with legacy header format.
@@ -373,6 +457,61 @@ func (p *Protocol) SendWeights(ctx context.Context, peerID peer.ID, layerID int,
 // SendWeightsAck sends acknowledgment for received weights.
 func (p *Protocol) SendWeightsAck(ctx context.Context, peerID peer.ID, layerID int) error {
 	return p.sendExtendedMessage(ctx, peerID, MsgTypeWeightsAck, layerID, 0, 0, nil)
+}
+
+// SendLayerStatus sends the list of locally loaded layers to a peer (coordinator).
+// This is sent by the worker to inform which layers it already has cached.
+func (p *Protocol) SendLayerStatus(ctx context.Context, peerID peer.ID, loadedLayers []int) error {
+	data := encodeLayerList(loadedLayers)
+	return p.sendExtendedMessage(ctx, peerID, MsgTypeLayerStatus, 0, 0, 0, data)
+}
+
+// SendLayerRequest sends a request for the worker to load specific layers.
+// This is sent by the coordinator to tell the worker which layers to load locally.
+func (p *Protocol) SendLayerRequest(ctx context.Context, peerID peer.ID, layerIDs []int) error {
+	data := encodeLayerList(layerIDs)
+	return p.sendExtendedMessage(ctx, peerID, MsgTypeLayerRequest, 0, 0, 0, data)
+}
+
+// RequestLayerStatus requests layer status from a peer and waits for response.
+// Returns the list of layers the peer has locally loaded.
+func (p *Protocol) RequestLayerStatus(ctx context.Context, peerID peer.ID, timeout time.Duration) ([]int, error) {
+	// Register pending response
+	key := peerID.String()
+	p.mu.Lock()
+	p.pendingLayerStatus[key] = make(chan []int, 1)
+	p.mu.Unlock()
+
+	// Send empty layer request to trigger status response
+	if err := p.SendLayerRequest(ctx, peerID, []int{}); err != nil {
+		p.mu.Lock()
+		delete(p.pendingLayerStatus, key)
+		p.mu.Unlock()
+		return nil, fmt.Errorf("failed to request layer status: %w", err)
+	}
+
+	// Wait for response
+	p.mu.RLock()
+	ch := p.pendingLayerStatus[key]
+	p.mu.RUnlock()
+
+	select {
+	case layers := <-ch:
+		p.mu.Lock()
+		delete(p.pendingLayerStatus, key)
+		p.mu.Unlock()
+		return layers, nil
+	case <-time.After(timeout):
+		p.mu.Lock()
+		delete(p.pendingLayerStatus, key)
+		p.mu.Unlock()
+		return nil, fmt.Errorf("timeout waiting for layer status from peer")
+	case <-ctx.Done():
+		p.mu.Lock()
+		delete(p.pendingLayerStatus, key)
+		p.mu.Unlock()
+		return nil, ctx.Err()
+	}
 }
 
 // WaitForResponse waits for a response to a specific request ID.

@@ -123,6 +123,7 @@ func (w *Worker) Start() error {
 	w.protocol = p2p.NewProtocol(w.host)
 	w.protocol.OnActivationReceived(w.handleActivation)
 	w.protocol.OnWeightsReceived(w.handleWeights)
+	w.protocol.OnLayerRequestReceived(w.handleLayerRequest)
 
 	// Connect to bootstrap peers (coordinator)
 	if len(w.config.BootstrapPeers) > 0 {
@@ -139,6 +140,9 @@ func (w *Worker) Start() error {
 				w.peersMu.Lock()
 				w.peers = append(w.peers, peerInfo)
 				w.peersMu.Unlock()
+
+				// Send layer status to coordinator after connecting
+				go w.sendLayerStatus(peerInfo.ID)
 			}
 		}
 	}
@@ -501,6 +505,142 @@ func (w *Worker) handleWeights(layerID int, chunkIndex int, totalChunks int, dat
 			w.protocol.SendWeightsAck(ctx, p.ID, layerID)
 		}
 		w.peersMu.RUnlock()
+	}
+}
+
+// sendLayerStatus sends the list of locally loaded layers to the coordinator
+func (w *Worker) sendLayerStatus(coordinatorID peer.ID) {
+	// Get list of loaded layer IDs
+	loadedLayers := w.getLoadedLayerIDs()
+
+	log.Printf("Sending layer status to coordinator: %d layers loaded locally", len(loadedLayers))
+
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+
+	if err := w.protocol.SendLayerStatus(ctx, coordinatorID, loadedLayers); err != nil {
+		log.Printf("Warning: Failed to send layer status to coordinator: %v", err)
+	}
+}
+
+// getLoadedLayerIDs returns a list of layer IDs that are loaded in GPU memory
+func (w *Worker) getLoadedLayerIDs() []int {
+	w.weightsMu.RLock()
+	defer w.weightsMu.RUnlock()
+
+	layers := make([]int, 0, len(w.gpuWeights))
+	for layerID := range w.gpuWeights {
+		layers = append(layers, layerID)
+	}
+	return layers
+}
+
+// handleLayerRequest handles layer request messages from the coordinator
+func (w *Worker) handleLayerRequest(coordinatorID peer.ID, requestedLayers []int) {
+	// If empty request, just send back our status (query mode)
+	if len(requestedLayers) == 0 {
+		log.Printf("Received layer status query from coordinator")
+		w.sendLayerStatus(coordinatorID)
+		return
+	}
+
+	log.Printf("Received request to load %d layers from coordinator", len(requestedLayers))
+
+	// Check which layers we need to load vs already have
+	loadedLayers := w.getLoadedLayerIDs()
+	loadedSet := make(map[int]bool)
+	for _, id := range loadedLayers {
+		loadedSet[id] = true
+	}
+
+	needToLoad := make([]int, 0)
+	for _, layerID := range requestedLayers {
+		if !loadedSet[layerID] {
+			needToLoad = append(needToLoad, layerID)
+		}
+	}
+
+	if len(needToLoad) == 0 {
+		log.Printf("All requested layers already loaded locally")
+		w.sendLayerStatus(coordinatorID)
+		return
+	}
+
+	// Try to load missing layers from local model if available
+	if w.config.ModelPath != "" {
+		log.Printf("Loading %d layers from local storage: %v", len(needToLoad), needToLoad)
+		w.loadSpecificLayers(needToLoad)
+	} else {
+		log.Printf("No local model path, waiting for %d layers from coordinator", len(needToLoad))
+	}
+
+	// Send updated status
+	w.sendLayerStatus(coordinatorID)
+}
+
+// loadSpecificLayers loads specific layers from local model storage
+func (w *Worker) loadSpecificLayers(layerIDs []int) {
+	loader, err := model.NewWeightLoader(w.config.ModelPath)
+	if err != nil {
+		log.Printf("Warning: Failed to create weight loader: %v", err)
+		return
+	}
+	defer loader.Close()
+
+	for _, layerID := range layerIDs {
+		// Skip if already loaded
+		w.weightsMu.RLock()
+		_, exists := w.gpuWeights[layerID]
+		w.weightsMu.RUnlock()
+		if exists {
+			continue
+		}
+
+		weights, err := loader.LoadLayerWeights(layerID)
+		if err != nil {
+			log.Printf("Warning: Failed to load layer %d: %v", layerID, err)
+			continue
+		}
+
+		w.weightsMu.Lock()
+		w.layerWeights[layerID] = weights
+		w.weightsMu.Unlock()
+
+		// Upload weights to GPU
+		if w.modelConfig != nil {
+			gpuWeights, err := bindings.CreateLayerWeightsFromHost(
+				weights.QWeight,
+				weights.KWeight,
+				weights.VWeight,
+				weights.OWeight,
+				weights.GateWeight,
+				weights.UpWeight,
+				weights.DownWeight,
+				weights.AttnNorm,
+				weights.FFNNorm,
+				w.modelConfig,
+			)
+			if err != nil {
+				log.Printf("Warning: Failed to upload layer %d to GPU: %v", layerID, err)
+				continue
+			}
+			w.weightsMu.Lock()
+			w.gpuWeights[layerID] = gpuWeights
+			w.weightsMu.Unlock()
+
+			log.Printf("Loaded layer %d from local storage to GPU", layerID)
+		}
+
+		// Update layer range
+		w.weightsMu.Lock()
+		if w.startLayerID == -1 || layerID < w.startLayerID {
+			w.startLayerID = layerID
+		}
+		if layerID > w.endLayerID {
+			w.endLayerID = layerID
+		}
+		w.weightsReady = true
+		w.weightsMu.Unlock()
 	}
 }
 

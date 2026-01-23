@@ -608,6 +608,11 @@ func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, p
 
 	isLocal := peerID == e.localPeerID
 
+	// DEBUG: Log layer routing decision (only for first few layers and first token)
+	if position == 0 && layerID < 5 {
+		log.Printf("[DEBUG] Layer %d: peerID=%s, localPeerID=%s, isLocal=%v", layerID, peerID, e.localPeerID, isLocal)
+	}
+
 	if isLocal {
 		// Local execution
 		if e.layerExecutor != nil {
@@ -621,6 +626,11 @@ func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, p
 	e.mu.RLock()
 	remoteExec, hasRemoteExec := e.remoteExecutors[peerID]
 	e.mu.RUnlock()
+
+	// DEBUG: Log remote execution info
+	if position == 0 && layerID < 5 {
+		log.Printf("[DEBUG] Layer %d: hasRemoteExec=%v, numRemoteExecutors=%d", layerID, hasRemoteExec, len(e.remoteExecutors))
+	}
 
 	if hasRemoteExec {
 		// Use the remote layer executor to forward to peer
