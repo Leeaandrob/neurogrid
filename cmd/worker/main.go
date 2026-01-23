@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -330,6 +331,17 @@ func (w *Worker) sendResponse(peerID peer.ID, layerID int, seqID, requestID uint
 
 // executeLayer runs a forward pass through a transformer layer
 func (w *Worker) executeLayer(layerID int, hidden []byte, position int) ([]byte, error) {
+	// Lock this goroutine to its current OS thread to ensure CUDA context consistency.
+	// CUDA contexts are per-thread, so without this lock, the goroutine could be
+	// rescheduled to a different thread between CUDA calls, causing context errors.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Ensure CUDA context is set for this thread (P2P handlers may run on different goroutines)
+	if err := bindings.SetDevice(w.config.GPUID); err != nil {
+		return nil, fmt.Errorf("failed to set CUDA device: %w", err)
+	}
+
 	// Get GPU weights
 	gpuWeights, ok := w.gpuWeights[layerID]
 	if !ok {
@@ -544,7 +556,7 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 // getModelConfig returns configuration for the specified model
 func getModelConfig(modelName string) *types.LlamaConfig {
 	switch modelName {
-	case "llama-13b":
+	case "llama-13b", "llama-2-13b":
 		return types.Llama13BConfig()
 	case "llama-70b", "llama3-70b", "llama-3.3-70b":
 		return types.Llama70BConfig()

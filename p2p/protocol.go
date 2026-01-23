@@ -225,6 +225,7 @@ func (p *Protocol) handleExtendedMessage(s network.Stream, msgType uint8) {
 			select {
 			case ch <- msg:
 			default:
+				// Channel full, response dropped
 			}
 		}
 		if responseHandler != nil {

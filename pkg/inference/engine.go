@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"sync"
 	"sync/atomic"
 
@@ -356,24 +355,9 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 			return nil, fmt.Errorf("forward pass failed at step %d: %w", i, err)
 		}
 
-		// Debug: check logits
-		var maxLogit, minLogit float32 = logits[0], logits[0]
-		var maxIdx int
-		for j, l := range logits {
-			if l > maxLogit {
-				maxLogit = l
-				maxIdx = j
-			}
-			if l < minLogit {
-				minLogit = l
-			}
-		}
-		fmt.Printf("[DEBUG] Step %d: logits range [%.4f, %.4f], argmax=%d\n", i, minLogit, maxLogit, maxIdx)
-
 		// Sample next token
 		nextToken := e.sampler.Sample(logits, req.Temperature, req.TopP)
 		outputTokens = append(outputTokens, nextToken)
-		fmt.Printf("[DEBUG] Step %d: sampled token %d\n", i, nextToken)
 
 		// Check for EOS
 		if nextToken == e.tokenizer.EOSToken() {
@@ -612,21 +596,6 @@ func (e *Engine) forwardAllLayersHidden(ctx context.Context, hidden []byte, posi
 
 // forwardLayer executes a single layer forward pass.
 func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, []byte, []byte, error) {
-	// Debug: check input for NaN
-	if layerID == 0 {
-		hasNaN := false
-		for i := 0; i < len(hidden) && i < 100; i += 2 {
-			val := fp16ToFloat32Debug(hidden[i : i+2])
-			if val != val { // NaN check
-				hasNaN = true
-				break
-			}
-		}
-		if hasNaN {
-			fmt.Printf("[DEBUG] Layer %d input has NaN at position %d\n", layerID, position)
-		}
-	}
-
 	// Check if this is a local or remote layer
 	var peerID string
 	for _, a := range e.assignments {
@@ -639,22 +608,7 @@ func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, p
 	if peerID == e.localPeerID {
 		// Local execution
 		if e.layerExecutor != nil {
-			output, k, v, err := e.layerExecutor.Forward(ctx, layerID, hidden, position)
-			// Debug: check output for NaN
-			if layerID == 0 && err == nil {
-				hasNaN := false
-				for i := 0; i < len(output) && i < 100; i += 2 {
-					val := fp16ToFloat32Debug(output[i : i+2])
-					if val != val { // NaN check
-						hasNaN = true
-						break
-					}
-				}
-				if hasNaN {
-					fmt.Printf("[DEBUG] Layer %d output has NaN at position %d\n", layerID, position)
-				}
-			}
-			return output, k, v, err
+			return e.layerExecutor.Forward(ctx, layerID, hidden, position)
 		}
 		// Mock local execution for testing
 		return hidden, make([]byte, e.config.NumKVHeads*e.config.HeadDim*2), make([]byte, e.config.NumKVHeads*e.config.HeadDim*2), nil
@@ -719,17 +673,6 @@ func (e *Engine) embedToken(token int) ([]byte, error) {
 
 // applyLMHead applies the output projection to get logits.
 func (e *Engine) applyLMHead(hidden []byte) ([]float32, error) {
-	// DEBUG: Print first 4 hidden values
-	log.Printf("[applyLMHead] hidden size=%d bytes, useGPU=%v, gpuInference=%v",
-		len(hidden), e.useGPU, e.gpuInference != nil)
-	if len(hidden) >= 8 {
-		var vals []float32
-		for i := 0; i < 4; i++ {
-			vals = append(vals, fp16ToFloat32Debug(hidden[i*2:i*2+2]))
-		}
-		log.Printf("[applyLMHead] First 4 FP16 vals: %.4f %.4f %.4f %.4f", vals[0], vals[1], vals[2], vals[3])
-	}
-
 	// Use GPU LM head when available
 	if e.useGPU && e.gpuInference != nil {
 		return e.gpuInference.ApplyLMHeadGPU(hidden)
@@ -753,38 +696,6 @@ func (e *Engine) applyLMHead(hidden []byte) ([]float32, error) {
 // Config returns the model configuration.
 func (e *Engine) Config() *types.LlamaConfig {
 	return e.config
-}
-
-// fp16ToFloat32Debug converts FP16 bytes to float32 for debugging.
-func fp16ToFloat32Debug(b []byte) float32 {
-	if len(b) < 2 {
-		return 0
-	}
-	bits := uint16(b[0]) | uint16(b[1])<<8
-	sign := (bits >> 15) & 1
-	exp := (bits >> 10) & 0x1F
-	mant := bits & 0x3FF
-
-	var f float32
-	if exp == 0 {
-		if mant == 0 {
-			f = 0
-		} else {
-			f = float32(mant) / float32(1<<10) * float32(1.0/(1<<14))
-		}
-	} else if exp == 31 {
-		if mant == 0 {
-			f = float32(1e30) // Infinity
-		} else {
-			return float32(math.NaN()) // NaN
-		}
-	} else {
-		f = (1 + float32(mant)/float32(1<<10)) * float32(uint32(1)<<uint32(exp-15+127)) / float32(1<<127)
-	}
-	if sign == 1 {
-		f = -f
-	}
-	return f
 }
 
 // KVCaches returns the KV cache manager.

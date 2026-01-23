@@ -139,6 +139,7 @@ type RemoteLayerExecutor struct {
 // RemoteLayerExecutorConfig holds configuration for creating a RemoteLayerExecutor.
 type RemoteLayerExecutorConfig struct {
 	Host         host.Host
+	Protocol     *p2p.Protocol // Shared protocol instance (required)
 	TargetPeerID peer.ID
 	StartLayerID int
 	EndLayerID   int
@@ -147,23 +148,27 @@ type RemoteLayerExecutorConfig struct {
 }
 
 // NewRemoteLayerExecutor creates a new remote layer executor for forwarding to peers.
+// IMPORTANT: The Protocol must be provided and shared across all RemoteLayerExecutors
+// to ensure response routing works correctly (all executors use the same pendingResponses map).
 func NewRemoteLayerExecutor(config RemoteLayerExecutorConfig) *RemoteLayerExecutor {
 	timeout := config.Timeout
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
 
+	if config.Protocol == nil {
+		panic("RemoteLayerExecutorConfig.Protocol is required - must share protocol across all executors")
+	}
+
 	rle := &RemoteLayerExecutor{
 		host:           config.Host,
+		protocol:       config.Protocol, // Use shared protocol
 		targetPeerID:   config.TargetPeerID,
 		startLayerID:   config.StartLayerID,
 		endLayerID:     config.EndLayerID,
 		config:         config.Config,
 		defaultTimeout: timeout,
 	}
-
-	// Create protocol
-	rle.protocol = p2p.NewProtocol(config.Host)
 
 	return rle
 }

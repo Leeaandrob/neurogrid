@@ -5,7 +5,6 @@ package inference
 
 import (
 	"fmt"
-	"log"
 	"math"
 	"unsafe"
 
@@ -22,6 +21,11 @@ type GPULMHead struct {
 	vocabSize     int            // Output dimension (vocabulary size)
 	byteSize      uint64         // Total bytes on GPU
 	rmsNormEps    float32        // RMSNorm epsilon
+
+	// Preallocated GPU buffers for Forward() - avoids per-token cudaMalloc/cudaFree
+	hiddenGPU     unsafe.Pointer // GPU buffer for hidden state input
+	normalizedGPU unsafe.Pointer // GPU buffer for RMSNorm output
+	logitsGPU     unsafe.Pointer // GPU buffer for logits output
 }
 
 // NewGPULMHead uploads LM head weights to GPU memory (without final norm).
@@ -59,21 +63,49 @@ func NewGPULMHeadWithNorm(data []byte, finalNorm []byte, hiddenSize, vocabSize i
 		rmsNormEps: rmsNormEps,
 	}
 
+	// Preallocate GPU buffers for Forward() to avoid per-token allocations
+	hiddenBufSize := uint64(hiddenSize * 2) // FP16
+	logitsBufSize := uint64(vocabSize * 2)  // FP16
+
+	lmHead.hiddenGPU, err = bindings.AllocOnDevice(hiddenBufSize, 0)
+	if err != nil {
+		bindings.FreeOnDevice(ptr, 0)
+		return nil, fmt.Errorf("failed to preallocate hidden buffer: %w", err)
+	}
+
+	lmHead.normalizedGPU, err = bindings.AllocOnDevice(hiddenBufSize, 0)
+	if err != nil {
+		bindings.FreeOnDevice(ptr, 0)
+		bindings.FreeOnDevice(lmHead.hiddenGPU, 0)
+		return nil, fmt.Errorf("failed to preallocate normalized buffer: %w", err)
+	}
+
+	lmHead.logitsGPU, err = bindings.AllocOnDevice(logitsBufSize, 0)
+	if err != nil {
+		bindings.FreeOnDevice(ptr, 0)
+		bindings.FreeOnDevice(lmHead.hiddenGPU, 0)
+		bindings.FreeOnDevice(lmHead.normalizedGPU, 0)
+		return nil, fmt.Errorf("failed to preallocate logits buffer: %w", err)
+	}
+
 	// Upload final layernorm weights if provided
 	if finalNorm != nil {
 		expectedNormSize := hiddenSize * 2 // FP16
 		if len(finalNorm) != expectedNormSize {
+			lmHead.freePreallocated()
 			bindings.FreeOnDevice(ptr, 0)
 			return nil, fmt.Errorf("final norm size mismatch: got %d, expected %d", len(finalNorm), expectedNormSize)
 		}
 
 		normPtr, err := bindings.AllocOnDevice(uint64(expectedNormSize), 0)
 		if err != nil {
+			lmHead.freePreallocated()
 			bindings.FreeOnDevice(ptr, 0)
 			return nil, fmt.Errorf("failed to allocate GPU memory for final norm: %w", err)
 		}
 
 		if err := bindings.CopyToDeviceRaw(normPtr, unsafe.Pointer(&finalNorm[0]), uint64(expectedNormSize)); err != nil {
+			lmHead.freePreallocated()
 			bindings.FreeOnDevice(ptr, 0)
 			bindings.FreeOnDevice(normPtr, 0)
 			return nil, fmt.Errorf("failed to copy final norm to GPU: %w", err)
@@ -85,56 +117,53 @@ func NewGPULMHeadWithNorm(data []byte, finalNorm []byte, hiddenSize, vocabSize i
 	return lmHead, nil
 }
 
+// freePreallocated frees the preallocated GPU buffers.
+func (h *GPULMHead) freePreallocated() {
+	if h.hiddenGPU != nil {
+		bindings.FreeOnDevice(h.hiddenGPU, 0)
+		h.hiddenGPU = nil
+	}
+	if h.normalizedGPU != nil {
+		bindings.FreeOnDevice(h.normalizedGPU, 0)
+		h.normalizedGPU = nil
+	}
+	if h.logitsGPU != nil {
+		bindings.FreeOnDevice(h.logitsGPU, 0)
+		h.logitsGPU = nil
+	}
+}
+
 // Forward computes logits from hidden state.
 // hidden: FP16 hidden state [hiddenSize] in GPU memory (as byte slice)
 // returns: FP32 logits [vocabSize] in CPU memory for sampling
+//
+// OPTIMIZED: Uses preallocated GPU buffers to avoid per-token cudaMalloc/cudaFree.
 func (h *GPULMHead) Forward(hidden []byte) ([]float32, error) {
 	expectedHiddenSize := h.hiddenSize * 2 // FP16
 	if len(hidden) != expectedHiddenSize {
 		return nil, fmt.Errorf("hidden size mismatch: got %d bytes, expected %d", len(hidden), expectedHiddenSize)
 	}
 
-	// DEBUG: Print first few hidden values (FP16)
-	var hiddenVals []float32
-	for i := 0; i < 8 && i*2+1 < len(hidden); i++ {
-		hiddenVals = append(hiddenVals, fp16ToFloat32(hidden[i*2:i*2+2]))
-	}
-	log.Printf("[LMHead] Input hidden (first 8 FP16 values): %v", hiddenVals)
-
-	// Allocate GPU buffer for hidden state
-	hiddenGPU, err := bindings.AllocOnDevice(uint64(len(hidden)), 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate hidden buffer: %w", err)
-	}
-	defer bindings.FreeOnDevice(hiddenGPU, 0)
-
-	// Copy hidden to GPU
-	if err := bindings.CopyToDeviceRaw(hiddenGPU, unsafe.Pointer(&hidden[0]), uint64(len(hidden))); err != nil {
+	// Copy hidden to preallocated GPU buffer (no allocation needed)
+	if err := bindings.CopyToDeviceRaw(h.hiddenGPU, unsafe.Pointer(&hidden[0]), uint64(len(hidden))); err != nil {
 		return nil, fmt.Errorf("failed to copy hidden to GPU: %w", err)
 	}
 
 	// Apply final layernorm if available
-	inputForGEMM := hiddenGPU
+	inputForGEMM := h.hiddenGPU
 	if h.finalNormPtr != nil {
-		// Allocate buffer for normalized output
-		normalizedGPU, err := bindings.AllocOnDevice(uint64(len(hidden)), 0)
-		if err != nil {
-			return nil, fmt.Errorf("failed to allocate normalized buffer: %w", err)
-		}
-		defer bindings.FreeOnDevice(normalizedGPU, 0)
-
-		// Create tensors for RMSNorm
+		// Create tensors for RMSNorm using preallocated buffers
 		inputTensor := &types.Tensor{
 			Shape:  []int{1, h.hiddenSize},
 			Dtype:  types.DtypeFP16,
 			Device: 0,
-			Data:   hiddenGPU,
+			Data:   h.hiddenGPU,
 		}
 		outputTensor := &types.Tensor{
 			Shape:  []int{1, h.hiddenSize},
 			Dtype:  types.DtypeFP16,
 			Device: 0,
-			Data:   normalizedGPU,
+			Data:   h.normalizedGPU,
 		}
 		weightTensor := &types.Tensor{
 			Shape:  []int{h.hiddenSize},
@@ -148,28 +177,10 @@ func (h *GPULMHead) Forward(hidden []byte) ([]float32, error) {
 			return nil, fmt.Errorf("final RMSNorm failed: %w", err)
 		}
 
-		// DEBUG: Copy normalized output back and print
-		normDebug := make([]byte, len(hidden))
-		if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&normDebug[0]), normalizedGPU, uint64(len(hidden))); err == nil {
-			var normVals []float32
-			for i := 0; i < 8 && i*2+1 < len(normDebug); i++ {
-				normVals = append(normVals, fp16ToFloat32(normDebug[i*2:i*2+2]))
-			}
-			log.Printf("[LMHead] After RMSNorm (first 8 FP16 values): %v", normVals)
-		}
-
-		inputForGEMM = normalizedGPU
+		inputForGEMM = h.normalizedGPU
 	}
 
-	// Allocate GPU buffer for logits (FP16)
-	logitsSize := h.vocabSize * 2 // FP16
-	logitsGPU, err := bindings.AllocOnDevice(uint64(logitsSize), 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate logits buffer: %w", err)
-	}
-	defer bindings.FreeOnDevice(logitsGPU, 0)
-
-	// Create tensors for GEMM
+	// Create tensors for GEMM using preallocated logits buffer
 	// hidden: [1, hiddenSize]
 	// lm_head: [vocabSize, hiddenSize] (stored in row-major, needs transpose)
 	// output: [1, vocabSize]
@@ -192,7 +203,7 @@ func (h *GPULMHead) Forward(hidden []byte) ([]float32, error) {
 		Shape:  []int{1, h.vocabSize},
 		Dtype:  types.DtypeFP16,
 		Device: 0,
-		Data:   logitsGPU,
+		Data:   h.logitsGPU,
 	}
 
 	// Execute GEMM: logits = hidden @ lm_head^T (transB=true to transpose the weight matrix)
@@ -201,8 +212,9 @@ func (h *GPULMHead) Forward(hidden []byte) ([]float32, error) {
 	}
 
 	// Copy logits to host as FP16
+	logitsSize := h.vocabSize * 2 // FP16
 	logitsFP16 := make([]byte, logitsSize)
-	if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&logitsFP16[0]), logitsGPU, uint64(logitsSize)); err != nil {
+	if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&logitsFP16[0]), h.logitsGPU, uint64(logitsSize)); err != nil {
 		return nil, fmt.Errorf("failed to copy logits from GPU: %w", err)
 	}
 
@@ -212,47 +224,22 @@ func (h *GPULMHead) Forward(hidden []byte) ([]float32, error) {
 		logits[i] = fp16ToFloat32(logitsFP16[i*2 : i*2+2])
 	}
 
-	// DEBUG: Print top 5 logits
-	type logitEntry struct {
-		idx int
-		val float32
-	}
-	topN := make([]logitEntry, 5)
-	for i, v := range logits {
-		for j := 0; j < 5; j++ {
-			if v > topN[j].val {
-				copy(topN[j+1:], topN[j:4])
-				topN[j] = logitEntry{i, v}
-				break
-			}
-		}
-	}
-	log.Printf("[LMHead] Top 5 logits: [%d]=%.3f [%d]=%.3f [%d]=%.3f [%d]=%.3f [%d]=%.3f",
-		topN[0].idx, topN[0].val, topN[1].idx, topN[1].val, topN[2].idx, topN[2].val,
-		topN[3].idx, topN[3].val, topN[4].idx, topN[4].val)
-
 	return logits, nil
 }
 
 // ForwardFromGPU computes logits when hidden state is already on GPU.
 // hiddenGPU: GPU pointer to FP16 hidden state
 // returns: FP32 logits in CPU memory
-func (h *GPULMHead) ForwardFromGPU(hiddenGPU unsafe.Pointer) ([]float32, error) {
-	// Allocate GPU buffer for logits (FP16)
-	logitsSize := h.vocabSize * 2 // FP16
-	logitsGPUPtr, err := bindings.AllocOnDevice(uint64(logitsSize), 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate logits buffer: %w", err)
-	}
-	defer bindings.FreeOnDevice(logitsGPUPtr, 0)
-
-	// Create tensors for GEMM
+//
+// OPTIMIZED: Uses preallocated logits buffer to avoid per-token cudaMalloc/cudaFree.
+func (h *GPULMHead) ForwardFromGPU(hiddenGPUPtr unsafe.Pointer) ([]float32, error) {
+	// Create tensors for GEMM using preallocated logits buffer
 	// lm_head weights are [vocabSize, hiddenSize], need transB=true
 	hiddenTensor := &types.Tensor{
 		Shape:  []int{1, h.hiddenSize},
 		Dtype:  types.DtypeFP16,
 		Device: 0,
-		Data:   hiddenGPU,
+		Data:   hiddenGPUPtr,
 	}
 
 	lmHeadTensor := &types.Tensor{
@@ -266,7 +253,7 @@ func (h *GPULMHead) ForwardFromGPU(hiddenGPU unsafe.Pointer) ([]float32, error) 
 		Shape:  []int{1, h.vocabSize},
 		Dtype:  types.DtypeFP16,
 		Device: 0,
-		Data:   logitsGPUPtr,
+		Data:   h.logitsGPU,
 	}
 
 	// Execute GEMM with transB=true
@@ -275,8 +262,9 @@ func (h *GPULMHead) ForwardFromGPU(hiddenGPU unsafe.Pointer) ([]float32, error) 
 	}
 
 	// Copy logits to host and convert
+	logitsSize := h.vocabSize * 2 // FP16
 	logitsFP16 := make([]byte, logitsSize)
-	if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&logitsFP16[0]), logitsGPUPtr, uint64(logitsSize)); err != nil {
+	if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&logitsFP16[0]), h.logitsGPU, uint64(logitsSize)); err != nil {
 		return nil, fmt.Errorf("failed to copy logits from GPU: %w", err)
 	}
 
@@ -300,12 +288,18 @@ func (h *GPULMHead) VocabSize() int {
 
 // Close frees the GPU memory.
 func (h *GPULMHead) Close() error {
+	// Free preallocated buffers
+	h.freePreallocated()
+
+	// Free LM head weights
 	if h.ptr != nil {
 		if err := bindings.FreeOnDevice(h.ptr, 0); err != nil {
 			return fmt.Errorf("failed to free GPU LM head: %w", err)
 		}
 		h.ptr = nil
 	}
+
+	// Free final layernorm weights
 	if h.finalNormPtr != nil {
 		if err := bindings.FreeOnDevice(h.finalNormPtr, 0); err != nil {
 			return fmt.Errorf("failed to free GPU final norm: %w", err)
