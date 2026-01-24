@@ -205,8 +205,20 @@ func (c *Coordinator) waitForPeers() error {
 
 // initializeComponents initializes the inference components
 func (c *Coordinator) initializeComponents() error {
-	// Get model configuration
-	modelConfig := getModelConfig(c.config.ModelName)
+	// Get model configuration - try auto-detection from config.json first
+	var modelConfig scheduler.ModelConfig
+	if c.config.ModelPath != "" {
+		cfg, err := getModelConfigFromPath(c.config.ModelPath)
+		if err != nil {
+			log.Printf("Could not auto-detect model config from %s: %v, using --model-name", c.config.ModelPath, err)
+			modelConfig = getModelConfig(c.config.ModelName)
+		} else {
+			log.Printf("Auto-detected model config from %s/config.json", c.config.ModelPath)
+			modelConfig = cfg
+		}
+	} else {
+		modelConfig = getModelConfig(c.config.ModelName)
+	}
 
 	// Create scheduler
 	c.scheduler = scheduler.NewScheduler(modelConfig)
@@ -673,6 +685,32 @@ func (n *coordinatorNotifee) HandlePeerFound(pi peer.AddrInfo) {
 }
 
 // getModelConfig returns configuration for the specified model
+// getModelConfigFromPath auto-detects model configuration from config.json
+func getModelConfigFromPath(modelPath string) (scheduler.ModelConfig, error) {
+	cfg, err := model.LoadModelConfig(modelPath)
+	if err != nil {
+		return scheduler.ModelConfig{}, err
+	}
+
+	// HeadDim = HiddenSize / NumAttentionHeads
+	headDim := cfg.HiddenSize / cfg.NumAttentionHeads
+	if headDim == 0 {
+		headDim = 128 // Default
+	}
+
+	return scheduler.ModelConfig{
+		HiddenSize:       int64(cfg.HiddenSize),
+		IntermediateSize: int64(cfg.IntermediateSize),
+		NumLayers:        cfg.NumHiddenLayers,
+		NumHeads:         cfg.NumAttentionHeads,
+		NumKVHeads:       cfg.NumKeyValueHeads,
+		HeadDim:          headDim,
+		MaxSeqLen:        cfg.MaxPositionEmbeddings,
+		VocabSize:        int64(cfg.VocabSize),
+		RMSNormEps:       float32(cfg.RMSNormEps),
+	}, nil
+}
+
 func getModelConfig(modelName string) scheduler.ModelConfig {
 	switch modelName {
 	case "llama-7b", "llama-2-7b":

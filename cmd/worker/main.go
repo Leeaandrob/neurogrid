@@ -219,18 +219,18 @@ func (w *Worker) loadLocalWeights() error {
 	}
 	defer loader.Close()
 
-	// Get model config
-	modelConfig := getModelConfig(w.config.ModelName)
-	w.modelConfig = &types.LlamaConfig{
-		HiddenSize:       int(modelConfig.HiddenSize),
-		NumLayers:        modelConfig.NumLayers,
-		IntermediateSize: int(modelConfig.IntermediateSize),
-		NumHeads:         modelConfig.NumHeads,
-		NumKVHeads:       modelConfig.NumKVHeads,
-		HeadDim:          modelConfig.HeadDim,
-		VocabSize:        int(modelConfig.VocabSize),
-		MaxSeqLen:        modelConfig.MaxSeqLen,
-		RMSNormEps:       modelConfig.RMSNormEps,
+	// Get model config - try auto-detection from config.json first
+	if w.config.ModelPath != "" {
+		cfg, err := getModelConfigFromPath(w.config.ModelPath)
+		if err != nil {
+			log.Printf("Could not auto-detect model config from %s: %v, using --model-name", w.config.ModelPath, err)
+			w.modelConfig = getModelConfig(w.config.ModelName)
+		} else {
+			log.Printf("Auto-detected model config from %s/config.json", w.config.ModelPath)
+			w.modelConfig = cfg
+		}
+	} else {
+		w.modelConfig = getModelConfig(w.config.ModelName)
 	}
 
 	// Load all layers (in distributed mode, we only load assigned layers)
@@ -766,6 +766,32 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	n.worker.peersMu.Unlock()
 
 	log.Printf("Connected to peer: %s", pi.ID)
+}
+
+// getModelConfigFromPath auto-detects model configuration from config.json
+func getModelConfigFromPath(modelPath string) (*types.LlamaConfig, error) {
+	cfg, err := model.LoadModelConfig(modelPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// HeadDim = HiddenSize / NumAttentionHeads
+	headDim := cfg.HiddenSize / cfg.NumAttentionHeads
+	if headDim == 0 {
+		headDim = 128 // Default
+	}
+
+	return &types.LlamaConfig{
+		HiddenSize:       cfg.HiddenSize,
+		IntermediateSize: cfg.IntermediateSize,
+		NumLayers:        cfg.NumHiddenLayers,
+		NumHeads:         cfg.NumAttentionHeads,
+		NumKVHeads:       cfg.NumKeyValueHeads,
+		HeadDim:          headDim,
+		VocabSize:        cfg.VocabSize,
+		MaxSeqLen:        cfg.MaxPositionEmbeddings,
+		RMSNormEps:       float32(cfg.RMSNormEps),
+	}, nil
 }
 
 // getModelConfig returns configuration for the specified model
