@@ -1309,3 +1309,307 @@ func TestCoordinatorPeerConnectionCallback(t *testing.T) {
 
 	t.Log("PASS: Coordinator peer connection callback test completed")
 }
+
+// =============================================================================
+// PRP: HYBRID DISTRIBUTED INFERENCE - MODEL CONFIG PROTOCOL TESTS (RED PHASE)
+// =============================================================================
+// These tests validate the MsgTypeModelConfig message type for transferring
+// model configuration to stateless workers. All tests should FAIL initially
+// as the implementation doesn't exist yet.
+
+// TestProtocol_ModelConfigMessageType validates MsgTypeModelConfig constant exists
+// AC1: Worker receives ModelConfig via P2P
+func TestProtocol_ModelConfigMessageType(t *testing.T) {
+	// This test should FAIL initially - MsgTypeModelConfig doesn't exist yet
+	// Expected constant value: 0x07 (after MsgTypeLayerRequest = 0x06)
+
+	// Verify MsgTypeModelConfig constant is defined
+	// This should FAIL - p2p.MsgTypeModelConfig doesn't exist
+	if p2p.MsgTypeModelConfig != 0x07 {
+		t.Errorf("MsgTypeModelConfig should be 0x07, got 0x%02x", p2p.MsgTypeModelConfig)
+	}
+
+	t.Log("PASS: MsgTypeModelConfig constant defined")
+}
+
+// TestProtocol_SendModelConfig validates SendModelConfig method exists
+// AC1: Worker receives ModelConfig via P2P
+func TestProtocol_SendModelConfig(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Create sender and receiver hosts
+	sender, err := p2p.NewTestHost(ctx, 0)
+	if err != nil {
+		t.Fatalf("Sender creation failed: %v", err)
+	}
+	defer sender.Close()
+
+	receiver, err := p2p.NewTestHost(ctx, 0)
+	if err != nil {
+		t.Fatalf("Receiver creation failed: %v", err)
+	}
+	defer receiver.Close()
+
+	// Setup protocol on sender and receiver (required for stream negotiation)
+	senderProto := p2p.NewProtocol(sender)
+	_ = p2p.NewProtocol(receiver) // Receiver needs protocol registered for stream handling
+
+	// Connect sender to receiver
+	err = sender.Connect(ctx, p2p.GetHostInfo(receiver))
+	if err != nil {
+		t.Fatalf("Connection failed: %v", err)
+	}
+
+	// Create test config data (simulating serialized TransferableConfig)
+	testConfigData := []byte(`{"model_name":"mistral-7b","hidden_size":4096,"num_layers":32}`)
+
+	// This should FAIL - SendModelConfig method doesn't exist yet
+	err = senderProto.SendModelConfig(ctx, receiver.ID(), testConfigData)
+	if err != nil {
+		t.Fatalf("SendModelConfig failed: %v", err)
+	}
+
+	t.Log("PASS: SendModelConfig method exists and sends data")
+}
+
+// TestProtocol_ModelConfigRoundtrip validates full send/receive cycle
+// AC1: Worker receives ModelConfig via P2P (Log: "Received model config")
+func TestProtocol_ModelConfigRoundtrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Create sender and receiver hosts
+	sender, err := p2p.NewTestHost(ctx, 0)
+	if err != nil {
+		t.Fatalf("Sender creation failed: %v", err)
+	}
+	defer sender.Close()
+
+	receiver, err := p2p.NewTestHost(ctx, 0)
+	if err != nil {
+		t.Fatalf("Receiver creation failed: %v", err)
+	}
+	defer receiver.Close()
+
+	// Setup protocols
+	senderProto := p2p.NewProtocol(sender)
+	receiverProto := p2p.NewProtocol(receiver)
+
+	// Track received config
+	var receivedConfig []byte
+	var receivedFrom peer.ID
+	receivedChan := make(chan struct{})
+
+	// Register handler for model config
+	// This should FAIL - OnModelConfigReceived method doesn't exist yet
+	receiverProto.OnModelConfigReceived(func(config []byte, from peer.ID) {
+		receivedConfig = config
+		receivedFrom = from
+		close(receivedChan)
+	})
+
+	// Connect sender to receiver
+	err = sender.Connect(ctx, p2p.GetHostInfo(receiver))
+	if err != nil {
+		t.Fatalf("Connection failed: %v", err)
+	}
+
+	// Create test config data
+	testConfigData := []byte(`{
+		"model_name": "mistral-7b",
+		"hidden_size": 4096,
+		"num_layers": 32,
+		"intermediate_size": 14336,
+		"num_heads": 32,
+		"num_kv_heads": 8,
+		"head_dim": 128,
+		"vocab_size": 32000,
+		"max_seq_len": 8192,
+		"rms_norm_eps": 1e-5
+	}`)
+
+	// Send config
+	// This should FAIL - SendModelConfig method doesn't exist yet
+	err = senderProto.SendModelConfig(ctx, receiver.ID(), testConfigData)
+	if err != nil {
+		t.Fatalf("SendModelConfig failed: %v", err)
+	}
+
+	// Wait for reception
+	select {
+	case <-receivedChan:
+		// Verify received data
+		if receivedConfig == nil {
+			t.Fatal("Received config is nil")
+		}
+		if string(receivedConfig) != string(testConfigData) {
+			t.Errorf("Config data mismatch:\ngot: %s\nexpected: %s", string(receivedConfig), string(testConfigData))
+		}
+		if receivedFrom != sender.ID() {
+			t.Errorf("From peer mismatch: got %s, expected %s", receivedFrom.String(), sender.ID().String())
+		}
+		t.Log("PASS: ModelConfig round-trip working")
+
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for model config reception")
+	}
+}
+
+// TestProtocol_ModelConfigHandler validates handler registration
+// AC1: Worker receives ModelConfig via P2P
+func TestProtocol_ModelConfigHandler(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Create host
+	host, err := p2p.NewTestHost(ctx, 0)
+	if err != nil {
+		t.Fatalf("Host creation failed: %v", err)
+	}
+	defer host.Close()
+
+	// Setup protocol
+	proto := p2p.NewProtocol(host)
+
+	// Define handler
+	handlerCalled := false
+	handler := func(config []byte, from peer.ID) {
+		handlerCalled = true
+	}
+
+	// Register handler
+	// This should FAIL - OnModelConfigReceived method doesn't exist yet
+	proto.OnModelConfigReceived(handler)
+
+	// Verify handler can be registered (no panic)
+	// The actual invocation is tested in TestProtocol_ModelConfigRoundtrip
+
+	t.Log("PASS: OnModelConfigReceived handler registration works")
+	_ = handlerCalled // Handler will be called in roundtrip test
+}
+
+// TestCoordinator_SendsConfigBeforeWeights validates config is sent before weights
+// AC4: Coordinator distributes layers to 2 workers (config must precede weights)
+func TestCoordinator_SendsConfigBeforeWeights(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	config := types.TinyLlamaConfig()
+
+	// Create two hosts
+	coordinatorHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("Failed to create coordinator host: %v", err)
+	}
+	defer coordinatorHost.Close()
+
+	workerHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatalf("Failed to create worker host: %v", err)
+	}
+	defer workerHost.Close()
+
+	coordinatorPeerIDStr := coordinatorHost.ID().String()
+	workerPeerIDStr := workerHost.ID().String()
+
+	// Track message order
+	var messageOrder []string
+	var orderMu sync.Mutex
+
+	// Set up worker protocol to track messages
+	workerProto := p2p.NewProtocol(workerHost)
+
+	// Track config reception
+	// This should FAIL - OnModelConfigReceived doesn't exist yet
+	workerProto.OnModelConfigReceived(func(configData []byte, from peer.ID) {
+		orderMu.Lock()
+		messageOrder = append(messageOrder, "config")
+		orderMu.Unlock()
+	})
+
+	// Track weights reception
+	workerProto.OnWeightsReceived(func(layerID int, chunkIndex int, totalChunks int, data []byte) {
+		orderMu.Lock()
+		messageOrder = append(messageOrder, "weights")
+		orderMu.Unlock()
+	})
+
+	// Create layer assignments - all layers to worker
+	var assignments []scheduler.LayerAssignment
+	for i := 0; i < config.NumLayers; i++ {
+		assignments = append(assignments, scheduler.LayerAssignment{
+			LayerID: i,
+			PeerID:  workerPeerIDStr,
+		})
+	}
+
+	// Create coordinator engine
+	coordinatorEngine := inference.NewEngine(inference.EngineConfig{
+		ModelConfig: config,
+		LocalPeerID: coordinatorPeerIDStr,
+	})
+	coordinatorEngine.SetAssignments(assignments)
+
+	// Create peer manager
+	peerManager := p2p.NewPeerManager(coordinatorHost)
+	peerManager.Start()
+	defer peerManager.Stop()
+
+	// Create coordinator
+	coordinator := inference.NewDistributedInferenceCoordinator(inference.CoordinatorConfig{
+		Host:          coordinatorHost,
+		Engine:        coordinatorEngine,
+		PeerManager:   peerManager,
+		ModelConfig:   config,
+		Assignments:   assignments,
+		LocalPeerID:   coordinatorPeerIDStr,
+		WeightTimeout: 10 * time.Second,
+	})
+	defer coordinator.Close()
+
+	// Load test weights
+	for i := 0; i < 5; i++ {
+		testWeight := &inference.CPULayerWeights{
+			LayerID:  i,
+			AttnNorm: &inference.CPUTensor{Shape: []int{config.HiddenSize}, Data: make([]byte, config.HiddenSize*2)},
+		}
+		coordinator.LoadLocalWeights(i, testWeight)
+	}
+
+	// Connect hosts
+	workerInfo := peer.AddrInfo{ID: workerHost.ID(), Addrs: workerHost.Addrs()}
+	coordinatorHost.Peerstore().AddAddrs(workerHost.ID(), workerHost.Addrs(), time.Hour)
+	peerManager.AddPeer(workerInfo)
+
+	err = coordinatorHost.Connect(ctx, workerInfo)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
+	}
+
+	// Wait for distribution to happen
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify message order: config should come before weights
+	orderMu.Lock()
+	defer orderMu.Unlock()
+
+	if len(messageOrder) == 0 {
+		t.Fatal("No messages received")
+	}
+
+	// First message should be config
+	if messageOrder[0] != "config" {
+		t.Errorf("First message should be config, got: %s", messageOrder[0])
+	}
+
+	// All subsequent messages should be weights
+	for i := 1; i < len(messageOrder); i++ {
+		if messageOrder[i] != "weights" {
+			t.Errorf("Message %d should be weights, got: %s", i, messageOrder[i])
+		}
+	}
+
+	t.Log("PASS: Coordinator sends config before weights")
+	t.Logf("Message order: %v", messageOrder)
+}

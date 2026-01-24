@@ -13,6 +13,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/neurogrid/engine/pkg/telemetry"
 )
 
 const (
@@ -27,13 +28,20 @@ const (
 	// Format: MsgType (1 byte) + LayerID (4 bytes) + SeqID (8 bytes) + RequestID (8 bytes) + DataLen (4 bytes)
 	ExtendedHeaderSize = 25
 
+	// TracedHeaderSize is the size of the header with trace context for distributed tracing.
+	// Format: ExtendedHeader (25 bytes) + TraceID (16 bytes) + SpanID (8 bytes) + TraceFlags (1 byte)
+	TracedHeaderSize = ExtendedHeaderSize + telemetry.TraceContextSize
+
 	// Message types for the tensor protocol
-	MsgTypeActivation   = 0x01 // Forward activation to remote peer
-	MsgTypeResponse     = 0x02 // Return computed hidden state
-	MsgTypeWeights      = 0x03 // Transfer layer weights
-	MsgTypeWeightsAck   = 0x04 // Acknowledge weights received
-	MsgTypeLayerStatus  = 0x05 // Worker reports which layers it has locally
-	MsgTypeLayerRequest = 0x06 // Coordinator requests specific layers to be loaded
+	MsgTypeActivation       = 0x01 // Forward activation to remote peer
+	MsgTypeResponse         = 0x02 // Return computed hidden state
+	MsgTypeWeights          = 0x03 // Transfer layer weights
+	MsgTypeWeightsAck       = 0x04 // Acknowledge weights received
+	MsgTypeLayerStatus      = 0x05 // Worker reports which layers it has locally
+	MsgTypeLayerRequest     = 0x06 // Coordinator requests specific layers to be loaded
+	MsgTypeModelConfig      = 0x07 // Transfer model configuration to stateless worker
+	MsgTypeTracedActivation = 0x11 // Forward activation with trace context
+	MsgTypeTracedResponse   = 0x12 // Return computed hidden state with trace context
 
 	// WeightChunkSize is the maximum size of a weight chunk (1MB)
 	WeightChunkSize = 1024 * 1024
@@ -44,12 +52,13 @@ var ErrResponseTimeout = fmt.Errorf("response timeout")
 
 // TensorMessage represents a tensor being transferred over the network.
 type TensorMessage struct {
-	MsgType   uint8
-	LayerID   int
-	SeqID     uint64
-	RequestID uint64
-	Data      []byte
-	From      peer.ID
+	MsgType      uint8
+	LayerID      int
+	SeqID        uint64
+	RequestID    uint64
+	Data         []byte
+	From         peer.ID
+	TraceContext telemetry.TraceContext // Trace context for distributed tracing
 }
 
 // TensorHandler is a callback for received tensors.
@@ -64,6 +73,9 @@ type LayerStatusHandler func(peerID peer.ID, loadedLayers []int)
 // LayerRequestHandler is a callback for when coordinator requests specific layers.
 type LayerRequestHandler func(peerID peer.ID, requestedLayers []int)
 
+// ModelConfigHandler is a callback for received model config.
+type ModelConfigHandler func(config []byte, from peer.ID)
+
 // Protocol manages the tensor transfer protocol.
 type Protocol struct {
 	host                host.Host
@@ -73,6 +85,7 @@ type Protocol struct {
 	weightsHandler      WeightsHandler                 // Handler for weight chunks
 	layerStatusHandler  LayerStatusHandler             // Handler for layer status reports
 	layerRequestHandler LayerRequestHandler            // Handler for layer requests
+	modelConfigHandler  ModelConfigHandler             // Handler for model config messages
 	pendingResponses    map[uint64]chan *TensorMessage // RequestID -> response channel
 	pendingWeightsAck   map[string]chan struct{}       // peerID:layerID -> ack channel
 	pendingLayerStatus  map[string]chan []int          // peerID -> layer status channel
@@ -136,6 +149,13 @@ func (p *Protocol) OnLayerRequestReceived(handler LayerRequestHandler) {
 	p.layerRequestHandler = handler
 }
 
+// OnModelConfigReceived sets the callback for model config messages.
+func (p *Protocol) OnModelConfigReceived(handler ModelConfigHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.modelConfigHandler = handler
+}
+
 // RegisterPendingRequest creates a pending response channel for a request ID.
 func (p *Protocol) RegisterPendingRequest(requestID uint64) {
 	p.mu.Lock()
@@ -190,7 +210,10 @@ func (p *Protocol) handleStream(s network.Stream) {
 
 	// Check if this is an extended header (message type byte)
 	msgType := firstByte[0]
-	if msgType >= MsgTypeActivation && msgType <= MsgTypeLayerRequest {
+	if msgType == MsgTypeTracedActivation || msgType == MsgTypeTracedResponse {
+		// Traced message with trace context
+		p.handleTracedMessage(s, msgType)
+	} else if msgType >= MsgTypeActivation && msgType <= MsgTypeModelConfig {
 		// Extended header format
 		p.handleExtendedMessage(s, msgType)
 	} else {
@@ -308,6 +331,14 @@ func (p *Protocol) handleExtendedMessage(s network.Stream, msgType uint8) {
 		if layerRequestHandler != nil {
 			layerRequestHandler(peerID, layers)
 		}
+	case MsgTypeModelConfig:
+		// Coordinator sending model config to stateless worker
+		p.mu.RLock()
+		modelConfigHandler := p.modelConfigHandler
+		p.mu.RUnlock()
+		if modelConfigHandler != nil {
+			modelConfigHandler(data, s.Conn().RemotePeer())
+		}
 	}
 }
 
@@ -337,6 +368,71 @@ func encodeLayerList(layers []int) []byte {
 		binary.BigEndian.PutUint32(data[4+i*4:8+i*4], uint32(layerID))
 	}
 	return data
+}
+
+// handleTracedMessage processes messages with trace context for distributed tracing.
+func (p *Protocol) handleTracedMessage(s network.Stream, msgType uint8) {
+	// Read rest of traced header (TracedHeaderSize - 1 bytes remaining)
+	restHeader := make([]byte, TracedHeaderSize-1)
+	if _, err := io.ReadFull(s, restHeader); err != nil {
+		return
+	}
+
+	// Reconstruct full header
+	header := make([]byte, TracedHeaderSize)
+	header[0] = msgType
+	copy(header[1:], restHeader)
+
+	// Decode extended header part
+	_, layerID, seqID, requestID, dataLen := DecodeExtendedHeader(header[:ExtendedHeaderSize])
+
+	// Decode trace context
+	var traceCtx telemetry.TraceContext
+	traceCtx.Deserialize(header[ExtendedHeaderSize:])
+
+	// Read data
+	data := make([]byte, dataLen)
+	if _, err := io.ReadFull(s, data); err != nil {
+		return
+	}
+
+	// Create message with trace context
+	msg := &TensorMessage{
+		MsgType:      msgType,
+		LayerID:      layerID,
+		SeqID:        seqID,
+		RequestID:    requestID,
+		Data:         data,
+		From:         s.Conn().RemotePeer(),
+		TraceContext: traceCtx,
+	}
+
+	// Route by message type (same as non-traced but handlers can access trace context)
+	p.mu.RLock()
+	activationHandler := p.activationHandler
+	responseHandler := p.responseHandler
+	p.mu.RUnlock()
+
+	switch msgType {
+	case MsgTypeTracedActivation:
+		if activationHandler != nil {
+			activationHandler(msg)
+		}
+	case MsgTypeTracedResponse:
+		// Check for pending response channel
+		p.mu.RLock()
+		ch, ok := p.pendingResponses[requestID]
+		p.mu.RUnlock()
+		if ok {
+			select {
+			case ch <- msg:
+			default:
+			}
+		}
+		if responseHandler != nil {
+			responseHandler(msg)
+		}
+	}
 }
 
 // handleLegacyMessage processes messages with legacy header format.
@@ -416,6 +512,59 @@ func (p *Protocol) SendResponse(ctx context.Context, peerID peer.ID, layerID int
 	return p.sendExtendedMessage(ctx, peerID, MsgTypeResponse, layerID, seqID, requestID, data)
 }
 
+// SendTracedActivation sends an activation tensor with trace context for distributed tracing.
+// This enables end-to-end request tracing across coordinator and workers.
+func (p *Protocol) SendTracedActivation(ctx context.Context, peerID peer.ID, layerID int, seqID uint64, requestID uint64, data []byte) error {
+	// Register pending request before sending
+	p.RegisterPendingRequest(requestID)
+	return p.sendTracedMessage(ctx, peerID, MsgTypeTracedActivation, layerID, seqID, requestID, data)
+}
+
+// SendTracedResponse sends a response tensor with trace context.
+func (p *Protocol) SendTracedResponse(ctx context.Context, peerID peer.ID, layerID int, seqID uint64, requestID uint64, data []byte) error {
+	return p.sendTracedMessage(ctx, peerID, MsgTypeTracedResponse, layerID, seqID, requestID, data)
+}
+
+// sendTracedMessage sends a message with trace context for distributed tracing.
+func (p *Protocol) sendTracedMessage(ctx context.Context, peerID peer.ID, msgType uint8, layerID int, seqID uint64, requestID uint64, data []byte) error {
+	// Open stream to peer
+	s, err := p.host.NewStream(ctx, peerID, protocol.ID(TensorProtocolID))
+	if err != nil {
+		return fmt.Errorf("failed to open stream: %w", err)
+	}
+	defer s.Close()
+
+	// Build traced header: ExtendedHeader (25B) + TraceContext (25B) = 50B
+	header := make([]byte, TracedHeaderSize)
+	EncodeExtendedHeader(header[:ExtendedHeaderSize], msgType, layerID, seqID, requestID, len(data))
+
+	// Extract and append trace context from context.Context
+	traceCtx := telemetry.ExtractTraceContext(ctx)
+	copy(header[ExtendedHeaderSize:], traceCtx.Serialize())
+
+	if _, err := s.Write(header); err != nil {
+		return fmt.Errorf("failed to write traced header: %w", err)
+	}
+
+	// Write data
+	if len(data) > 0 {
+		if _, err := s.Write(data); err != nil {
+			return fmt.Errorf("failed to write data: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// ContextFromMessage creates a context.Context with trace context extracted from a TensorMessage.
+// This should be used by workers to continue traces initiated by the coordinator.
+func ContextFromMessage(ctx context.Context, msg *TensorMessage) context.Context {
+	if msg.TraceContext.IsEmpty() {
+		return ctx
+	}
+	return telemetry.ExtractTraceContextFromBytes(ctx, msg.TraceContext.Serialize())
+}
+
 // SendWeights sends layer weights to a remote peer in chunks.
 func (p *Protocol) SendWeights(ctx context.Context, peerID peer.ID, layerID int, data []byte) error {
 	// Calculate number of chunks
@@ -471,6 +620,12 @@ func (p *Protocol) SendLayerStatus(ctx context.Context, peerID peer.ID, loadedLa
 func (p *Protocol) SendLayerRequest(ctx context.Context, peerID peer.ID, layerIDs []int) error {
 	data := encodeLayerList(layerIDs)
 	return p.sendExtendedMessage(ctx, peerID, MsgTypeLayerRequest, 0, 0, 0, data)
+}
+
+// SendModelConfig sends model configuration to a remote peer.
+// Config is sent as a single message (< 1KB), not chunked.
+func (p *Protocol) SendModelConfig(ctx context.Context, peerID peer.ID, configData []byte) error {
+	return p.sendExtendedMessage(ctx, peerID, MsgTypeModelConfig, 0, 0, 0, configData)
 }
 
 // RequestLayerStatus requests layer status from a peer and waits for response.

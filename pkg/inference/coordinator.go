@@ -14,6 +14,19 @@ import (
 	"github.com/neurogrid/engine/pkg/types"
 )
 
+// peerIDLogLength is the number of characters to show when logging peer IDs.
+// Peer IDs are truncated for readability in log output.
+const peerIDLogLength = 12
+
+// shortPeerID returns a truncated peer ID string for logging.
+// Example: "12D3KooWSttt" from a full peer ID.
+func shortPeerID(peerID string) string {
+	if len(peerID) < peerIDLogLength {
+		return peerID
+	}
+	return peerID[:peerIDLogLength]
+}
+
 // DistributedInferenceCoordinator manages distributed inference across peers.
 // It handles weight distribution, remote executor setup, and peer lifecycle.
 type DistributedInferenceCoordinator struct {
@@ -37,6 +50,10 @@ type DistributedInferenceCoordinator struct {
 	// Peer layer status (which layers each peer has locally)
 	peerLoadedLayers map[string][]int // peerID -> list of layerIDs already loaded
 
+	// Config distribution tracking for stateless workers
+	configSent map[string]bool // Track which peers received config
+	modelName  string          // Model name for config serialization
+
 	// Remote executors
 	remoteExecutors map[string]*RemoteLayerExecutor // peerID -> executor
 
@@ -57,6 +74,7 @@ type CoordinatorConfig struct {
 	Assignments   []scheduler.LayerAssignment
 	LocalPeerID   string
 	WeightTimeout time.Duration
+	ModelName     string // Model name for config transfer to stateless workers
 }
 
 // NewDistributedInferenceCoordinator creates a new coordinator.
@@ -70,6 +88,12 @@ func NewDistributedInferenceCoordinator(config CoordinatorConfig) *DistributedIn
 		panic("CoordinatorConfig.Protocol is required - must provide shared protocol")
 	}
 
+	// Use model name from config, or default if not provided
+	modelName := config.ModelName
+	if modelName == "" {
+		modelName = "unknown"
+	}
+
 	dic := &DistributedInferenceCoordinator{
 		host:             config.Host,
 		engine:           config.Engine,
@@ -80,6 +104,8 @@ func NewDistributedInferenceCoordinator(config CoordinatorConfig) *DistributedIn
 		localLayers:      make([]int, 0),
 		localWeights:     make(map[int]*CPULayerWeights),
 		peerLoadedLayers: make(map[string][]int),
+		configSent:       make(map[string]bool),
+		modelName:        modelName,
 		remoteExecutors:  make(map[string]*RemoteLayerExecutor),
 		weightTimeout:    timeout,
 	}
@@ -162,7 +188,7 @@ func (dic *DistributedInferenceCoordinator) onPeerConnected(peerID peer.ID) {
 	dic.mu.Unlock()
 
 	peerIDStr := peerID.String()
-	log.Printf("[Coordinator] Peer connected: %s", peerIDStr[:12])
+	log.Printf("[Coordinator] Peer connected: %s", shortPeerID(peerIDStr))
 
 	// Check if this peer has layer assignments
 	dic.mu.RLock()
@@ -170,7 +196,7 @@ func (dic *DistributedInferenceCoordinator) onPeerConnected(peerID peer.ID) {
 	dic.mu.RUnlock()
 
 	if !hasAssignments {
-		log.Printf("[Coordinator] No layer assignments for peer %s", peerIDStr[:12])
+		log.Printf("[Coordinator] No layer assignments for peer %s", shortPeerID(peerIDStr))
 		return
 	}
 
@@ -186,7 +212,7 @@ func (dic *DistributedInferenceCoordinator) onPeerConnected(peerID peer.ID) {
 func (dic *DistributedInferenceCoordinator) onLayerStatusReceived(peerID peer.ID, loadedLayers []int) {
 	peerIDStr := peerID.String()
 	log.Printf("[Coordinator] Received layer status from %s: %d layers loaded locally",
-		peerIDStr[:12], len(loadedLayers))
+		shortPeerID(peerIDStr), len(loadedLayers))
 
 	dic.mu.Lock()
 	dic.peerLoadedLayers[peerIDStr] = loadedLayers
@@ -207,7 +233,7 @@ func (dic *DistributedInferenceCoordinator) requestAndDistributeWeights(peerID p
 
 	if !hasStatus {
 		// Request layer status explicitly
-		log.Printf("[Coordinator] Requesting layer status from peer %s", peerIDStr[:12])
+		log.Printf("[Coordinator] Requesting layer status from peer %s", shortPeerID(peerIDStr))
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		var err error
 		loadedLayers, err = dic.protocol.RequestLayerStatus(ctx, peerID, 10*time.Second)
@@ -215,7 +241,7 @@ func (dic *DistributedInferenceCoordinator) requestAndDistributeWeights(peerID p
 
 		if err != nil {
 			log.Printf("[Coordinator] Failed to get layer status from %s: %v, will send all weights",
-				peerIDStr[:12], err)
+				shortPeerID(peerIDStr), err)
 			loadedLayers = nil
 		} else {
 			dic.mu.Lock()
@@ -231,7 +257,7 @@ func (dic *DistributedInferenceCoordinator) requestAndDistributeWeights(peerID p
 // onPeerDisconnected is called when a peer disconnects.
 func (dic *DistributedInferenceCoordinator) onPeerDisconnected(peerID peer.ID) {
 	peerIDStr := peerID.String()
-	log.Printf("[Coordinator] Peer disconnected: %s", peerIDStr[:12])
+	log.Printf("[Coordinator] Peer disconnected: %s", shortPeerID(peerIDStr))
 
 	dic.mu.Lock()
 	defer dic.mu.Unlock()
@@ -289,20 +315,63 @@ func (dic *DistributedInferenceCoordinator) setupRemoteExecutor(peerID peer.ID, 
 	}
 
 	log.Printf("[Coordinator] Registered remote executor for peer %s (layers %d-%d)",
-		peerIDStr[:12], startLayer, endLayer)
+		shortPeerID(peerIDStr), startLayer, endLayer)
+}
+
+// sendConfigToPeer sends model config to a peer if not already sent.
+// Returns true if config was sent (or already sent), false on error.
+// Config must be sent before weights so stateless workers can process incoming weight data.
+func (dic *DistributedInferenceCoordinator) sendConfigToPeer(peerID peer.ID) bool {
+	peerIDStr := peerID.String()
+
+	dic.mu.RLock()
+	alreadySent := dic.configSent[peerIDStr]
+	dic.mu.RUnlock()
+
+	if alreadySent || dic.config == nil {
+		return true
+	}
+
+	configData, err := SerializeConfig(dic.config, dic.modelName)
+	if err != nil {
+		log.Printf("[Coordinator] Failed to serialize config for %s: %v", shortPeerID(peerIDStr), err)
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := dic.protocol.SendModelConfig(ctx, peerID, configData); err != nil {
+		log.Printf("[Coordinator] Failed to send config to %s: %v", shortPeerID(peerIDStr), err)
+		return false
+	}
+
+	dic.mu.Lock()
+	dic.configSent[peerIDStr] = true
+	dic.mu.Unlock()
+
+	log.Printf("[Coordinator] Sent model config to peer %s", shortPeerID(peerIDStr))
+
+	// Brief pause to ensure config is processed before weights
+	time.Sleep(100 * time.Millisecond)
+	return true
 }
 
 // distributeWeightsToPeer sends layer weights to a connected peer.
 // Only sends weights for layers the peer doesn't already have locally.
+// Config is sent before weights via sendConfigToPeer.
 func (dic *DistributedInferenceCoordinator) distributeWeightsToPeer(peerID peer.ID) {
 	peerIDStr := peerID.String()
 
 	// Get all weights assigned to this peer
 	allWeights := dic.GetWeightsForPeer(peerIDStr)
 	if len(allWeights) == 0 {
-		log.Printf("[Coordinator] No weights to distribute to peer %s", peerIDStr[:12])
+		log.Printf("[Coordinator] No weights to distribute to peer %s", shortPeerID(peerIDStr))
 		return
 	}
+
+	// Send config before weights (critical for stateless workers)
+	dic.sendConfigToPeer(peerID)
 
 	// Check which layers peer already has locally
 	dic.mu.RLock()
@@ -328,28 +397,28 @@ func (dic *DistributedInferenceCoordinator) distributeWeightsToPeer(peerID peer.
 	// Log the optimization
 	if len(loadedLayers) > 0 {
 		log.Printf("[Coordinator] Peer %s has %d/%d layers locally cached, sending %d missing layers",
-			peerIDStr[:12], len(loadedLayers), len(allWeights), len(missingWeights))
+			shortPeerID(peerIDStr), len(loadedLayers), len(allWeights), len(missingWeights))
 	}
 
 	if len(missingWeights) == 0 {
 		log.Printf("[Coordinator] Peer %s has all %d layers locally, no transfer needed!",
-			peerIDStr[:12], len(allWeights))
+			shortPeerID(peerIDStr), len(allWeights))
 		return
 	}
 
 	log.Printf("[Coordinator] Distributing %d layer weights to peer %s (layers: %v)",
-		len(missingWeights), peerIDStr[:12], missingLayerIDs)
+		len(missingWeights), shortPeerID(peerIDStr), missingLayerIDs)
 
 	ctx, cancel := context.WithTimeout(context.Background(), dic.weightTimeout)
 	defer cancel()
 
 	err := dic.weightDistributor.DistributeLayersToPerformer(ctx, peerID, missingWeights, 30*time.Second)
 	if err != nil {
-		log.Printf("[Coordinator] Weight distribution to %s failed: %v", peerIDStr[:12], err)
+		log.Printf("[Coordinator] Weight distribution to %s failed: %v", shortPeerID(peerIDStr), err)
 		return
 	}
 
-	log.Printf("[Coordinator] Successfully distributed %d weights to peer %s", len(missingWeights), peerIDStr[:12])
+	log.Printf("[Coordinator] Successfully distributed %d weights to peer %s", len(missingWeights), shortPeerID(peerIDStr))
 }
 
 // onLayerWeightsReceived is called when layer weights are received from a peer.

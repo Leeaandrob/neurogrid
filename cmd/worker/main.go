@@ -134,6 +134,7 @@ func (w *Worker) Start() error {
 	w.protocol.OnActivationReceived(w.handleActivation)
 	w.protocol.OnWeightsReceived(w.handleWeights)
 	w.protocol.OnLayerRequestReceived(w.handleLayerRequest)
+	w.protocol.OnModelConfigReceived(w.handleModelConfig)
 
 	// Connect to bootstrap peers (coordinator)
 	if len(w.config.BootstrapPeers) > 0 {
@@ -699,6 +700,23 @@ func (w *Worker) loadSpecificLayers(layerIDs []int) {
 		w.weightsReady = true
 		w.weightsMu.Unlock()
 	}
+}
+
+// handleModelConfig handles model configuration received from coordinator.
+// This enables stateless workers to receive config before weights.
+func (w *Worker) handleModelConfig(data []byte, from peer.ID) {
+	config, modelName, err := inference.DeserializeConfig(data)
+	if err != nil {
+		log.Printf("Error deserializing model config: %v", err)
+		return
+	}
+
+	w.weightsMu.Lock()
+	w.modelConfig = config
+	w.weightsMu.Unlock()
+
+	log.Printf("Received model config: %s (%d layers, hidden=%d)",
+		modelName, config.NumLayers, config.HiddenSize)
 }
 
 // Shutdown gracefully shuts down the worker
