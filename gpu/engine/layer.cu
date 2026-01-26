@@ -388,7 +388,8 @@ extern "C" int cuda_layer_forward(
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    float rms_norm_eps
+    float rms_norm_eps,
+    float rope_theta
 ) {
     LayerWeights* w = (LayerWeights*)weights;
 
@@ -494,19 +495,20 @@ extern "C" int cuda_layer_forward(
     if (result != 0) goto cleanup;
 
     // 3. Reshape for attention: [batch, seq, hidden] -> [batch, seq, num_heads, head_dim]
-    //    and apply RoPE
+    //    and apply RoPE with configurable theta
     {
         // For RoPE, we need [batch, seq, num_heads, head_dim] layout
         // Q: [num_tokens, hidden] -> [batch, seq, num_heads, head_dim]
         // Already in correct layout for our purposes
+        // Use split-half style (0) for Mistral/Llama 2 models
 
-        result = cuda_rope(q, q, positions, batch_size, seq_len, num_heads, head_dim);
+        result = cuda_rope_with_theta(q, q, positions, batch_size, seq_len, num_heads, head_dim, 0, rope_theta);
 #ifdef DEBUG_CUDA
         checkNaN(q, hidden_size, "AFTER_Q_ROPE");
 #endif
         if (result != 0) goto cleanup;
 
-        result = cuda_rope(k, k, positions, batch_size, seq_len, num_kv_heads, head_dim);
+        result = cuda_rope_with_theta(k, k, positions, batch_size, seq_len, num_kv_heads, head_dim, 0, rope_theta);
 #ifdef DEBUG_CUDA
         checkNaN(k, kv_dim, "AFTER_K_ROPE");
 #endif

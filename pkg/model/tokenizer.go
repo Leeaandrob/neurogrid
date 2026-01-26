@@ -25,6 +25,7 @@ type Tokenizer struct {
 	padToken      int
 	unkToken      int
 	vocabSize     int
+	spaceMarker   string // Space marker: "Ġ" for GPT-2 style, "▁" for SentencePiece
 }
 
 // BPEMerge represents a BPE merge rule.
@@ -69,10 +70,37 @@ func NewTokenizerFromJSON(data []byte) (*Tokenizer, error) {
 		vocab:         config.Model.Vocab,
 		vocabByID:     make(map[int]string),
 		specialTokens: make(map[string]int),
-		bosToken:      1, // Default for Llama
-		eosToken:      2, // Default for Llama
-		padToken:      0, // Default for Llama
-		unkToken:      0, // Default for Llama
+		bosToken:      1,   // Default for Llama
+		eosToken:      2,   // Default for Llama
+		padToken:      0,   // Default for Llama
+		unkToken:      0,   // Default for Llama
+		spaceMarker:   "▁", // Default: SentencePiece style
+	}
+
+	// Detect tokenizer style by counting tokens with each space marker prefix
+	// GPT-2 style uses "Ġ" (U+0120), SentencePiece uses "▁" (U+2581)
+	// Some tokenizers have both markers, so count which one is actually used in word tokens
+	gpt2Count := 0
+	spCount := 0
+	for token := range config.Model.Vocab {
+		if len(token) > 1 { // Only count multi-char tokens (actual words with space prefix)
+			if strings.HasPrefix(token, "Ġ") {
+				gpt2Count++
+			}
+			if strings.HasPrefix(token, "▁") {
+				spCount++
+			}
+		}
+	}
+
+	if gpt2Count > spCount && gpt2Count > 100 {
+		t.spaceMarker = "Ġ"
+		log.Printf("[Tokenizer] Detected GPT-2 style tokenizer (space marker: Ġ, %d tokens)", gpt2Count)
+	} else if spCount > 0 {
+		t.spaceMarker = "▁"
+		log.Printf("[Tokenizer] Detected SentencePiece style tokenizer (space marker: ▁, %d tokens)", spCount)
+	} else {
+		log.Printf("[Tokenizer] No space marker detected, using default SentencePiece style")
 	}
 
 	// Build reverse vocab
@@ -135,7 +163,12 @@ func (t *Tokenizer) Encode(text string) ([]int, error) {
 
 	// Split text by special tokens and encode each segment
 	var tokens []int
-	tokens = append(tokens, t.bosToken)
+
+	// Only add BOS if text doesn't already start with a BOS token marker
+	// This handles chat templates that include <s> at the start
+	if !strings.HasPrefix(text, "<s>") {
+		tokens = append(tokens, t.bosToken)
+	}
 
 	// Find and process special tokens
 	remaining := text
@@ -205,8 +238,8 @@ func (t *Tokenizer) preTokenize(text string) []string {
 				words = append(words, current.String())
 				current.Reset()
 			}
-			// Llama tokenizer includes space as prefix
-			current.WriteRune('▁') // Unicode character U+2581
+			// Use the detected space marker (Ġ for GPT-2, ▁ for SentencePiece)
+			current.WriteString(t.spaceMarker)
 		} else {
 			current.WriteRune(r)
 		}
@@ -323,8 +356,8 @@ func (t *Tokenizer) Decode(tokens []int) (string, error) {
 		}
 
 		if token, ok := t.vocabByID[id]; ok {
-			// Replace sentencepiece space marker with actual space
-			token = strings.ReplaceAll(token, "▁", " ")
+			// Replace space marker with actual space (handles both GPT-2 and SentencePiece)
+			token = strings.ReplaceAll(token, t.spaceMarker, " ")
 			result.WriteString(token)
 		}
 	}
@@ -427,13 +460,14 @@ func CreateMockTokenizer() *Tokenizer {
 	}
 
 	return &Tokenizer{
-		vocab:     vocab,
-		vocabByID: vocabByID,
-		bosToken:  1,
-		eosToken:  2,
-		padToken:  0,
-		unkToken:  0,
-		vocabSize: len(vocab),
+		vocab:       vocab,
+		vocabByID:   vocabByID,
+		bosToken:    1,
+		eosToken:    2,
+		padToken:    0,
+		unkToken:    0,
+		vocabSize:   len(vocab),
+		spaceMarker: "▁", // SentencePiece style for mock tokenizer
 	}
 }
 

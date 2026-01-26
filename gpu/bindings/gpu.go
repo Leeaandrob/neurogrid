@@ -701,6 +701,12 @@ func LayerForward(output, input *types.Tensor, weights *LayerWeights, cache *KVC
 		return errors.New("failed to copy positions to GPU")
 	}
 
+	// Use RopeTheta from config, default to 10000.0 if not set
+	ropeTheta := config.RopeTheta
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0
+	}
+
 	result := C.cuda_layer_forward(
 		output.Data,
 		input.Data,
@@ -715,6 +721,7 @@ func LayerForward(output, input *types.Tensor, weights *LayerWeights, cache *KVC
 		C.int(config.NumKVHeads),
 		C.int(config.HeadDim),
 		C.float(config.RMSNormEps),
+		C.float(ropeTheta),
 	)
 	if result != 0 {
 		return fmt.Errorf("layer forward failed: %d", result)

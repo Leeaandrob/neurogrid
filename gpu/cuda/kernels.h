@@ -54,6 +54,19 @@ int cuda_rope_styled(
     int rope_style  // ROPE_STYLE_SPLIT_HALF or ROPE_STYLE_INTERLEAVED
 );
 
+// Rotary Position Embeddings with configurable theta
+int cuda_rope_with_theta(
+    void* output,
+    const void* input,
+    const int* positions,
+    int batch_size,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_style,
+    float rope_theta  // Base frequency (10000.0 for Llama 2, 1000000.0 for Mistral Nemo)
+);
+
 // Softmax along last dimension
 int cuda_softmax(void* output, const void* input, int num_rows, int row_size);
 

@@ -18,6 +18,7 @@ type ModelConfig struct {
 	MaxSeqLen        int     // Maximum sequence length for KV cache
 	VocabSize        int64   // Vocabulary size for embedding
 	RMSNormEps       float32 // RMSNorm epsilon (typically 1e-6)
+	RopeTheta        float64 // RoPE base frequency (10000.0 for Llama 2, 1000000.0 for Mistral Nemo)
 }
 
 // DefaultLlama7BConfig returns the default configuration for Llama 7B.
@@ -32,6 +33,7 @@ func DefaultLlama7BConfig() ModelConfig {
 		MaxSeqLen:        2048,
 		VocabSize:        32000,
 		RMSNormEps:       1e-6,
+		RopeTheta:        10000.0,
 	}
 }
 
@@ -47,6 +49,7 @@ func DefaultLlama13BConfig() ModelConfig {
 		MaxSeqLen:        2048,
 		VocabSize:        32000,
 		RMSNormEps:       1e-6,
+		RopeTheta:        10000.0,
 	}
 }
 
@@ -62,6 +65,7 @@ func DefaultTinyLlamaConfig() ModelConfig {
 		MaxSeqLen:        2048,
 		VocabSize:        32000,
 		RMSNormEps:       1e-6,
+		RopeTheta:        10000.0,
 	}
 }
 
@@ -77,6 +81,7 @@ func DefaultLlama3_70BConfig() ModelConfig {
 		MaxSeqLen:        8192,
 		VocabSize:        128256,
 		RMSNormEps:       1e-5,
+		RopeTheta:        500000.0, // Llama 3 uses 500000
 	}
 }
 
@@ -92,6 +97,7 @@ func DefaultMistral7BConfig() ModelConfig {
 		MaxSeqLen:        32768, // Mistral supports longer context
 		VocabSize:        32768, // Larger vocab than Llama
 		RMSNormEps:       1e-5,
+		RopeTheta:        1000000.0, // Mistral uses 1M
 	}
 }
 
@@ -152,33 +158,50 @@ func (s *Scheduler) UnregisterPeer(peerID string) error {
 	return nil
 }
 
+// MaxKVCacheSeqLen is the maximum sequence length used for KV cache memory estimation.
+// Models may support very long contexts (128k+) but we cap this for practical inference.
+// This is a fallback - the CLI --max-seq-len flag (default 4096) is the primary cap.
+const MaxKVCacheSeqLen = 4096
+
+// CUDAWorkspaceReservation is a fixed amount of VRAM reserved per GPU for CUDA runtime.
+// This includes cuBLAS workspace, CUDA context, and memory fragmentation overhead.
+// Empirically determined from testing with various model sizes.
+const CUDAWorkspaceReservation = 1024 * 1024 * 1024 // 1 GB
+
 // EstimateLayerMemory calculates the estimated memory for a single transformer layer.
 func (s *Scheduler) EstimateLayerMemory() uint64 {
 	cfg := s.config
 
-	// Weights (INT8): Q, K, V, O projections
-	attnWeights := uint64(cfg.HiddenSize * cfg.HiddenSize * 4) // 4 projections
+	// Attention weights (FP16) - correct for GQA models:
+	// Q, O projections: hidden_size * hidden_size
+	// K, V projections: hidden_size * (num_kv_heads * head_dim) for GQA
+	qoWeights := uint64(cfg.HiddenSize * cfg.HiddenSize * 2 * 2) // Q and O projections, FP16
+	kvDim := int64(cfg.NumKVHeads * cfg.HeadDim)
+	kvWeights := uint64(cfg.HiddenSize * kvDim * 2 * 2) // K and V projections, FP16
+	attnWeights := qoWeights + kvWeights
 
-	// FFN weights (INT8): gate, up, down projections
-	ffnWeights := uint64(cfg.HiddenSize * cfg.IntermediateSize * 3) // 3 projections
-
-	// Scales (FP32): one per column for each weight matrix
-	numScaleParams := cfg.HiddenSize*4 + cfg.IntermediateSize*3
-	scales := uint64(numScaleParams * 4) // 4 bytes per float32
+	// FFN weights (FP16): gate, up, down projections - 2 bytes per param
+	ffnWeights := uint64(cfg.HiddenSize * cfg.IntermediateSize * 3 * 2) // 3 projections, FP16
 
 	// Norms (FP16): RMSNorm weights for attention and FFN
 	norms := uint64(cfg.HiddenSize * 2 * 2) // 2 norms, 2 bytes per fp16
 
-	// KV cache (FP16): 2 * seq_len * num_kv_heads * head_dim * 2 bytes
-	kvCache := uint64(cfg.MaxSeqLen * cfg.NumKVHeads * cfg.HeadDim * 2 * 2) // K and V
+	// KV cache (FP16): Cap sequence length for practical inference
+	// Models may support 128k+ context but we don't pre-allocate that much
+	seqLen := cfg.MaxSeqLen
+	if seqLen > MaxKVCacheSeqLen {
+		seqLen = MaxKVCacheSeqLen
+	}
+	kvCache := uint64(seqLen * cfg.NumKVHeads * cfg.HeadDim * 2 * 2) // K and V
 
 	// Activation buffer (FP16): working memory for forward pass
 	activations := uint64(4096 * cfg.HiddenSize * 2) // batch * hidden * 2 bytes
 
-	total := attnWeights + ffnWeights + scales + norms + kvCache + activations
+	total := attnWeights + ffnWeights + norms + kvCache + activations
 
-	// 20% overhead for alignment, fragmentation, and cuBLAS workspace
-	return uint64(float64(total) * 1.2)
+	// 30% overhead for alignment, fragmentation, intermediate buffers, and cuBLAS per-layer workspace
+	// Increased from 15% based on empirical testing with Mistral Nemo 12B
+	return uint64(float64(total) * 1.30)
 }
 
 // EstimateEmbeddingMemory calculates memory for embedding/output layers.
@@ -192,8 +215,8 @@ func (s *Scheduler) EstimateEmbeddingMemory() uint64 {
 	// Only need activation buffer
 	outputBuffer := uint64(cfg.VocabSize * 4) // logits in FP32
 
-	// 10% overhead
-	return uint64(float64(embedding+outputBuffer) * 1.1)
+	// 20% overhead for alignment and intermediate buffers
+	return uint64(float64(embedding+outputBuffer) * 1.2)
 }
 
 // TotalModelMemory returns the total estimated memory for the model.
@@ -226,9 +249,17 @@ func (s *Scheduler) ComputeAssignments() ([]LayerAssignment, error) {
 	assignments := make([]LayerAssignment, 0, s.config.NumLayers+2)
 
 	// Create a local copy for tracking during assignment
+	// Reserve CUDA workspace from each peer's available VRAM to ensure
+	// headroom for CUDA runtime, cuBLAS workspace, and memory fragmentation
 	available := make(map[string]uint64)
 	for _, p := range peerInfos {
-		available[p.PeerID] = p.Available()
+		avail := p.Available()
+		if avail > CUDAWorkspaceReservation {
+			avail -= CUDAWorkspaceReservation
+		} else {
+			avail = 0 // GPU has insufficient VRAM for CUDA overhead
+		}
+		available[p.PeerID] = avail
 	}
 
 	// Helper to find best peer for given memory requirement

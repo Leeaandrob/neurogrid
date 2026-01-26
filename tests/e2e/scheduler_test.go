@@ -182,12 +182,13 @@ func TestScheduler_EstimateLayerMemory_7B(t *testing.T) {
 
 	layerMem := sched.EstimateLayerMemory()
 
-	// Expected: ~200-350MB per layer for 7B (including KV cache and activations)
-	minExpected := uint64(150 * 1024 * 1024) // 150MB
-	maxExpected := uint64(400 * 1024 * 1024) // 400MB
+	// Expected: ~500-700MB per layer for 7B (FP16 weights + KV cache + activations + 30% overhead)
+	// Increased from earlier estimates after empirical testing showed higher actual VRAM usage
+	minExpected := uint64(400 * 1024 * 1024) // 400MB
+	maxExpected := uint64(800 * 1024 * 1024) // 800MB
 
 	if layerMem < minExpected || layerMem > maxExpected {
-		t.Errorf("Layer memory estimate out of range: got %d MB, expected 150-300MB",
+		t.Errorf("Layer memory estimate out of range: got %d MB, expected 400-800MB",
 			layerMem/(1024*1024))
 	}
 
@@ -201,12 +202,12 @@ func TestScheduler_EstimateLayerMemory_13B(t *testing.T) {
 
 	layerMem := sched.EstimateLayerMemory()
 
-	// Expected: ~300-400MB per layer for 13B
-	minExpected := uint64(250 * 1024 * 1024) // 250MB
-	maxExpected := uint64(500 * 1024 * 1024) // 500MB
+	// Expected: ~700-1100MB per layer for 13B (FP16 weights + KV cache + activations + 30% overhead)
+	minExpected := uint64(600 * 1024 * 1024)  // 600MB
+	maxExpected := uint64(1200 * 1024 * 1024) // 1200MB
 
 	if layerMem < minExpected || layerMem > maxExpected {
-		t.Errorf("Layer memory estimate out of range: got %d MB, expected 250-500MB",
+		t.Errorf("Layer memory estimate out of range: got %d MB, expected 600-1200MB",
 			layerMem/(1024*1024))
 	}
 
@@ -220,12 +221,13 @@ func TestScheduler_TotalModelMemory_7B(t *testing.T) {
 
 	totalMem := sched.TotalModelMemory()
 
-	// 7B INT8: ~7GB weights + overhead
-	minExpected := uint64(6 * 1024 * 1024 * 1024)  // 6GB
-	maxExpected := uint64(12 * 1024 * 1024 * 1024) // 12GB
+	// 7B FP16 with 30% overhead: ~14-22GB total (32 layers + embeddings)
+	// This accounts for weights + KV cache + activations + CUDA runtime overhead
+	minExpected := uint64(14 * 1024 * 1024 * 1024) // 14GB
+	maxExpected := uint64(25 * 1024 * 1024 * 1024) // 25GB
 
 	if totalMem < minExpected || totalMem > maxExpected {
-		t.Errorf("Total model memory out of range: got %d GB, expected 6-12GB",
+		t.Errorf("Total model memory out of range: got %d GB, expected 14-25GB",
 			totalMem/(1024*1024*1024))
 	}
 

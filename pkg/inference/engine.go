@@ -374,6 +374,12 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		nextToken := e.sampler.Sample(logits, req.Temperature, req.TopP)
 		outputTokens = append(outputTokens, nextToken)
 
+		// Debug: log generated token
+		if decoded, err := e.tokenizer.Decode([]int{nextToken}); err == nil {
+			log.Printf("[Generate] Step %d: token=%d, decoded=%q, logits_min=%.4f, logits_max=%.4f",
+				i, nextToken, decoded, minFloat32(logits), maxFloat32(logits))
+		}
+
 		// Check for EOS
 		if nextToken == e.tokenizer.EOSToken() {
 			stopReason = "eos"
@@ -776,4 +782,32 @@ func (e *Engine) ForwardLayerPublic(ctx context.Context, layerID int, hidden []b
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.forwardLayer(ctx, layerID, hidden, position)
+}
+
+// minFloat32 returns the minimum value in a float32 slice.
+func minFloat32(vals []float32) float32 {
+	if len(vals) == 0 {
+		return 0
+	}
+	min := vals[0]
+	for _, v := range vals[1:] {
+		if v < min {
+			min = v
+		}
+	}
+	return min
+}
+
+// maxFloat32 returns the maximum value in a float32 slice.
+func maxFloat32(vals []float32) float32 {
+	if len(vals) == 0 {
+		return 0
+	}
+	max := vals[0]
+	for _, v := range vals[1:] {
+		if v > max {
+			max = v
+		}
+	}
+	return max
 }

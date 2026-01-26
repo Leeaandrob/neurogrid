@@ -42,6 +42,7 @@ type WorkerConfig struct {
 	LogLevel          string
 	BootstrapPeers    []peer.AddrInfo // Coordinator address for WAN connections
 	WaitForAssignment bool            // Wait for coordinator to assign layers before loading
+	MaxSeqLen         int             // Maximum sequence length for KV cache (caps model's max_position_embeddings)
 }
 
 // chunkBuffer accumulates weight chunks for a layer
@@ -236,8 +237,14 @@ func (w *Worker) loadModelConfigOnly() error {
 		w.modelConfig = cfg
 	}
 
-	log.Printf("Model config loaded: %d layers, hidden=%d, intermediate=%d",
-		w.modelConfig.NumLayers, w.modelConfig.HiddenSize, w.modelConfig.IntermediateSize)
+	// Cap MaxSeqLen to save VRAM (models may support 128k+ but we cap for practical inference)
+	if w.config.MaxSeqLen > 0 && w.modelConfig.MaxSeqLen > w.config.MaxSeqLen {
+		log.Printf("Capping MaxSeqLen from %d to %d (use --max-seq-len to adjust)", w.modelConfig.MaxSeqLen, w.config.MaxSeqLen)
+		w.modelConfig.MaxSeqLen = w.config.MaxSeqLen
+	}
+
+	log.Printf("Model config loaded: %d layers, hidden=%d, intermediate=%d, maxSeqLen=%d",
+		w.modelConfig.NumLayers, w.modelConfig.HiddenSize, w.modelConfig.IntermediateSize, w.modelConfig.MaxSeqLen)
 
 	return nil
 }
@@ -264,6 +271,12 @@ func (w *Worker) loadLocalWeights() error {
 		}
 	} else {
 		w.modelConfig = getModelConfig(w.config.ModelName)
+	}
+
+	// Cap MaxSeqLen to save VRAM (models may support 128k+ but we cap for practical inference)
+	if w.config.MaxSeqLen > 0 && w.modelConfig.MaxSeqLen > w.config.MaxSeqLen {
+		log.Printf("Capping MaxSeqLen from %d to %d (use --max-seq-len to adjust)", w.modelConfig.MaxSeqLen, w.config.MaxSeqLen)
+		w.modelConfig.MaxSeqLen = w.config.MaxSeqLen
 	}
 
 	// Load all layers (in distributed mode, we only load assigned layers)
@@ -814,6 +827,12 @@ func getModelConfigFromPath(modelPath string) (*types.LlamaConfig, error) {
 		headDim = 128 // Default
 	}
 
+	// Get rope_theta (default to 10000.0 for Llama 2 compatibility)
+	ropeTheta := float32(cfg.RopeTheta)
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0 // Default for Llama 2
+	}
+
 	return &types.LlamaConfig{
 		HiddenSize:       cfg.HiddenSize,
 		IntermediateSize: cfg.IntermediateSize,
@@ -824,6 +843,7 @@ func getModelConfigFromPath(modelPath string) (*types.LlamaConfig, error) {
 		VocabSize:        cfg.VocabSize,
 		MaxSeqLen:        cfg.MaxPositionEmbeddings,
 		RMSNormEps:       float32(cfg.RMSNormEps),
+		RopeTheta:        ropeTheta,
 	}, nil
 }
 
@@ -851,6 +871,7 @@ func main() {
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	bootstrapStr := flag.String("bootstrap", "", "Bootstrap peer multiaddr (coordinator address)")
 	waitForAssignment := flag.Bool("wait-for-assignment", false, "Wait for coordinator to assign layers before loading (for distributed memory)")
+	maxSeqLen := flag.Int("max-seq-len", 4096, "Maximum sequence length for KV cache (caps model's max_position_embeddings to save VRAM)")
 	flag.Parse()
 
 	// Parse bootstrap peers
@@ -882,6 +903,7 @@ func main() {
 		LogLevel:          *logLevel,
 		BootstrapPeers:    bootstrapPeers,
 		WaitForAssignment: *waitForAssignment,
+		MaxSeqLen:         *maxSeqLen,
 	}
 
 	log.Println("================================================")
@@ -890,6 +912,7 @@ func main() {
 	log.Printf("GPU: %d", config.GPUID)
 	log.Printf("Port: %d", config.Port)
 	log.Printf("Model: %s", config.ModelName)
+	log.Printf("Max Seq Len: %d", config.MaxSeqLen)
 	if config.ModelPath != "" {
 		log.Printf("Model Path: %s", config.ModelPath)
 	}

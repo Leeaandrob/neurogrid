@@ -33,11 +33,16 @@ type TransferableConfig struct {
 	VocabSize        int     `json:"vocab_size"`
 	MaxSeqLen        int     `json:"max_seq_len"`
 	RMSNormEps       float32 `json:"rms_norm_eps"`
+	RopeTheta        float32 `json:"rope_theta"` // RoPE base frequency (10000.0 for Llama 2, 1000000.0 for Mistral Nemo)
 }
 
 // ToLlamaConfig converts TransferableConfig to types.LlamaConfig.
 // This is used by workers after receiving config over P2P.
 func (tc *TransferableConfig) ToLlamaConfig() *types.LlamaConfig {
+	ropeTheta := tc.RopeTheta
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0 // Default for Llama 2 compatibility
+	}
 	return &types.LlamaConfig{
 		HiddenSize:       tc.HiddenSize,
 		IntermediateSize: tc.IntermediateSize,
@@ -48,6 +53,7 @@ func (tc *TransferableConfig) ToLlamaConfig() *types.LlamaConfig {
 		VocabSize:        tc.VocabSize,
 		MaxSeqLen:        tc.MaxSeqLen,
 		RMSNormEps:       tc.RMSNormEps,
+		RopeTheta:        ropeTheta,
 	}
 }
 
@@ -65,6 +71,7 @@ func FromLlamaConfig(config *types.LlamaConfig, modelName string) *TransferableC
 		VocabSize:        config.VocabSize,
 		MaxSeqLen:        config.MaxSeqLen,
 		RMSNormEps:       config.RMSNormEps,
+		RopeTheta:        config.RopeTheta,
 	}
 }
 

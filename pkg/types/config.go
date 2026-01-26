@@ -12,6 +12,7 @@ type LlamaConfig struct {
 	VocabSize        int     // Vocabulary size (32000)
 	MaxSeqLen        int     // Maximum sequence length (4096)
 	RMSNormEps       float32 // RMSNorm epsilon (1e-6)
+	RopeTheta        float32 // RoPE base frequency (10000.0 for Llama 2, 1000000.0 for Mistral Nemo)
 }
 
 // Llama7BConfig returns the standard configuration for Llama 2 7B.
@@ -26,6 +27,7 @@ func Llama7BConfig() *LlamaConfig {
 		VocabSize:        32000,
 		MaxSeqLen:        4096,
 		RMSNormEps:       1e-6,
+		RopeTheta:        10000.0,
 	}
 }
 
@@ -41,6 +43,7 @@ func Llama13BConfig() *LlamaConfig {
 		VocabSize:        32000,
 		MaxSeqLen:        4096,
 		RMSNormEps:       1e-6,
+		RopeTheta:        10000.0,
 	}
 }
 
@@ -56,6 +59,7 @@ func Llama70BConfig() *LlamaConfig {
 		VocabSize:        32000,
 		MaxSeqLen:        4096,
 		RMSNormEps:       1e-6,
+		RopeTheta:        10000.0,
 	}
 }
 
@@ -71,6 +75,7 @@ func Llama3_70BConfig() *LlamaConfig {
 		VocabSize:        128256, // Llama 3 has larger vocab
 		MaxSeqLen:        8192,   // 8K default, supports up to 128K
 		RMSNormEps:       1e-5,   // Llama 3 uses 1e-5
+		RopeTheta:        500000.0, // Llama 3 uses 500000
 	}
 }
 
@@ -86,6 +91,7 @@ func TinyLlamaConfig() *LlamaConfig {
 		VocabSize:        32000,
 		MaxSeqLen:        2048,
 		RMSNormEps:       1e-6,
+		RopeTheta:        10000.0,
 	}
 }
 

@@ -98,6 +98,19 @@ int cuda_rope(
     int head_dim
 );
 
+// Rotary Position Embeddings with configurable theta
+int cuda_rope_with_theta(
+    void* output,
+    const void* input,
+    const int* positions,
+    int batch_size,
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int rope_style,
+    float rope_theta
+);
+
 // ============================================================================
 // Matrix Multiplication
 // ============================================================================
@@ -350,7 +363,8 @@ int cuda_layer_forward(
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    float rms_norm_eps
+    float rms_norm_eps,
+    float rope_theta
 );
 
 #ifdef __cplusplus

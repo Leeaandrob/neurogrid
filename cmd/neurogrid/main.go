@@ -52,6 +52,7 @@ type CoordinatorConfig struct {
 	BootstrapPeers     []peer.AddrInfo // Direct peers to connect to (for WAN connections)
 	Role               string          // "coordinator" or "performer"
 	SkipWeightTransfer bool            // Skip sending weights to workers (they have local models)
+	MaxSeqLen          int             // Maximum sequence length for KV cache (caps model's max_position_embeddings)
 }
 
 // Coordinator orchestrates distributed inference
@@ -228,6 +229,12 @@ func (c *Coordinator) initializeComponents() error {
 		modelConfig = getModelConfig(c.config.ModelName)
 	}
 
+	// Cap MaxSeqLen to save VRAM (models may support 128k+ but we cap for practical inference)
+	if c.config.MaxSeqLen > 0 && modelConfig.MaxSeqLen > c.config.MaxSeqLen {
+		log.Printf("Capping MaxSeqLen from %d to %d (use --max-seq-len to adjust)", modelConfig.MaxSeqLen, c.config.MaxSeqLen)
+		modelConfig.MaxSeqLen = c.config.MaxSeqLen
+	}
+
 	// Create scheduler
 	c.scheduler = scheduler.NewScheduler(modelConfig)
 
@@ -296,6 +303,10 @@ func (c *Coordinator) initializeComponents() error {
 	}
 
 	// Create inference engine config using types.LlamaConfig
+	ropeTheta := float32(modelConfig.RopeTheta)
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0 // Default for Llama 2
+	}
 	llamaConfig := &types.LlamaConfig{
 		HiddenSize:       int(modelConfig.HiddenSize),
 		NumLayers:        modelConfig.NumLayers,
@@ -306,6 +317,7 @@ func (c *Coordinator) initializeComponents() error {
 		VocabSize:        int(modelConfig.VocabSize),
 		MaxSeqLen:        modelConfig.MaxSeqLen,
 		RMSNormEps:       modelConfig.RMSNormEps,
+		RopeTheta:        ropeTheta,
 	}
 
 	engineConfig := inference.EngineConfig{
@@ -398,13 +410,18 @@ func (c *Coordinator) initializeComponents() error {
 	}
 
 	// Load tokenizer from model directory
-	tokenizer, err := model.NewSentencePieceTokenizer(c.config.ModelPath)
-	if err != nil {
-		log.Printf("Warning: Failed to load tokenizer from %s: %v", c.config.ModelPath, err)
+	// Try tokenizer.json first (HuggingFace/GPT-2 style), then fall back to tokenizer.model (SentencePiece)
+	var tokenizer inference.Tokenizer
+	if tok, err := model.NewTokenizer(c.config.ModelPath); err == nil {
+		log.Printf("Loaded BPE tokenizer from %s (vocab size: %d)", c.config.ModelPath, tok.VocabSize())
+		tokenizer = tok
+	} else if spTok, spErr := model.NewSentencePieceTokenizer(c.config.ModelPath); spErr == nil {
+		log.Printf("Loaded SentencePiece tokenizer from %s (vocab size: %d)", c.config.ModelPath, spTok.VocabSize())
+		tokenizer = spTok
+	} else {
+		log.Printf("Warning: Failed to load tokenizer from %s: %v (BPE) / %v (SentencePiece)", c.config.ModelPath, err, spErr)
 		log.Printf("Using mock tokenizer for testing")
 		tokenizer = model.NewMockSentencePieceTokenizer()
-	} else {
-		log.Printf("Loaded tokenizer from %s (vocab size: %d)", c.config.ModelPath, tokenizer.VocabSize())
 	}
 	c.engine.SetTokenizer(tokenizer)
 
@@ -763,6 +780,7 @@ func main() {
 	bootstrapStr := flag.String("bootstrap", "", "Bootstrap peer multiaddr (e.g., /ip4/192.168.1.100/tcp/9000/p2p/12D3KooW...)")
 	role := flag.String("role", "coordinator", "Node role: coordinator (orchestrates inference) or performer (executes layers)")
 	skipWeightTransfer := flag.Bool("skip-weight-transfer", false, "Skip sending weights to workers (use when workers have local models)")
+	maxSeqLen := flag.Int("max-seq-len", 4096, "Maximum sequence length for KV cache (caps model's max_position_embeddings to save VRAM)")
 	flag.Parse()
 
 	// Parse bootstrap peers
@@ -799,6 +817,7 @@ func main() {
 		BootstrapPeers:     bootstrapPeers,
 		Role:               *role,
 		SkipWeightTransfer: *skipWeightTransfer,
+		MaxSeqLen:          *maxSeqLen,
 	}
 
 	log.Println("================================================")
@@ -809,6 +828,7 @@ func main() {
 	log.Printf("HTTP Port: %d", config.HTTPPort)
 	log.Printf("P2P Port: %d", config.P2PPort)
 	log.Printf("GPU: %d", config.GPUID)
+	log.Printf("Max Seq Len: %d", config.MaxSeqLen)
 	if config.ModelPath != "" {
 		log.Printf("Model Path: %s", config.ModelPath)
 	}

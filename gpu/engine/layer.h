@@ -56,7 +56,8 @@ int cuda_layer_forward(
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    float rms_norm_eps
+    float rms_norm_eps,
+    float rope_theta
 );
 
 #ifdef __cplusplus
