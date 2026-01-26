@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -215,6 +216,13 @@ func (c *Coordinator) initializeComponents() error {
 		} else {
 			log.Printf("Auto-detected model config from %s/config.json", c.config.ModelPath)
 			modelConfig = cfg
+			// Also update ModelName from path for correct chat template
+			// e.g., "models/tinyllama" -> "tinyllama"
+			modelNameFromPath := filepath.Base(c.config.ModelPath)
+			if modelNameFromPath != "" && modelNameFromPath != "." {
+				c.config.ModelName = modelNameFromPath
+				log.Printf("Using model name '%s' for chat template", c.config.ModelName)
+			}
 		}
 	} else {
 		modelConfig = getModelConfig(c.config.ModelName)
