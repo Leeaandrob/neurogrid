@@ -75,6 +75,7 @@ type Worker struct {
 	weightsMu    sync.RWMutex
 	chunkBuffers map[int]*chunkBuffer // Layer ID -> chunk buffer
 	chunkMu      sync.Mutex
+	gpuInfo      p2p.GPUInfo // Cached GPU info for reporting to coordinator
 }
 
 // NewWorker creates a new worker instance
@@ -137,6 +138,7 @@ func (w *Worker) Start() error {
 	w.protocol.OnWeightsReceived(w.handleWeights)
 	w.protocol.OnLayerRequestReceived(w.handleLayerRequest)
 	w.protocol.OnModelConfigReceived(w.handleModelConfig)
+	w.protocol.OnGPUInfoRequestReceived(w.handleGPUInfoRequest)
 
 	// Connect to bootstrap peers (coordinator)
 	if len(w.config.BootstrapPeers) > 0 {
@@ -154,8 +156,11 @@ func (w *Worker) Start() error {
 				w.peers = append(w.peers, peerInfo)
 				w.peersMu.Unlock()
 
-				// Send layer status to coordinator after connecting
-				go w.sendLayerStatus(peerInfo.ID)
+				// Send GPU info and layer status to coordinator after connecting
+				go func(pid peer.ID) {
+					w.sendGPUInfo(pid)
+					w.sendLayerStatus(pid)
+				}(peerInfo.ID)
 			}
 		}
 	}
@@ -218,6 +223,13 @@ func (w *Worker) initializeGPU() error {
 		float64(totalVRAM)/(1024*1024*1024),
 		float64(usedVRAM)/(1024*1024*1024),
 		float64(totalVRAM-usedVRAM)/(1024*1024*1024))
+
+	// Cache GPU info for reporting to coordinator
+	w.gpuInfo = p2p.GPUInfo{
+		TotalVRAM: totalVRAM,
+		UsedVRAM:  usedVRAM,
+		GPUName:   deviceInfo.Name,
+	}
 
 	return nil
 }
@@ -610,6 +622,27 @@ func (w *Worker) handleWeights(layerID int, chunkIndex int, totalChunks int, dat
 		w.protocol.SendWeightsAck(ctx, p.ID, layerID)
 	}
 	w.peersMu.RUnlock()
+}
+
+// handleGPUInfoRequest handles GPU info request from coordinator
+func (w *Worker) handleGPUInfoRequest(coordinatorID peer.ID) {
+	log.Printf("Received GPU info request from coordinator %s", coordinatorID)
+	w.sendGPUInfo(coordinatorID)
+}
+
+// sendGPUInfo sends GPU information to the coordinator
+func (w *Worker) sendGPUInfo(coordinatorID peer.ID) {
+	log.Printf("Sending GPU info to coordinator: %s, Total VRAM: %.2f GB, Used: %.2f GB",
+		w.gpuInfo.GPUName,
+		float64(w.gpuInfo.TotalVRAM)/(1024*1024*1024),
+		float64(w.gpuInfo.UsedVRAM)/(1024*1024*1024))
+
+	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	defer cancel()
+
+	if err := w.protocol.SendGPUInfo(ctx, coordinatorID, w.gpuInfo); err != nil {
+		log.Printf("Warning: Failed to send GPU info to coordinator: %v", err)
+	}
 }
 
 // sendLayerStatus sends the list of locally loaded layers to the coordinator

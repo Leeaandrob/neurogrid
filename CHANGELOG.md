@@ -5,6 +5,46 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-01-26
+
+### Added
+
+#### Distributed Inference Improvements
+- **`-disable-mdns` flag** - Disable mDNS peer discovery for controlled environments
+  - Prevents "ghost peer" issues from stale k8s pods or old processes
+  - Workers connect explicitly via `-bootstrap` address
+  - Recommended for production deployments
+
+#### Weight Distributed Memory
+- Workers can now load model weights locally with `-model` flag
+- Combined with `-skip-weight-transfer` on coordinator for instant startup
+- No P2P weight distribution overhead when workers have local models
+
+#### Heterogeneous GPU Support
+- **P2P GPU Info Protocol** - Workers report actual VRAM to coordinator
+  - `MsgTypeGPUInfo` (0x08) - Worker sends GPU info
+  - `MsgTypeGPUInfoRequest` (0x09) - Coordinator requests GPU info
+- Scheduler now uses **real VRAM values** from each worker
+  - No longer assumes all workers have same VRAM as coordinator
+  - Enables proper layer distribution across GPUs with different capacities
+- Workers proactively send GPU info when connecting to coordinator
+
+### Fixed
+- **Ghost Peer Issue** - Stale peers from k8s pods or previous sessions no longer interfere
+  - Root cause: mDNS discovering cached/old peer announcements
+  - Solution: Use `-disable-mdns` with explicit bootstrap addresses
+- **Heterogeneous GPU OOM** - Scheduler now correctly estimates VRAM for each worker
+  - Root cause: Coordinator was using local GPU's VRAM for all workers
+  - Solution: Workers report actual VRAM via P2P protocol
+- **Scheduler Memory Estimation** - Improved for distributed inference across heterogeneous GPUs
+
+### Changed
+- Better documentation for distributed mode setup
+- Coordinator logs now show when mDNS is disabled vs enabled
+- Coordinator logs GPU info received from each worker
+
+---
+
 ## [0.3.0] - 2025-01-23
 
 ### Added

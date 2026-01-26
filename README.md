@@ -145,7 +145,58 @@ curl http://localhost:8090/health
 
 For multi-GPU inference across machines using Pipeline Parallelism.
 
-### Setup (3-machine example)
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Coordinator (GH200)                        │
+│  - HTTP API endpoint                                             │
+│  - Orchestrates inference                                        │
+│  - Layers 0-13 (local)                                           │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ P2P (libp2p)
+          ┌─────────────────┴─────────────────┐
+          │                                   │
+┌─────────┴───────────┐          ┌────────────┴──────────┐
+│   Worker (RTX 4090) │          │   Worker (RTX 2080)   │
+│   Layers 14-26      │          │   Layers 27-39        │
+└─────────────────────┘          └───────────────────────┘
+```
+
+### Mode 1: Workers with Local Models (Recommended)
+
+When workers have the model downloaded locally, skip weight transfer for faster startup:
+
+```bash
+# Coordinator (GH200 - start first)
+LD_LIBRARY_PATH=./build ./build/neurogrid \
+  -model models/mistral-nemo-instruct-2407 \
+  -http-port 8090 \
+  -p2p-port 9000 \
+  -gpu 0 \
+  -min-peers 2 \
+  -max-seq-len 4096 \
+  -skip-weight-transfer \
+  -disable-mdns
+
+# Worker 1 (RTX 4090 - connect via bootstrap)
+LD_LIBRARY_PATH=./build ./build/worker \
+  -bootstrap /ip4/<COORDINATOR_IP>/tcp/9000/p2p/<COORDINATOR_PEER_ID> \
+  -model models/mistral-nemo-instruct-2407 \
+  -gpu 0 \
+  -port 9001
+
+# Worker 2 (RTX 2080 - connect via bootstrap)
+LD_LIBRARY_PATH=./build ./build/worker \
+  -bootstrap /ip4/<COORDINATOR_IP>/tcp/9000/p2p/<COORDINATOR_PEER_ID> \
+  -model /path/to/models/mistral-nemo-instruct-2407 \
+  -gpu 0 \
+  -port 9002
+```
+
+### Mode 2: Auto-Discovery (LAN only)
+
+For simple LAN setups, workers can be discovered automatically via mDNS:
 
 ```bash
 # Machine 1: Worker with GPU 0
@@ -158,7 +209,24 @@ make run-worker GPU_ID=0 P2P_PORT=9002
 make run-coordinator MIN_PEERS=2
 ```
 
-Workers are discovered automatically on the local network. The coordinator distributes model layers across available GPUs.
+### Distributed Mode Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-min-peers` | 0 | Minimum workers to wait for (0 = local only) |
+| `-skip-weight-transfer` | false | Skip P2P weight distribution (workers have local models) |
+| `-disable-mdns` | false | Disable mDNS discovery (use explicit bootstrap) |
+| `-bootstrap` | "" | Bootstrap peer address for explicit connection |
+| `-max-seq-len` | 4096 | Max sequence length (caps KV cache size) |
+
+### Troubleshooting Distributed Mode
+
+**Ghost Peer Issue**: If you see connections to unknown peers, use `-disable-mdns` and connect workers via explicit `-bootstrap` addresses.
+
+**Out of Memory on Workers**: Workers with less VRAM (e.g., RTX 2080 11GB) may run out of memory. Consider:
+- Using smaller models
+- Reducing `-max-seq-len`
+- Assigning fewer layers to smaller GPUs (future feature)
 
 ## Building from Source
 

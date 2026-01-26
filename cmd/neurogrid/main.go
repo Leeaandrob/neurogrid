@@ -68,6 +68,8 @@ type Coordinator struct {
 	server          *api.Server
 	peers           []peer.AddrInfo
 	peersMu         sync.RWMutex
+	peerGPUInfo     map[string]p2p.GPUInfo // Peer ID -> GPU info
+	peerGPUInfoMu   sync.RWMutex
 	startTime       time.Time
 	p2pProtocol     *p2p.Protocol
 	remoteExecutors map[string]*inference.RemoteLayerExecutor // Peer ID -> executor
@@ -100,6 +102,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		ctx:             ctx,
 		cancel:          cancel,
 		peers:           make([]peer.AddrInfo, 0),
+		peerGPUInfo:     make(map[string]p2p.GPUInfo),
 		startTime:       time.Now(),
 		remoteExecutors: make(map[string]*inference.RemoteLayerExecutor),
 	}, nil
@@ -119,6 +122,10 @@ func (c *Coordinator) Start() error {
 
 	// Subscribe to network connection events to detect incoming worker connections
 	c.host.Network().Notify(&networkNotifee{coordinator: c})
+
+	// Create P2P protocol early to receive GPU info from workers
+	c.p2pProtocol = p2p.NewProtocol(c.host)
+	c.p2pProtocol.OnGPUInfoReceived(c.handleGPUInfo)
 
 	// Connect to bootstrap peers first (for WAN connections)
 	if len(c.config.BootstrapPeers) > 0 {
@@ -268,14 +275,42 @@ func (c *Coordinator) initializeComponents() error {
 	// Register discovered peers only in distributed mode (MinPeers > 0)
 	// In local-only mode, all layers run on this node
 	if c.config.MinPeers > 0 {
-		// TODO: Request actual GPU info from each peer via P2P protocol
-		// For now, assume peers have similar GPU specs
+		// Request GPU info from each peer if not already received
 		c.peersMu.RLock()
-		for _, p := range c.peers {
-			// Use same memory values as local GPU (approximation)
-			c.scheduler.RegisterPeer(p.ID.String(), totalVRAM, usedVRAM)
-		}
+		peers := make([]peer.AddrInfo, len(c.peers))
+		copy(peers, c.peers)
 		c.peersMu.RUnlock()
+
+		for _, p := range peers {
+			// Check if we already have GPU info for this peer
+			c.peerGPUInfoMu.RLock()
+			gpuInfo, hasInfo := c.peerGPUInfo[p.ID.String()]
+			c.peerGPUInfoMu.RUnlock()
+
+			if !hasInfo {
+				// Request GPU info from peer
+				log.Printf("Requesting GPU info from peer %s...", p.ID)
+				ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+				info, err := c.p2pProtocol.RequestGPUInfo(ctx, p.ID, 10*time.Second)
+				cancel()
+				if err != nil {
+					log.Printf("Warning: Failed to get GPU info from peer %s: %v (using local GPU values)", p.ID, err)
+					// Fall back to local GPU values
+					gpuInfo = p2p.GPUInfo{TotalVRAM: totalVRAM, UsedVRAM: usedVRAM, GPUName: "Unknown"}
+				} else {
+					gpuInfo = info
+					c.peerGPUInfoMu.Lock()
+					c.peerGPUInfo[p.ID.String()] = gpuInfo
+					c.peerGPUInfoMu.Unlock()
+				}
+			}
+
+			log.Printf("Peer %s GPU: %s, Total VRAM: %.2f GB, Used: %.2f GB",
+				p.ID, gpuInfo.GPUName,
+				float64(gpuInfo.TotalVRAM)/(1024*1024*1024),
+				float64(gpuInfo.UsedVRAM)/(1024*1024*1024))
+			c.scheduler.RegisterPeer(p.ID.String(), gpuInfo.TotalVRAM, gpuInfo.UsedVRAM)
+		}
 	} else {
 		log.Printf("Running in local-only mode: all layers assigned to this node")
 	}
@@ -340,8 +375,7 @@ func (c *Coordinator) initializeComponents() error {
 	c.engine.SetRouter(c.router)
 	c.engine.SetAssignments(assignments)
 
-	// Create P2P protocol for tensor transfer
-	c.p2pProtocol = p2p.NewProtocol(c.host)
+	// P2P protocol was already created in Start() for GPU info handling
 
 	// Create RemoteLayerExecutors for each remote peer
 	// Group layers by peer to determine layer ranges
@@ -640,6 +674,18 @@ func (c *Coordinator) GetStats() map[string]interface{} {
 		"peer_count":  peerCount,
 		"uptime_secs": time.Since(c.startTime).Seconds(),
 	}
+}
+
+// handleGPUInfo handles GPU info received from a worker
+func (c *Coordinator) handleGPUInfo(peerID peer.ID, info p2p.GPUInfo) {
+	log.Printf("Received GPU info from worker %s: %s, Total VRAM: %.2f GB, Used: %.2f GB",
+		peerID, info.GPUName,
+		float64(info.TotalVRAM)/(1024*1024*1024),
+		float64(info.UsedVRAM)/(1024*1024*1024))
+
+	c.peerGPUInfoMu.Lock()
+	c.peerGPUInfo[peerID.String()] = info
+	c.peerGPUInfoMu.Unlock()
 }
 
 // coordinatorNotifee handles peer discovery notifications

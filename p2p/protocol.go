@@ -40,6 +40,8 @@ const (
 	MsgTypeLayerStatus      = 0x05 // Worker reports which layers it has locally
 	MsgTypeLayerRequest     = 0x06 // Coordinator requests specific layers to be loaded
 	MsgTypeModelConfig      = 0x07 // Transfer model configuration to stateless worker
+	MsgTypeGPUInfo          = 0x08 // Worker reports GPU info (VRAM) to coordinator
+	MsgTypeGPUInfoRequest   = 0x09 // Coordinator requests GPU info from worker
 	MsgTypeTracedActivation = 0x11 // Forward activation with trace context
 	MsgTypeTracedResponse   = 0x12 // Return computed hidden state with trace context
 
@@ -76,20 +78,36 @@ type LayerRequestHandler func(peerID peer.ID, requestedLayers []int)
 // ModelConfigHandler is a callback for received model config.
 type ModelConfigHandler func(config []byte, from peer.ID)
 
+// GPUInfo contains GPU information reported by a worker.
+type GPUInfo struct {
+	TotalVRAM uint64 // Total VRAM in bytes
+	UsedVRAM  uint64 // Used VRAM in bytes
+	GPUName   string // GPU device name
+}
+
+// GPUInfoHandler is a callback for when a peer reports its GPU info.
+type GPUInfoHandler func(peerID peer.ID, info GPUInfo)
+
+// GPUInfoRequestHandler is a callback for when coordinator requests GPU info.
+type GPUInfoRequestHandler func(peerID peer.ID)
+
 // Protocol manages the tensor transfer protocol.
 type Protocol struct {
-	host                host.Host
-	handler             TensorHandler                  // Legacy handler
-	activationHandler   TensorHandler                  // Handler for activation messages
-	responseHandler     TensorHandler                  // Handler for response messages
-	weightsHandler      WeightsHandler                 // Handler for weight chunks
-	layerStatusHandler  LayerStatusHandler             // Handler for layer status reports
-	layerRequestHandler LayerRequestHandler            // Handler for layer requests
-	modelConfigHandler  ModelConfigHandler             // Handler for model config messages
-	pendingResponses    map[uint64]chan *TensorMessage // RequestID -> response channel
-	pendingWeightsAck   map[string]chan struct{}       // peerID:layerID -> ack channel
-	pendingLayerStatus  map[string]chan []int          // peerID -> layer status channel
-	mu                  sync.RWMutex
+	host                  host.Host
+	handler               TensorHandler                  // Legacy handler
+	activationHandler     TensorHandler                  // Handler for activation messages
+	responseHandler       TensorHandler                  // Handler for response messages
+	weightsHandler        WeightsHandler                 // Handler for weight chunks
+	layerStatusHandler    LayerStatusHandler             // Handler for layer status reports
+	layerRequestHandler   LayerRequestHandler            // Handler for layer requests
+	modelConfigHandler    ModelConfigHandler             // Handler for model config messages
+	gpuInfoHandler        GPUInfoHandler                 // Handler for GPU info reports
+	gpuInfoRequestHandler GPUInfoRequestHandler          // Handler for GPU info requests
+	pendingResponses      map[uint64]chan *TensorMessage // RequestID -> response channel
+	pendingWeightsAck     map[string]chan struct{}       // peerID:layerID -> ack channel
+	pendingLayerStatus    map[string]chan []int          // peerID -> layer status channel
+	pendingGPUInfo        map[string]chan GPUInfo        // peerID -> GPU info channel
+	mu                    sync.RWMutex
 }
 
 // NewProtocol creates a new tensor transfer protocol handler.
@@ -99,6 +117,7 @@ func NewProtocol(h host.Host) *Protocol {
 		pendingResponses:   make(map[uint64]chan *TensorMessage),
 		pendingWeightsAck:  make(map[string]chan struct{}),
 		pendingLayerStatus: make(map[string]chan []int),
+		pendingGPUInfo:     make(map[string]chan GPUInfo),
 	}
 
 	// Register stream handler
@@ -154,6 +173,20 @@ func (p *Protocol) OnModelConfigReceived(handler ModelConfigHandler) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.modelConfigHandler = handler
+}
+
+// OnGPUInfoReceived sets the callback for GPU info messages from workers.
+func (p *Protocol) OnGPUInfoReceived(handler GPUInfoHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gpuInfoHandler = handler
+}
+
+// OnGPUInfoRequestReceived sets the callback for GPU info request messages from coordinator.
+func (p *Protocol) OnGPUInfoRequestReceived(handler GPUInfoRequestHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gpuInfoRequestHandler = handler
 }
 
 // RegisterPendingRequest creates a pending response channel for a request ID.
@@ -339,6 +372,36 @@ func (p *Protocol) handleExtendedMessage(s network.Stream, msgType uint8) {
 		if modelConfigHandler != nil {
 			modelConfigHandler(data, s.Conn().RemotePeer())
 		}
+	case MsgTypeGPUInfo:
+		// Worker reporting GPU info to coordinator
+		// Data format: TotalVRAM (8B) + UsedVRAM (8B) + GPUNameLen (4B) + GPUName (variable)
+		peerID := s.Conn().RemotePeer()
+		gpuInfo := decodeGPUInfo(data)
+
+		// Check for pending GPU info channel (coordinator waiting)
+		p.mu.RLock()
+		ch, ok := p.pendingGPUInfo[peerID.String()]
+		gpuInfoHandler := p.gpuInfoHandler
+		p.mu.RUnlock()
+		if ok {
+			select {
+			case ch <- gpuInfo:
+			default:
+			}
+		}
+
+		if gpuInfoHandler != nil {
+			gpuInfoHandler(peerID, gpuInfo)
+		}
+	case MsgTypeGPUInfoRequest:
+		// Coordinator requesting GPU info from worker
+		peerID := s.Conn().RemotePeer()
+		p.mu.RLock()
+		gpuInfoRequestHandler := p.gpuInfoRequestHandler
+		p.mu.RUnlock()
+		if gpuInfoRequestHandler != nil {
+			gpuInfoRequestHandler(peerID)
+		}
 	}
 }
 
@@ -367,6 +430,38 @@ func encodeLayerList(layers []int) []byte {
 	for i, layerID := range layers {
 		binary.BigEndian.PutUint32(data[4+i*4:8+i*4], uint32(layerID))
 	}
+	return data
+}
+
+// decodeGPUInfo decodes GPU info from binary format.
+// Format: TotalVRAM (8B) + UsedVRAM (8B) + GPUNameLen (4B) + GPUName (variable)
+func decodeGPUInfo(data []byte) GPUInfo {
+	if len(data) < 20 {
+		return GPUInfo{}
+	}
+	totalVRAM := binary.BigEndian.Uint64(data[0:8])
+	usedVRAM := binary.BigEndian.Uint64(data[8:16])
+	nameLen := int(binary.BigEndian.Uint32(data[16:20]))
+	gpuName := ""
+	if len(data) >= 20+nameLen {
+		gpuName = string(data[20 : 20+nameLen])
+	}
+	return GPUInfo{
+		TotalVRAM: totalVRAM,
+		UsedVRAM:  usedVRAM,
+		GPUName:   gpuName,
+	}
+}
+
+// encodeGPUInfo encodes GPU info to binary format.
+// Format: TotalVRAM (8B) + UsedVRAM (8B) + GPUNameLen (4B) + GPUName (variable)
+func encodeGPUInfo(info GPUInfo) []byte {
+	nameBytes := []byte(info.GPUName)
+	data := make([]byte, 20+len(nameBytes))
+	binary.BigEndian.PutUint64(data[0:8], info.TotalVRAM)
+	binary.BigEndian.PutUint64(data[8:16], info.UsedVRAM)
+	binary.BigEndian.PutUint32(data[16:20], uint32(len(nameBytes)))
+	copy(data[20:], nameBytes)
 	return data
 }
 
@@ -626,6 +721,60 @@ func (p *Protocol) SendLayerRequest(ctx context.Context, peerID peer.ID, layerID
 // Config is sent as a single message (< 1KB), not chunked.
 func (p *Protocol) SendModelConfig(ctx context.Context, peerID peer.ID, configData []byte) error {
 	return p.sendExtendedMessage(ctx, peerID, MsgTypeModelConfig, 0, 0, 0, configData)
+}
+
+// SendGPUInfo sends GPU information (VRAM) to a remote peer.
+// This is sent by the worker to inform the coordinator about its GPU capabilities.
+func (p *Protocol) SendGPUInfo(ctx context.Context, peerID peer.ID, info GPUInfo) error {
+	data := encodeGPUInfo(info)
+	return p.sendExtendedMessage(ctx, peerID, MsgTypeGPUInfo, 0, 0, 0, data)
+}
+
+// SendGPUInfoRequest sends a request for GPU info to a worker.
+// The worker should respond with SendGPUInfo.
+func (p *Protocol) SendGPUInfoRequest(ctx context.Context, peerID peer.ID) error {
+	return p.sendExtendedMessage(ctx, peerID, MsgTypeGPUInfoRequest, 0, 0, 0, nil)
+}
+
+// RequestGPUInfo requests GPU info from a peer and waits for response.
+// Returns the GPU information (VRAM, name) from the peer.
+func (p *Protocol) RequestGPUInfo(ctx context.Context, peerID peer.ID, timeout time.Duration) (GPUInfo, error) {
+	// Register pending response
+	key := peerID.String()
+	p.mu.Lock()
+	p.pendingGPUInfo[key] = make(chan GPUInfo, 1)
+	p.mu.Unlock()
+
+	// Send GPU info request
+	if err := p.SendGPUInfoRequest(ctx, peerID); err != nil {
+		p.mu.Lock()
+		delete(p.pendingGPUInfo, key)
+		p.mu.Unlock()
+		return GPUInfo{}, fmt.Errorf("failed to request GPU info: %w", err)
+	}
+
+	// Wait for response
+	p.mu.RLock()
+	ch := p.pendingGPUInfo[key]
+	p.mu.RUnlock()
+
+	select {
+	case info := <-ch:
+		p.mu.Lock()
+		delete(p.pendingGPUInfo, key)
+		p.mu.Unlock()
+		return info, nil
+	case <-time.After(timeout):
+		p.mu.Lock()
+		delete(p.pendingGPUInfo, key)
+		p.mu.Unlock()
+		return GPUInfo{}, fmt.Errorf("timeout waiting for GPU info from peer")
+	case <-ctx.Done():
+		p.mu.Lock()
+		delete(p.pendingGPUInfo, key)
+		p.mu.Unlock()
+		return GPUInfo{}, ctx.Err()
+	}
 }
 
 // RequestLayerStatus requests layer status from a peer and waits for response.
