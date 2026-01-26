@@ -7,7 +7,9 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/neurogrid/engine/pkg/metrics"
 	"github.com/neurogrid/engine/pkg/model"
 	"github.com/neurogrid/engine/pkg/scheduler"
 	"github.com/neurogrid/engine/pkg/transport"
@@ -58,8 +60,9 @@ type LayerExecutor interface {
 
 // EngineConfig holds configuration for the inference engine.
 type EngineConfig struct {
-	ModelConfig *types.LlamaConfig
-	LocalPeerID string
+	ModelConfig      *types.LlamaConfig
+	LocalPeerID      string
+	EnableHealthCheck bool // Enable tensor health checking (NaN/Inf detection)
 }
 
 // GPUInference interface for GPU-accelerated operations.
@@ -93,18 +96,29 @@ type Engine struct {
 	gpuInference GPUInference
 	useGPU       bool
 
+	// Health check configuration
+	enableHealthCheck bool
+
 	mu sync.RWMutex
 }
 
 // NewEngine creates a new distributed inference engine.
 func NewEngine(config EngineConfig) *Engine {
 	return &Engine{
-		config:          config.ModelConfig,
-		kvCaches:        NewKVCacheManager(),
-		sampler:         NewSampler(42), // Default seed
-		localPeerID:     config.LocalPeerID,
-		remoteExecutors: make(map[string]LayerExecutor),
+		config:            config.ModelConfig,
+		kvCaches:          NewKVCacheManager(),
+		sampler:           NewSampler(42), // Default seed
+		localPeerID:       config.LocalPeerID,
+		remoteExecutors:   make(map[string]LayerExecutor),
+		enableHealthCheck: config.EnableHealthCheck,
 	}
+}
+
+// SetHealthCheckEnabled enables or disables tensor health checking.
+func (e *Engine) SetHealthCheckEnabled(enabled bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.enableHealthCheck = enabled
 }
 
 // RegisterRemoteExecutor registers a remote layer executor for a specific peer.
@@ -597,6 +611,8 @@ func (e *Engine) forwardAllLayersHidden(ctx context.Context, hidden []byte, posi
 
 // forwardLayer executes a single layer forward pass.
 func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, []byte, []byte, error) {
+	layerStart := time.Now()
+
 	// Check if this is a local or remote layer
 	var peerID string
 	for _, a := range e.assignments {
@@ -607,52 +623,85 @@ func (e *Engine) forwardLayer(ctx context.Context, layerID int, hidden []byte, p
 	}
 
 	isLocal := peerID == e.localPeerID
+	location := "local"
+	if !isLocal {
+		location = "remote"
+	}
 
 	// DEBUG: Log layer routing decision (only for first few layers and first token)
 	if position == 0 && layerID < 5 {
 		log.Printf("[DEBUG] Layer %d: peerID=%s, localPeerID=%s, isLocal=%v", layerID, peerID, e.localPeerID, isLocal)
 	}
 
+	var output, k, v []byte
+	var err error
+
 	if isLocal {
 		// Local execution
 		if e.layerExecutor != nil {
-			return e.layerExecutor.Forward(ctx, layerID, hidden, position)
+			output, k, v, err = e.layerExecutor.Forward(ctx, layerID, hidden, position)
+		} else {
+			// Mock local execution for testing
+			output = hidden
+			k = make([]byte, e.config.NumKVHeads*e.config.HeadDim*2)
+			v = make([]byte, e.config.NumKVHeads*e.config.HeadDim*2)
 		}
-		// Mock local execution for testing
-		return hidden, make([]byte, e.config.NumKVHeads*e.config.HeadDim*2), make([]byte, e.config.NumKVHeads*e.config.HeadDim*2), nil
-	}
+	} else {
+		// Remote execution - use registered remote executor for this peer
+		e.mu.RLock()
+		remoteExec, hasRemoteExec := e.remoteExecutors[peerID]
+		e.mu.RUnlock()
 
-	// Remote execution - use registered remote executor for this peer
-	e.mu.RLock()
-	remoteExec, hasRemoteExec := e.remoteExecutors[peerID]
-	e.mu.RUnlock()
-
-	// DEBUG: Log remote execution info
-	if position == 0 && layerID < 5 {
-		log.Printf("[DEBUG] Layer %d: hasRemoteExec=%v, numRemoteExecutors=%d", layerID, hasRemoteExec, len(e.remoteExecutors))
-	}
-
-	if hasRemoteExec {
-		// Use the remote layer executor to forward to peer
-		output, k, v, err := remoteExec.Forward(ctx, layerID, hidden, position)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("remote layer %d forward failed (peer %s): %w", layerID, peerID, err)
+		// DEBUG: Log remote execution info
+		if position == 0 && layerID < 5 {
+			log.Printf("[DEBUG] Layer %d: hasRemoteExec=%v, numRemoteExecutors=%d", layerID, hasRemoteExec, len(e.remoteExecutors))
 		}
-		return output, k, v, nil
+
+		if hasRemoteExec {
+			// Use the remote layer executor to forward to peer
+			output, k, v, err = remoteExec.Forward(ctx, layerID, hidden, position)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("remote layer %d forward failed (peer %s): %w", layerID, peerID, err)
+			}
+		} else {
+			// Fallback to router-based activation transfer (legacy path)
+			if e.router == nil {
+				return nil, nil, nil, fmt.Errorf("no remote executor or router for peer %s", peerID)
+			}
+
+			seqID := atomic.LoadUint64(&e.seqCounter)
+			if err := e.router.RouteActivation(ctx, layerID, seqID, hidden); err != nil {
+				return nil, nil, nil, fmt.Errorf("route activation failed: %w", err)
+			}
+
+			// Legacy path: passthrough (caller needs to handle response separately)
+			output = hidden
+		}
 	}
 
-	// Fallback to router-based activation transfer (legacy path)
-	if e.router == nil {
-		return nil, nil, nil, fmt.Errorf("no remote executor or router for peer %s", peerID)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
-	seqID := atomic.LoadUint64(&e.seqCounter)
-	if err := e.router.RouteActivation(ctx, layerID, seqID, hidden); err != nil {
-		return nil, nil, nil, fmt.Errorf("route activation failed: %w", err)
+	// Record layer execution duration
+	layerDuration := time.Since(layerStart).Seconds()
+	metrics.RecordLayerDuration(layerID, location, layerDuration)
+
+	// Perform health check on output tensor if enabled
+	if e.enableHealthCheck && output != nil && len(output) > 0 {
+		healthStart := time.Now()
+		healthResult := metrics.CheckTensorHealthFP16(output)
+		metrics.TensorHealthCheckDuration.Observe(time.Since(healthStart).Seconds())
+		metrics.RecordTensorHealth(layerID, "hidden_state", healthResult)
+
+		// Log warning if NaN/Inf detected
+		if healthResult.NaNCount > 0 || healthResult.InfCount > 0 {
+			log.Printf("[WARNING] Layer %d: detected %d NaN, %d Inf in output (sampled)",
+				layerID, healthResult.NaNCount, healthResult.InfCount)
+		}
 	}
 
-	// Legacy path: passthrough (caller needs to handle response separately)
-	return hidden, nil, nil, nil
+	return output, k, v, nil
 }
 
 // embedToken looks up the embedding for a token.

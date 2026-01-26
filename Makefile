@@ -2,7 +2,8 @@
 # CUDA + Go build system
 
 SHELL := /bin/bash
-.PHONY: all binaries test clean cuda install-deps lint fmt flatbuffers
+.PHONY: all binaries test clean cuda install-deps lint fmt flatbuffers \
+	observability-up observability-down observability-logs observability-restart observability-status
 
 # Directories
 BUILD_DIR := build
@@ -417,6 +418,18 @@ test-e2e:
 	@echo "Running E2E tests..."
 	go test -v -timeout 120s ./tests/e2e/...
 
+# Run REAL distributed E2E test (requires SSH access to rtx2080)
+# This test actually starts workers on remote machines and validates real inference
+test-e2e-distributed: build-distributed
+	@echo "Running REAL distributed E2E test..."
+	@echo "This test requires SSH access to rtx2080 and builds on both machines"
+	./scripts/run_e2e_distributed.sh
+
+# Quick distributed test (single inference)
+test-e2e-distributed-quick: build-distributed
+	@echo "Running quick distributed E2E test..."
+	./scripts/run_e2e_distributed.sh --quick
+
 # Run integration tests
 test-integration: build-distributed
 	@echo "Running integration tests..."
@@ -492,6 +505,41 @@ run-cluster: build-distributed
 	./scripts/test_e2e.sh
 
 #==============================================================================
+# Observability Stack
+#==============================================================================
+
+# Start observability stack (Jaeger, Prometheus, Grafana)
+observability-up:
+	@echo "Starting observability stack..."
+	docker compose -f docker-compose.observability.yml up -d
+	@echo ""
+	@echo "════════════════════════════════════════════════════════════════"
+	@echo "  Observability Stack Running"
+	@echo "════════════════════════════════════════════════════════════════"
+	@echo "  Jaeger UI:     http://localhost:16686"
+	@echo "  Prometheus:    http://localhost:9090"
+	@echo "  Grafana:       http://localhost:3001"
+	@echo "════════════════════════════════════════════════════════════════"
+	@echo ""
+
+# Stop observability stack
+observability-down:
+	@echo "Stopping observability stack..."
+	docker compose -f docker-compose.observability.yml down
+
+# View observability logs
+observability-logs:
+	docker compose -f docker-compose.observability.yml logs -f
+
+# Restart observability stack
+observability-restart: observability-down observability-up
+
+# Check observability stack status
+observability-status:
+	@echo "Observability Stack Status:"
+	@docker compose -f docker-compose.observability.yml ps
+
+#==============================================================================
 # Help
 #==============================================================================
 
@@ -557,6 +605,17 @@ help:
 	@echo "  LOG_LEVEL=info        Log level: debug, info, warn, error"
 	@echo ""
 	@echo "  Example: make run HTTP_PORT=8080 GPU_ID=1 LOG_LEVEL=debug"
+	@echo ""
+	@echo "📊 OBSERVABILITY:"
+	@echo "  observability-up      Start Jaeger, Prometheus, Grafana"
+	@echo "  observability-down    Stop observability stack"
+	@echo "  observability-logs    View stack logs"
+	@echo "  observability-status  Check stack status"
+	@echo ""
+	@echo "  URLs when running:"
+	@echo "    Jaeger:     http://localhost:16686"
+	@echo "    Prometheus: http://localhost:9090"
+	@echo "    Grafana:    http://localhost:3001"
 	@echo ""
 	@echo "🧹 OTHER:"
 	@echo "  clean                 Remove build artifacts"

@@ -1,0 +1,28 @@
+# Prometheus Configuration for NeuroGrid
+# Scrapes metrics from NeuroGrid inference engine
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # NeuroGrid Coordinator
+  - job_name: 'neurogrid-coordinator'
+    static_configs:
+      - targets: ['host.docker.internal:8089']
+    metrics_path: /metrics
+    scrape_interval: 5s
+    scrape_timeout: 5s
+
+  # NeuroGrid Worker(s)
+  - job_name: 'neurogrid-worker'
+    static_configs:
+      - targets: ['host.docker.internal:8090']
+    metrics_path: /metrics
+    scrape_interval: 5s
+    scrape_timeout: 5s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

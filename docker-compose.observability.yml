@@ -1,0 +1,52 @@
+# NeuroGrid Observability Stack
+# Start with: docker compose -f docker-compose.observability.yml up -d
+# Stop with: docker compose -f docker-compose.observability.yml down
+
+services:
+  # Jaeger - Distributed Tracing
+  # UI: http://localhost:16686
+  jaeger:
+    image: jaegertracing/all-in-one:1.53
+    container_name: neurogrid-jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    restart: unless-stopped
+
+  # Prometheus - Metrics Collection
+  # UI: http://localhost:9090
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: neurogrid-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Access host from container
+    restart: unless-stopped
+
+  # Grafana - Dashboards
+  # UI: http://localhost:3001 (no login required)
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: neurogrid-grafana
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    depends_on:
+      - prometheus
+      - jaeger
+    restart: unless-stopped
+
+volumes:
+  grafana-data:

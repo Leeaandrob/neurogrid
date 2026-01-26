@@ -211,17 +211,11 @@ func (h *GPULMHead) Forward(hidden []byte) ([]float32, error) {
 		return nil, fmt.Errorf("LM head GEMM failed: %w", err)
 	}
 
-	// Copy logits to host as FP16
-	logitsSize := h.vocabSize * 2 // FP16
-	logitsFP16 := make([]byte, logitsSize)
-	if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&logitsFP16[0]), h.logitsGPU, uint64(logitsSize)); err != nil {
-		return nil, fmt.Errorf("failed to copy logits from GPU: %w", err)
-	}
-
-	// Convert FP16 to FP32 on CPU (for sampling)
+	// Copy logits to host with GPU-based FP16->FP32 conversion
+	// This uses cuda_copy_to_host which runs fp16_to_fp32_kernel on GPU
 	logits := make([]float32, h.vocabSize)
-	for i := 0; i < h.vocabSize; i++ {
-		logits[i] = fp16ToFloat32(logitsFP16[i*2 : i*2+2])
+	if err := bindings.CopyToHost(logits, logitsTensor); err != nil {
+		return nil, fmt.Errorf("failed to copy logits from GPU: %w", err)
 	}
 
 	return logits, nil
@@ -261,16 +255,11 @@ func (h *GPULMHead) ForwardFromGPU(hiddenGPUPtr unsafe.Pointer) ([]float32, erro
 		return nil, fmt.Errorf("LM head GEMM failed: %w", err)
 	}
 
-	// Copy logits to host and convert
-	logitsSize := h.vocabSize * 2 // FP16
-	logitsFP16 := make([]byte, logitsSize)
-	if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&logitsFP16[0]), h.logitsGPU, uint64(logitsSize)); err != nil {
-		return nil, fmt.Errorf("failed to copy logits from GPU: %w", err)
-	}
-
+	// Copy logits to host with GPU-based FP16->FP32 conversion
+	// This uses cuda_copy_to_host which runs fp16_to_fp32_kernel on GPU
 	logits := make([]float32, h.vocabSize)
-	for i := 0; i < h.vocabSize; i++ {
-		logits[i] = fp16ToFloat32(logitsFP16[i*2 : i*2+2])
+	if err := bindings.CopyToHost(logits, logitsTensor); err != nil {
+		return nil, fmt.Errorf("failed to copy logits from GPU: %w", err)
 	}
 
 	return logits, nil
