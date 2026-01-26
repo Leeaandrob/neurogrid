@@ -53,6 +53,7 @@ type CoordinatorConfig struct {
 	Role               string          // "coordinator" or "performer"
 	SkipWeightTransfer bool            // Skip sending weights to workers (they have local models)
 	MaxSeqLen          int             // Maximum sequence length for KV cache (caps model's max_position_embeddings)
+	DisableMDNS        bool            // Disable mDNS discovery (use only explicit bootstrap peers)
 }
 
 // Coordinator orchestrates distributed inference
@@ -138,11 +139,16 @@ func (c *Coordinator) Start() error {
 		}
 	}
 
-	// Setup mDNS discovery (for LAN connections)
-	notifee := &coordinatorNotifee{coordinator: c}
-	mdnsService := mdns.NewMdnsService(c.host, ServiceTag, notifee)
-	if err := mdnsService.Start(); err != nil {
-		return fmt.Errorf("failed to start mDNS: %w", err)
+	// Setup mDNS discovery (for LAN connections) unless disabled
+	if !c.config.DisableMDNS {
+		notifee := &coordinatorNotifee{coordinator: c}
+		mdnsService := mdns.NewMdnsService(c.host, ServiceTag, notifee)
+		if err := mdnsService.Start(); err != nil {
+			return fmt.Errorf("failed to start mDNS: %w", err)
+		}
+		log.Printf("mDNS discovery enabled")
+	} else {
+		log.Printf("mDNS discovery disabled (workers must connect via bootstrap)")
 	}
 
 	log.Printf("Discovering workers (minimum %d required)...", c.config.MinPeers)
@@ -781,6 +787,7 @@ func main() {
 	role := flag.String("role", "coordinator", "Node role: coordinator (orchestrates inference) or performer (executes layers)")
 	skipWeightTransfer := flag.Bool("skip-weight-transfer", false, "Skip sending weights to workers (use when workers have local models)")
 	maxSeqLen := flag.Int("max-seq-len", 4096, "Maximum sequence length for KV cache (caps model's max_position_embeddings to save VRAM)")
+	disableMDNS := flag.Bool("disable-mdns", false, "Disable mDNS discovery (workers must connect via bootstrap to this coordinator)")
 	flag.Parse()
 
 	// Parse bootstrap peers
@@ -818,6 +825,7 @@ func main() {
 		Role:               *role,
 		SkipWeightTransfer: *skipWeightTransfer,
 		MaxSeqLen:          *maxSeqLen,
+		DisableMDNS:        *disableMDNS,
 	}
 
 	log.Println("================================================")
