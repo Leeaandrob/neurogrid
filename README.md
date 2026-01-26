@@ -165,7 +165,9 @@ For multi-GPU inference across machines using Pipeline Parallelism.
 
 ### Mode 1: Workers with Local Models (Recommended)
 
-When workers have the model downloaded locally, skip weight transfer for faster startup:
+When workers have the model downloaded locally, skip weight transfer for faster startup.
+
+**Important**: Use `-wait-for-assignment` on workers so they only load layers assigned by the coordinator. This is critical for heterogeneous GPU clusters to prevent OOM errors.
 
 ```bash
 # Coordinator (GH200 - start first)
@@ -184,15 +186,23 @@ LD_LIBRARY_PATH=./build ./build/worker \
   -bootstrap /ip4/<COORDINATOR_IP>/tcp/9000/p2p/<COORDINATOR_PEER_ID> \
   -model models/mistral-nemo-instruct-2407 \
   -gpu 0 \
-  -port 9001
+  -port 9001 \
+  -wait-for-assignment
 
 # Worker 2 (RTX 2080 - connect via bootstrap)
 LD_LIBRARY_PATH=./build ./build/worker \
   -bootstrap /ip4/<COORDINATOR_IP>/tcp/9000/p2p/<COORDINATOR_PEER_ID> \
   -model /path/to/models/mistral-nemo-instruct-2407 \
   -gpu 0 \
-  -port 9002
+  -port 9002 \
+  -wait-for-assignment
 ```
+
+**What happens:**
+1. Workers connect and report their GPU info (VRAM, name) to coordinator
+2. Coordinator computes layer assignments based on actual VRAM of each GPU
+3. Coordinator sends layer requests to workers
+4. Workers load only their assigned layers from local storage
 
 ### Mode 2: Auto-Discovery (LAN only)
 
@@ -211,22 +221,46 @@ make run-coordinator MIN_PEERS=2
 
 ### Distributed Mode Flags
 
+#### Coordinator Flags
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-min-peers` | 0 | Minimum workers to wait for (0 = local only) |
 | `-skip-weight-transfer` | false | Skip P2P weight distribution (workers have local models) |
 | `-disable-mdns` | false | Disable mDNS discovery (use explicit bootstrap) |
-| `-bootstrap` | "" | Bootstrap peer address for explicit connection |
 | `-max-seq-len` | 4096 | Max sequence length (caps KV cache size) |
+
+#### Worker Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-bootstrap` | "" | Coordinator address for explicit connection |
+| `-model` | "" | Path to local model weights |
+| `-wait-for-assignment` | false | **Critical for heterogeneous clusters**: Wait for coordinator to assign layers before loading |
+| `-max-seq-len` | 4096 | Max sequence length (caps KV cache size) |
+| `-port` | 9000 | P2P listen port |
+| `-gpu` | 0 | GPU device ID |
+
+### Heterogeneous GPU Support
+
+NeuroGrid supports clusters with different GPU types (e.g., GH200 + RTX 4090 + RTX 2080). The system:
+
+1. **GPU Info Protocol**: Workers report actual VRAM to coordinator on connect
+2. **VRAM-Aware Scheduling**: Scheduler assigns layers based on each GPU's available memory
+3. **On-Demand Loading**: With `-wait-for-assignment`, workers load only their assigned layers
+
+This prevents OOM errors on smaller GPUs that would occur if all GPUs tried to load the same layers.
 
 ### Troubleshooting Distributed Mode
 
 **Ghost Peer Issue**: If you see connections to unknown peers, use `-disable-mdns` and connect workers via explicit `-bootstrap` addresses.
 
-**Out of Memory on Workers**: Workers with less VRAM (e.g., RTX 2080 11GB) may run out of memory. Consider:
-- Using smaller models
-- Reducing `-max-seq-len`
-- Assigning fewer layers to smaller GPUs (future feature)
+**Out of Memory on Workers**:
+- **Use `-wait-for-assignment`** on workers (most common fix)
+- Reduce `-max-seq-len` to use less KV cache memory
+- The scheduler automatically assigns fewer layers to GPUs with less VRAM
+
+**Workers not receiving layer assignments**: Ensure coordinator has `-min-peers` set to the number of expected workers.
 
 ## Building from Source
 
