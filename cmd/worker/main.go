@@ -35,12 +35,13 @@ const (
 
 // WorkerConfig holds worker configuration
 type WorkerConfig struct {
-	Port           int
-	GPUID          int
-	ModelPath      string
-	ModelName      string
-	LogLevel       string
-	BootstrapPeers []peer.AddrInfo // Coordinator address for WAN connections
+	Port              int
+	GPUID             int
+	ModelPath         string
+	ModelName         string
+	LogLevel          string
+	BootstrapPeers    []peer.AddrInfo // Coordinator address for WAN connections
+	WaitForAssignment bool            // Wait for coordinator to assign layers before loading
 }
 
 // chunkBuffer accumulates weight chunks for a layer
@@ -165,11 +166,22 @@ func (w *Worker) Start() error {
 		return fmt.Errorf("failed to start mDNS: %w", err)
 	}
 
-	// If model path provided, load weights locally
+	// If model path provided, load weights locally (unless waiting for assignment)
 	if w.config.ModelPath != "" {
-		if err := w.loadLocalWeights(); err != nil {
-			log.Printf("Warning: Failed to load local weights: %v", err)
-			log.Printf("Worker will wait for weights from coordinator")
+		if w.config.WaitForAssignment {
+			// In distributed memory mode, wait for coordinator to assign specific layers
+			log.Printf("Waiting for layer assignment from coordinator (model: %s)", w.config.ModelPath)
+			log.Printf("Layers will be loaded only after coordinator sends assignment")
+			// Load model config but not weights
+			if err := w.loadModelConfigOnly(); err != nil {
+				log.Printf("Warning: Failed to load model config: %v", err)
+			}
+		} else {
+			// Load all layers at startup (traditional mode)
+			if err := w.loadLocalWeights(); err != nil {
+				log.Printf("Warning: Failed to load local weights: %v", err)
+				log.Printf("Worker will wait for weights from coordinator")
+			}
 		}
 	} else {
 		log.Printf("No model path specified, waiting for weights from coordinator...")
@@ -205,6 +217,27 @@ func (w *Worker) initializeGPU() error {
 		float64(totalVRAM)/(1024*1024*1024),
 		float64(usedVRAM)/(1024*1024*1024),
 		float64(totalVRAM-usedVRAM)/(1024*1024*1024))
+
+	return nil
+}
+
+// loadModelConfigOnly loads model configuration without loading weights.
+// Used in distributed memory mode where coordinator assigns specific layers.
+func (w *Worker) loadModelConfigOnly() error {
+	log.Printf("Loading model config from %s...", w.config.ModelPath)
+
+	// Try auto-detection from config.json first
+	cfg, err := getModelConfigFromPath(w.config.ModelPath)
+	if err != nil {
+		log.Printf("Could not auto-detect model config from %s: %v, using --model-name", w.config.ModelPath, err)
+		w.modelConfig = getModelConfig(w.config.ModelName)
+	} else {
+		log.Printf("Auto-detected model config from %s/config.json", w.config.ModelPath)
+		w.modelConfig = cfg
+	}
+
+	log.Printf("Model config loaded: %d layers, hidden=%d, intermediate=%d",
+		w.modelConfig.NumLayers, w.modelConfig.HiddenSize, w.modelConfig.IntermediateSize)
 
 	return nil
 }
@@ -817,6 +850,7 @@ func main() {
 	modelName := flag.String("model-name", "llama-7b", "Model name (llama-7b, llama-13b, llama-70b)")
 	logLevel := flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	bootstrapStr := flag.String("bootstrap", "", "Bootstrap peer multiaddr (coordinator address)")
+	waitForAssignment := flag.Bool("wait-for-assignment", false, "Wait for coordinator to assign layers before loading (for distributed memory)")
 	flag.Parse()
 
 	// Parse bootstrap peers
@@ -841,12 +875,13 @@ func main() {
 
 	// Create worker config
 	config := WorkerConfig{
-		Port:           *port,
-		GPUID:          *gpuID,
-		ModelPath:      *modelPath,
-		ModelName:      *modelName,
-		LogLevel:       *logLevel,
-		BootstrapPeers: bootstrapPeers,
+		Port:              *port,
+		GPUID:             *gpuID,
+		ModelPath:         *modelPath,
+		ModelName:         *modelName,
+		LogLevel:          *logLevel,
+		BootstrapPeers:    bootstrapPeers,
+		WaitForAssignment: *waitForAssignment,
 	}
 
 	log.Println("================================================")
@@ -860,6 +895,9 @@ func main() {
 	}
 	if len(config.BootstrapPeers) > 0 {
 		log.Printf("Bootstrap Peers (coordinators): %d", len(config.BootstrapPeers))
+	}
+	if config.WaitForAssignment {
+		log.Printf("Mode: Weight Distributed Memory (waiting for layer assignment)")
 	}
 
 	// Create and start worker

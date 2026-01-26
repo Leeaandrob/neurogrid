@@ -383,6 +383,18 @@ func (c *Coordinator) initializeComponents() error {
 		c.engine.RegisterRemoteExecutor(peerIDStr, remoteExec)
 
 		log.Printf("Created RemoteLayerExecutor for peer %s: layers %d-%d", peerIDStr, startLayer, endLayer)
+
+		// Send layer assignment to this peer (for Weight Distributed Memory)
+		go func(pID peer.ID, layerList []int) {
+			ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
+			defer cancel()
+			log.Printf("Sending layer assignment to peer %s: %d layers", pID, len(layerList))
+			if err := c.p2pProtocol.SendLayerRequest(ctx, pID, layerList); err != nil {
+				log.Printf("Warning: Failed to send layer assignment to %s: %v", pID, err)
+			} else {
+				log.Printf("Layer assignment sent to peer %s: layers %v", pID, layerList)
+			}
+		}(targetPeerID, layers)
 	}
 
 	// Load tokenizer from model directory
