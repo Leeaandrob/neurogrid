@@ -37,11 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Root cause: Coordinator was using local GPU's VRAM for all workers
   - Solution: Workers report actual VRAM via P2P protocol
 - **Scheduler Memory Estimation** - Improved for distributed inference across heterogeneous GPUs
+- **CRITICAL: Garbage Output in Distributed Inference** - RopeTheta mismatch between coordinator and workers
+  - Root cause: Coordinator's `getModelConfigFromPath` was not passing `RopeTheta` from config.json
+  - Impact: Coordinator used default RopeTheta=10000 while workers used model's actual value (e.g., 1000000 for Mistral Nemo)
+  - Result: RoPE position encodings were incompatible, causing completely garbled output
+  - Solution: Coordinator now correctly reads and uses `rope_theta` from model's config.json
 
 ### Changed
 - Better documentation for distributed mode setup
 - Coordinator logs now show when mDNS is disabled vs enabled
 - Coordinator logs GPU info received from each worker
+- Enhanced model config logging on both coordinator and workers (now includes RopeTheta)
 
 ---
 

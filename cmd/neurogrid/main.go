@@ -248,6 +248,10 @@ func (c *Coordinator) initializeComponents() error {
 		modelConfig.MaxSeqLen = c.config.MaxSeqLen
 	}
 
+	// Log critical model config values for debugging distributed inference
+	log.Printf("Model config: layers=%d, hidden=%d, heads=%d, kvHeads=%d, RopeTheta=%.1f",
+		modelConfig.NumLayers, modelConfig.HiddenSize, modelConfig.NumHeads, modelConfig.NumKVHeads, modelConfig.RopeTheta)
+
 	// Create scheduler
 	c.scheduler = scheduler.NewScheduler(modelConfig)
 
@@ -797,6 +801,7 @@ func getModelConfigFromPath(modelPath string) (scheduler.ModelConfig, error) {
 		MaxSeqLen:        cfg.MaxPositionEmbeddings,
 		VocabSize:        int64(cfg.VocabSize),
 		RMSNormEps:       float32(cfg.RMSNormEps),
+		RopeTheta:        cfg.RopeTheta,
 	}, nil
 }
 

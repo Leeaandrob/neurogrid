@@ -255,8 +255,8 @@ func (w *Worker) loadModelConfigOnly() error {
 		w.modelConfig.MaxSeqLen = w.config.MaxSeqLen
 	}
 
-	log.Printf("Model config loaded: %d layers, hidden=%d, intermediate=%d, maxSeqLen=%d",
-		w.modelConfig.NumLayers, w.modelConfig.HiddenSize, w.modelConfig.IntermediateSize, w.modelConfig.MaxSeqLen)
+	log.Printf("Model config loaded: layers=%d, hidden=%d, intermediate=%d, maxSeqLen=%d, RopeTheta=%.1f",
+		w.modelConfig.NumLayers, w.modelConfig.HiddenSize, w.modelConfig.IntermediateSize, w.modelConfig.MaxSeqLen, w.modelConfig.RopeTheta)
 
 	return nil
 }
