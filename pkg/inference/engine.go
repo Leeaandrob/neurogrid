@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,7 @@ type GenerateRequest struct {
 	Temperature float32
 	TopP        float32
 	StopTokens  []int
+	StopStrings []string // Stop generation when any of these strings appear in output
 }
 
 // GenerateResponse represents a text generation response.
@@ -397,6 +399,29 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 			break
 		}
 
+		// Check for stop strings in generated text
+		if len(req.StopStrings) > 0 {
+			currentText, _ := e.tokenizer.Decode(outputTokens)
+			for _, stopStr := range req.StopStrings {
+				if idx := strings.Index(currentText, stopStr); idx != -1 {
+					// Truncate output at the stop string
+					log.Printf("[Generate] Stop string %q found at position %d", stopStr, idx)
+					// Re-encode the truncated text to get correct token count
+					truncatedText := currentText[:idx]
+					outputTokens, _ = e.tokenizer.Encode(truncatedText)
+					// Remove BOS if present (Encode adds it)
+					if len(outputTokens) > 0 && outputTokens[0] == e.tokenizer.BOSToken() {
+						outputTokens = outputTokens[1:]
+					}
+					stopReason = "stop_string"
+					break
+				}
+			}
+			if stopReason == "stop_string" {
+				break
+			}
+		}
+
 		// Get embedding for next token
 		hidden, err = e.embedToken(nextToken)
 		if err != nil {
@@ -447,6 +472,7 @@ func (e *Engine) GenerateStream(ctx context.Context, req *GenerateRequest, callb
 
 	// Autoregressive decode with streaming
 	tokenCount := 0
+	var accumulatedText strings.Builder // For stop string detection
 
 	for i := 0; i < req.MaxTokens; i++ {
 		select {
@@ -487,6 +513,31 @@ func (e *Engine) GenerateStream(ctx context.Context, req *GenerateRequest, callb
 				isFinal = true
 				stopReason = "stop_token"
 				break
+			}
+		}
+
+		// Accumulate text and check for stop strings
+		accumulatedText.WriteString(tokenText)
+		if len(req.StopStrings) > 0 && !isFinal {
+			currentText := accumulatedText.String()
+			for _, stopStr := range req.StopStrings {
+				if idx := strings.Index(currentText, stopStr); idx != -1 {
+					// Truncate token text if stop string is in current token
+					log.Printf("[GenerateStream] Stop string %q found", stopStr)
+					// Calculate how much of the current token to keep
+					textBeforeStop := currentText[:idx]
+					prevLen := len(currentText) - len(tokenText)
+					if idx >= prevLen {
+						// Stop string starts within current token
+						tokenText = textBeforeStop[prevLen:]
+					} else {
+						// Stop string was in previous text (shouldn't happen, but handle it)
+						tokenText = ""
+					}
+					isFinal = true
+					stopReason = "stop_string"
+					break
+				}
 			}
 		}
 

@@ -357,12 +357,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Build prompt from messages using the model-specific chat template
 	prompt := buildPromptForModel(req.Messages, s.config.ModelName)
 
+	// Get stop strings for this model (prevents generating new turns)
+	stopStrings := getStopStringsForModel(s.config.ModelName)
+
 	// Generate response
 	genReq := &inference.GenerateRequest{
 		Prompt:      prompt,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
+		StopStrings: stopStrings,
 	}
 
 	ctx := r.Context()
@@ -397,12 +401,16 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 	// Build prompt using model-specific chat template
 	prompt := buildPromptForModel(req.Messages, s.config.ModelName)
 
+	// Get stop strings for this model (prevents generating new turns)
+	stopStrings := getStopStringsForModel(s.config.ModelName)
+
 	// Build generation request
 	genReq := &inference.GenerateRequest{
 		Prompt:      prompt,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
+		StopStrings: stopStrings,
 	}
 
 	ctx := r.Context()
@@ -472,6 +480,30 @@ func buildPromptForModel(messages []Message, modelName string) string {
 // It delegates to buildPromptForModel with an empty model name (defaults to Llama 2).
 func buildLlamaPrompt(messages []Message) string {
 	return buildPromptForModel(messages, "")
+}
+
+// getStopStringsForModel returns stop strings that prevent the model from generating new turns.
+// Different chat templates use different markers for role changes.
+func getStopStringsForModel(modelName string) []string {
+	lower := strings.ToLower(modelName)
+
+	// TinyLlama uses ChatML-style markers
+	if strings.Contains(lower, "tinyllama") {
+		return []string{"<|user|>", "<|system|>"}
+	}
+
+	// Llama 3 uses special header tokens
+	if strings.Contains(lower, "llama-3") || strings.Contains(lower, "llama3") {
+		return []string{"<|start_header_id|>user", "<|start_header_id|>system"}
+	}
+
+	// Mistral uses [INST] markers
+	if strings.Contains(lower, "mistral") || strings.Contains(lower, "mixtral") {
+		return []string{"[INST]"}
+	}
+
+	// Llama 2 default - uses [INST] for new user turns
+	return []string{"[INST]"}
 }
 
 // sendJSON sends a JSON response.
