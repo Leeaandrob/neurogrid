@@ -380,8 +380,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clean up output - remove any leaked template tokens
+	cleanedText := cleanModelOutput(genResp.Text, s.config.ModelName)
+
 	// Build response
-	resp := NewChatCompletionResponse(s.config.ModelName, genResp.Text, genResp.StopReason)
+	resp := NewChatCompletionResponse(s.config.ModelName, cleanedText, genResp.StopReason)
 
 	s.sendJSON(w, resp, http.StatusOK)
 }
@@ -485,25 +488,54 @@ func buildLlamaPrompt(messages []Message) string {
 // getStopStringsForModel returns stop strings that prevent the model from generating new turns.
 // Different chat templates use different markers for role changes.
 func getStopStringsForModel(modelName string) []string {
+	// Return empty - we'll clean up the output instead of stopping early
+	// This prevents issues with models that generate template tokens at the start
+	return []string{}
+}
+
+// cleanModelOutput removes leaked template tokens from model output.
+// Some models (especially smaller ones like TinyLlama) may generate template markers
+// as part of their response. This function strips them out.
+func cleanModelOutput(text string, modelName string) string {
 	lower := strings.ToLower(modelName)
 
-	// TinyLlama uses ChatML-style markers
+	// Define markers to remove based on model type
+	var markers []string
+
 	if strings.Contains(lower, "tinyllama") {
-		return []string{"<|user|>", "<|system|>"}
+		markers = []string{"<|system|>", "<|user|>", "<|assistant|>", "</s>"}
+	} else if strings.Contains(lower, "llama-3") || strings.Contains(lower, "llama3") {
+		markers = []string{"<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|begin_of_text|>"}
+	} else if strings.Contains(lower, "mistral") || strings.Contains(lower, "mixtral") {
+		markers = []string{"[INST]", "[/INST]", "<<SYS>>", "<</SYS>>"}
+	} else {
+		// Llama 2 default
+		markers = []string{"[INST]", "[/INST]", "<<SYS>>", "<</SYS>>", "</s>", "<s>"}
 	}
 
-	// Llama 3 uses special header tokens
-	if strings.Contains(lower, "llama-3") || strings.Contains(lower, "llama3") {
-		return []string{"<|start_header_id|>user", "<|start_header_id|>system"}
+	// Remove all markers
+	result := text
+	for _, marker := range markers {
+		result = strings.ReplaceAll(result, marker, "")
 	}
 
-	// Mistral uses [INST] markers
-	if strings.Contains(lower, "mistral") || strings.Contains(lower, "mixtral") {
-		return []string{"[INST]"}
+	// Remove role names that might appear after markers
+	roleNames := []string{"system\n", "user\n", "assistant\n", "system", "user", "assistant"}
+	for _, role := range roleNames {
+		// Only remove if at the start of the text or after a newline
+		if strings.HasPrefix(result, role) {
+			result = strings.TrimPrefix(result, role)
+		}
+		result = strings.ReplaceAll(result, "\n"+role, "\n")
 	}
 
-	// Llama 2 default - uses [INST] for new user turns
-	return []string{"[INST]"}
+	// Clean up multiple newlines and trim
+	for strings.Contains(result, "\n\n\n") {
+		result = strings.ReplaceAll(result, "\n\n\n", "\n\n")
+	}
+	result = strings.TrimSpace(result)
+
+	return result
 }
 
 // sendJSON sends a JSON response.
