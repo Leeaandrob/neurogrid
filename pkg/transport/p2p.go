@@ -43,6 +43,7 @@ type P2PTransport struct {
 	requestCounter   uint64
 	mu               sync.RWMutex
 	closed           bool
+	bufferPool       BufferPool // Optional buffer pool for zero-allocation message handling
 }
 
 // activationMsg is an internal message structure for the receive channel.
@@ -54,13 +55,38 @@ type activationMsg struct {
 	from      string
 }
 
+// P2PTransportOption is a functional option for configuring P2PTransport.
+// Use these options with NewP2PTransport to customize transport behavior.
+type P2PTransportOption func(*P2PTransport)
+
+// WithBufferPool configures a buffer pool for zero-allocation message handling.
+// When set, the transport will use pooled buffers instead of allocating new ones for each message.
+//
+// For optimal DMA performance with CUDA, use a pinned memory buffer pool.
+// The pool should have buffers sized for typical activation data (8KB-16KB for LLM inference).
+//
+// Example:
+//
+//	pool, _ := NewPinnedBufferPool(16*1024, 32)
+//	transport := NewP2PTransport(host, peerID, WithBufferPool(pool))
+func WithBufferPool(pool BufferPool) P2PTransportOption {
+	return func(t *P2PTransport) {
+		t.bufferPool = pool
+	}
+}
+
 // NewP2PTransport creates a new P2P transport for the given peer.
-func NewP2PTransport(h host.Host, peerID peer.ID) *P2PTransport {
+func NewP2PTransport(h host.Host, peerID peer.ID, opts ...P2PTransportOption) *P2PTransport {
 	t := &P2PTransport{
 		host:             h,
 		peerID:           peerID,
 		recvChan:         make(chan *activationMsg, 100),
 		pendingResponses: make(map[uint64]chan *ActivationMessage),
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(t)
 	}
 
 	// Register stream handler for this peer
@@ -102,9 +128,19 @@ func (t *P2PTransport) handleExtendedStream(s network.Stream, msgType byte) {
 	requestID := binary.BigEndian.Uint64(restHeader[12:20])
 	dataLen := binary.BigEndian.Uint32(restHeader[20:24])
 
-	// Read data
-	data := make([]byte, dataLen)
+	// Read data - use buffer pool if available
+	var data []byte
+	var pooledBuf []byte
+	if t.bufferPool != nil {
+		pooledBuf = t.bufferPool.Get(int(dataLen))
+		data = pooledBuf[:dataLen]
+	} else {
+		data = make([]byte, dataLen)
+	}
 	if _, err := io.ReadFull(s, data); err != nil {
+		if pooledBuf != nil && t.bufferPool != nil {
+			t.bufferPool.Put(pooledBuf)
+		}
 		return
 	}
 
@@ -112,12 +148,21 @@ func (t *P2PTransport) handleExtendedStream(s network.Stream, msgType byte) {
 
 	switch msgType {
 	case msgTypeActivation:
+		// Make a copy of data if using pooled buffer (caller owns the copy)
+		var msgData []byte
+		if pooledBuf != nil {
+			msgData = make([]byte, len(data))
+			copy(msgData, data)
+			t.bufferPool.Put(pooledBuf)
+		} else {
+			msgData = data
+		}
 		// Send to receive channel
 		msg := &activationMsg{
 			layerID:   layerID,
 			seqID:     seqID,
 			requestID: requestID,
-			data:      data,
+			data:      msgData,
 			from:      from,
 		}
 		select {
@@ -132,11 +177,21 @@ func (t *P2PTransport) handleExtendedStream(s network.Stream, msgType byte) {
 		handler := t.responseHandler
 		t.mu.RUnlock()
 
+		// Make a copy of data if using pooled buffer
+		var msgData []byte
+		if pooledBuf != nil {
+			msgData = make([]byte, len(data))
+			copy(msgData, data)
+			t.bufferPool.Put(pooledBuf)
+		} else {
+			msgData = data
+		}
+
 		respMsg := &ActivationMessage{
 			LayerID:   layerID,
 			SeqID:     seqID,
 			RequestID: requestID,
-			Data:      data,
+			Data:      msgData,
 			Timestamp: time.Now(),
 			From:      from,
 		}
@@ -170,17 +225,37 @@ func (t *P2PTransport) handleLegacyStream(s network.Stream, firstByte []byte) {
 	seqID := binary.BigEndian.Uint64(header[4:12])
 	dataLen := binary.BigEndian.Uint32(header[12:16])
 
-	// Read data
-	data := make([]byte, dataLen)
+	// Read data - use buffer pool if available
+	var data []byte
+	var pooledBuf []byte
+	if t.bufferPool != nil {
+		pooledBuf = t.bufferPool.Get(int(dataLen))
+		data = pooledBuf[:dataLen]
+	} else {
+		data = make([]byte, dataLen)
+	}
 	if _, err := io.ReadFull(s, data); err != nil {
+		if pooledBuf != nil && t.bufferPool != nil {
+			t.bufferPool.Put(pooledBuf)
+		}
 		return
+	}
+
+	// Make a copy of data if using pooled buffer
+	var msgData []byte
+	if pooledBuf != nil {
+		msgData = make([]byte, len(data))
+		copy(msgData, data)
+		t.bufferPool.Put(pooledBuf)
+	} else {
+		msgData = data
 	}
 
 	// Send to receive channel
 	msg := &activationMsg{
 		layerID: layerID,
 		seqID:   seqID,
-		data:    data,
+		data:    msgData,
 		from:    s.Conn().RemotePeer().String(),
 	}
 
@@ -188,6 +263,23 @@ func (t *P2PTransport) handleLegacyStream(s network.Stream, firstByte []byte) {
 	case t.recvChan <- msg:
 	default:
 	}
+}
+
+// GetBufferPool returns the configured buffer pool, or nil if none is set.
+// Use HasBufferPool() to check if a pool is configured without getting it.
+func (t *P2PTransport) GetBufferPool() BufferPool {
+	return t.bufferPool
+}
+
+// SetBufferPool sets the buffer pool for the transport.
+// Can be called after transport creation to add or replace the buffer pool.
+// Thread-safe: acquires write lock during update.
+//
+// Passing nil disables pooled buffers (transport reverts to per-message allocation).
+func (t *P2PTransport) SetBufferPool(pool BufferPool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.bufferPool = pool
 }
 
 // SendActivation sends activation data to the remote peer.

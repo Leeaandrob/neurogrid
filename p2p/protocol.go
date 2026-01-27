@@ -91,6 +91,28 @@ type GPUInfoHandler func(peerID peer.ID, info GPUInfo)
 // GPUInfoRequestHandler is a callback for when coordinator requests GPU info.
 type GPUInfoRequestHandler func(peerID peer.ID)
 
+// BufferPool provides reusable byte buffers for transport operations.
+// This mirrors the transport.BufferPool interface for protocol layer use.
+//
+// Implementations should be thread-safe for concurrent Get/Put calls.
+// Buffers returned by Get may be larger than requested size.
+// Put accepts nil buffers gracefully (no-op).
+//
+// Note: This interface is intentionally duplicated from transport.BufferPool
+// to avoid circular import between p2p and transport packages.
+type BufferPool interface {
+	// Get returns a buffer of at least the requested size.
+	// Returns nil if allocation fails and pool is exhausted.
+	Get(size int) []byte
+
+	// Put returns a buffer to the pool for reuse.
+	// Safe to call with nil buffer.
+	Put(buf []byte)
+
+	// Close releases all pooled resources.
+	Close() error
+}
+
 // Protocol manages the tensor transfer protocol.
 type Protocol struct {
 	host                  host.Host
@@ -107,6 +129,7 @@ type Protocol struct {
 	pendingWeightsAck     map[string]chan struct{}       // peerID:layerID -> ack channel
 	pendingLayerStatus    map[string]chan []int          // peerID -> layer status channel
 	pendingGPUInfo        map[string]chan GPUInfo        // peerID -> GPU info channel
+	bufferPool            BufferPool                     // Optional buffer pool for zero-allocation message handling
 	mu                    sync.RWMutex
 }
 
@@ -196,6 +219,35 @@ func (p *Protocol) RegisterPendingRequest(requestID uint64) {
 	p.pendingResponses[requestID] = make(chan *TensorMessage, 1)
 }
 
+// SetBufferPool sets the buffer pool for zero-allocation message handling.
+// When set, incoming messages will use pooled buffers instead of allocating new ones.
+//
+// The pool should have buffers sized for typical activation data (8KB-16KB for LLM inference).
+// For CUDA-optimized transfers, use a pinned memory pool implementation.
+//
+// Thread-safe: can be called while protocol is handling messages.
+func (p *Protocol) SetBufferPool(pool BufferPool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bufferPool = pool
+}
+
+// GetBufferPool returns the configured buffer pool, or nil if none is set.
+// Thread-safe.
+func (p *Protocol) GetBufferPool() BufferPool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.bufferPool
+}
+
+// HasBufferPool returns whether the protocol has a buffer pool configured.
+// Thread-safe.
+func (p *Protocol) HasBufferPool() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.bufferPool != nil
+}
+
 // decodeHeader extracts layerID, seqID, and dataLen from a header buffer (legacy).
 func decodeHeader(header []byte) (layerID int, seqID uint64, dataLen uint32) {
 	layerID = int(binary.BigEndian.Uint32(header[0:4]))
@@ -270,10 +322,34 @@ func (p *Protocol) handleExtendedMessage(s network.Stream, msgType uint8) {
 
 	_, layerID, seqID, requestID, dataLen := DecodeExtendedHeader(header)
 
-	// Read data
-	data := make([]byte, dataLen)
+	// Read data - use buffer pool if available
+	p.mu.RLock()
+	pool := p.bufferPool
+	p.mu.RUnlock()
+
+	var data []byte
+	var pooledBuf []byte
+	if pool != nil {
+		pooledBuf = pool.Get(int(dataLen))
+		data = pooledBuf[:dataLen]
+	} else {
+		data = make([]byte, dataLen)
+	}
 	if _, err := io.ReadFull(s, data); err != nil {
+		if pooledBuf != nil && pool != nil {
+			pool.Put(pooledBuf)
+		}
 		return
+	}
+
+	// Make a copy of data if using pooled buffer
+	var msgData []byte
+	if pooledBuf != nil {
+		msgData = make([]byte, len(data))
+		copy(msgData, data)
+		pool.Put(pooledBuf)
+	} else {
+		msgData = data
 	}
 
 	// Create message
@@ -282,7 +358,7 @@ func (p *Protocol) handleExtendedMessage(s network.Stream, msgType uint8) {
 		LayerID:   layerID,
 		SeqID:     seqID,
 		RequestID: requestID,
-		Data:      data,
+		Data:      msgData,
 		From:      s.Conn().RemotePeer(),
 	}
 
@@ -485,10 +561,34 @@ func (p *Protocol) handleTracedMessage(s network.Stream, msgType uint8) {
 	var traceCtx telemetry.TraceContext
 	traceCtx.Deserialize(header[ExtendedHeaderSize:])
 
-	// Read data
-	data := make([]byte, dataLen)
+	// Read data - use buffer pool if available
+	p.mu.RLock()
+	pool := p.bufferPool
+	p.mu.RUnlock()
+
+	var data []byte
+	var pooledBuf []byte
+	if pool != nil {
+		pooledBuf = pool.Get(int(dataLen))
+		data = pooledBuf[:dataLen]
+	} else {
+		data = make([]byte, dataLen)
+	}
 	if _, err := io.ReadFull(s, data); err != nil {
+		if pooledBuf != nil && pool != nil {
+			pool.Put(pooledBuf)
+		}
 		return
+	}
+
+	// Make a copy of data if using pooled buffer
+	var msgData []byte
+	if pooledBuf != nil {
+		msgData = make([]byte, len(data))
+		copy(msgData, data)
+		pool.Put(pooledBuf)
+	} else {
+		msgData = data
 	}
 
 	// Create message with trace context
@@ -497,7 +597,7 @@ func (p *Protocol) handleTracedMessage(s network.Stream, msgType uint8) {
 		LayerID:      layerID,
 		SeqID:        seqID,
 		RequestID:    requestID,
-		Data:         data,
+		Data:         msgData,
 		From:         s.Conn().RemotePeer(),
 		TraceContext: traceCtx,
 	}

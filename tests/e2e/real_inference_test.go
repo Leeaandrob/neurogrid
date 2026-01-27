@@ -33,7 +33,9 @@ func TestCUDALayerExecutor_Interface(t *testing.T) {
 	config := getTestConfig()
 
 	// This should compile - CUDALayerExecutor must implement LayerExecutor
-	var executor inference.LayerExecutor = inference.NewCUDALayerExecutor(config, 0)
+	cudaExec, err := inference.NewCUDALayerExecutor(config, 0)
+	require.NoError(t, err, "Failed to create CUDALayerExecutor")
+	var executor inference.LayerExecutor = cudaExec
 	require.NotNil(t, executor, "CUDALayerExecutor should not be nil")
 
 	// Cleanup
@@ -50,7 +52,8 @@ func TestCUDALayerExecutor_LoadLayer(t *testing.T) {
 	}
 
 	config := getTestConfig()
-	executor := inference.NewCUDALayerExecutor(config, 0)
+	executor, execErr := inference.NewCUDALayerExecutor(config, 0)
+	require.NoError(t, execErr, "Failed to create executor")
 	defer executor.Close()
 
 	// Load golden weights (skip if not available)
@@ -72,7 +75,8 @@ func TestCUDALayerExecutor_Forward(t *testing.T) {
 	}
 
 	config := getTestConfig()
-	executor := inference.NewCUDALayerExecutor(config, 0)
+	executor, execErr := inference.NewCUDALayerExecutor(config, 0)
+	require.NoError(t, execErr, "Failed to create executor")
 	defer executor.Close()
 
 	// Load layer (skip if not available)

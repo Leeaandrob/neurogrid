@@ -11,6 +11,23 @@ package bindings
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include "gpu.h"
+
+// cuda_host_alloc allocates CUDA-registered host (pinned) memory.
+// Uses cudaHostAllocPortable for multi-GPU visibility.
+static inline cudaError_t cuda_host_alloc(void** ptr, size_t size) {
+    return cudaHostAlloc(ptr, size, cudaHostAllocPortable);
+}
+
+// cuda_host_free releases CUDA-registered host memory.
+static inline cudaError_t cuda_host_free(void* ptr) {
+    return cudaFreeHost(ptr);
+}
+
+// cuda_host_get_flags retrieves the flags used when allocating pinned memory.
+// Returns cudaSuccess if the pointer is registered pinned memory, error otherwise.
+static inline cudaError_t cuda_host_get_flags(unsigned int* flags, void* ptr) {
+    return cudaHostGetFlags(flags, ptr);
+}
 */
 import "C"
 import (
@@ -924,4 +941,75 @@ func CopyFromDeviceRaw(dst unsafe.Pointer, src unsafe.Pointer, size uint64) erro
 		return fmt.Errorf("copy from device failed: %d", result)
 	}
 	return nil
+}
+
+// =============================================================================
+// CUDA Pinned Memory Operations (for DMA transfers)
+// =============================================================================
+
+// AllocPinnedMemory allocates CUDA-registered host memory for DMA transfers.
+// Uses cudaHostAllocPortable flag for multi-GPU visibility.
+// The allocated memory is page-locked and suitable for asynchronous transfers.
+//
+// CRITICAL: Uses cudaHostAllocPortable so pinned memory is visible from all GPUs.
+//
+// Parameters:
+//   - size: number of bytes to allocate (must be > 0)
+//
+// Returns:
+//   - pointer to allocated pinned memory
+//   - error if allocation fails or size is zero
+func AllocPinnedMemory(size uint64) (unsafe.Pointer, error) {
+	if size == 0 {
+		return nil, errors.New("cannot allocate zero bytes of pinned memory")
+	}
+
+	var ptr unsafe.Pointer
+	result := C.cuda_host_alloc(&ptr, C.size_t(size))
+	if result != C.cudaSuccess {
+		return nil, fmt.Errorf("cudaHostAlloc failed: error=%d, requested_size=%d bytes", result, size)
+	}
+	return ptr, nil
+}
+
+// FreePinnedMemory releases CUDA-registered host memory.
+// Safe to call with nil pointer (no-op).
+//
+// Parameters:
+//   - ptr: pointer to pinned memory to free (nil is safe)
+//
+// Returns:
+//   - error if CUDA deallocation fails
+func FreePinnedMemory(ptr unsafe.Pointer) error {
+	if ptr == nil {
+		return nil
+	}
+	result := C.cuda_host_free(ptr)
+	if result != C.cudaSuccess {
+		return fmt.Errorf("cudaFreeHost failed: error=%d, ptr=%p", result, ptr)
+	}
+	return nil
+}
+
+// IsPinnedMemory checks if a pointer points to CUDA-registered pinned memory.
+// Returns true if the memory was allocated with cudaHostAlloc/cudaMallocHost.
+//
+// Parameters:
+//   - ptr: pointer to check (nil returns false, nil)
+//
+// Returns:
+//   - isPinned: true if memory is CUDA-registered pinned memory
+//   - error: nil (errors are suppressed as non-pinned memory returns cudaErrorInvalidValue)
+func IsPinnedMemory(ptr unsafe.Pointer) (bool, error) {
+	if ptr == nil {
+		return false, nil
+	}
+	var flags C.uint
+	result := C.cuda_host_get_flags(&flags, ptr)
+	if result != C.cudaSuccess {
+		// Not pinned memory or error - return false without error for non-pinned
+		// CUDA returns cudaErrorInvalidValue for non-pinned memory
+		return false, nil
+	}
+	return true, nil
 }

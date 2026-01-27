@@ -83,7 +83,12 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 	log.Printf("LM head loaded to GPU: %d x %d (with final layernorm)", e.config.HiddenSize, e.config.VocabSize)
 
 	// 3. Create CUDA layer executor
-	gpu.LayerExecutor = NewCUDALayerExecutor(e.config, deviceID)
+	layerExecutor, err := NewCUDALayerExecutor(e.config, deviceID)
+	if err != nil {
+		gpu.Close()
+		return nil, fmt.Errorf("create CUDA layer executor: %w", err)
+	}
+	gpu.LayerExecutor = layerExecutor
 
 	// 4. Load all transformer layers
 	for layerID := 0; layerID < e.config.NumLayers; layerID++ {

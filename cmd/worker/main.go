@@ -52,6 +52,58 @@ type chunkBuffer struct {
 	received    int
 }
 
+// pinnedPoolAdapter wraps PinnedBufferPool to implement p2p.BufferPool interface.
+// This adapter enables the worker to use CUDA pinned memory for P2P protocol operations,
+// improving DMA transfer performance for activation data.
+//
+// Limitation: Put() is a no-op because we cannot track the mapping from slice to
+// PinnedBuffer without additional overhead. For full buffer reuse, use the transport
+// package's PinnedTransportBufferPool which maintains this mapping.
+type pinnedPoolAdapter struct {
+	pool *bindings.PinnedBufferPool
+}
+
+// Get returns a buffer from the pinned pool.
+// Falls back to regular memory allocation if:
+//   - pool is nil
+//   - pool is exhausted and fallback allocation fails
+//   - requested size exceeds pool buffer size
+func (a *pinnedPoolAdapter) Get(size int) []byte {
+	if a.pool == nil {
+		return make([]byte, size)
+	}
+	buf := a.pool.Get()
+	if buf == nil {
+		return make([]byte, size)
+	}
+	slice := buf.AsSlice()
+	if len(slice) < size {
+		// Buffer too small, return to pool and allocate regular memory
+		a.pool.Put(buf)
+		return make([]byte, size)
+	}
+	return slice[:size]
+}
+
+// Put is a no-op for this adapter.
+// The buffer cannot be returned to the pool because we only have the slice,
+// not the original PinnedBuffer reference. The memory will be managed by
+// the pool's fallback mechanism or garbage collected for regular allocations.
+//
+// For true zero-copy buffer reuse, use transport.PinnedTransportBufferPool instead.
+func (a *pinnedPoolAdapter) Put(buf []byte) {
+	// Intentionally empty - see godoc above for explanation
+}
+
+// Close closes the underlying pinned buffer pool, freeing all CUDA pinned memory.
+// Safe to call with nil pool.
+func (a *pinnedPoolAdapter) Close() error {
+	if a.pool != nil {
+		return a.pool.Close()
+	}
+	return nil
+}
+
 // Worker represents a distributed inference worker node (performer role)
 type Worker struct {
 	config       WorkerConfig
@@ -76,6 +128,7 @@ type Worker struct {
 	chunkBuffers map[int]*chunkBuffer // Layer ID -> chunk buffer
 	chunkMu      sync.Mutex
 	gpuInfo      p2p.GPUInfo // Cached GPU info for reporting to coordinator
+	pinnedPool   *bindings.PinnedBufferPool // Pinned memory pool for DMA transfers
 }
 
 // NewWorker creates a new worker instance
@@ -139,6 +192,13 @@ func (w *Worker) Start() error {
 	w.protocol.OnLayerRequestReceived(w.handleLayerRequest)
 	w.protocol.OnModelConfigReceived(w.handleModelConfig)
 	w.protocol.OnGPUInfoRequestReceived(w.handleGPUInfoRequest)
+
+	// Configure protocol with pinned buffer pool if available
+	if w.pinnedPool != nil {
+		adapter := &pinnedPoolAdapter{pool: w.pinnedPool}
+		w.protocol.SetBufferPool(adapter)
+		log.Printf("Protocol configured with pinned buffer pool for DMA optimization")
+	}
 
 	// Connect to bootstrap peers (coordinator)
 	if len(w.config.BootstrapPeers) > 0 {
@@ -231,7 +291,41 @@ func (w *Worker) initializeGPU() error {
 		GPUName:   deviceInfo.Name,
 	}
 
+	// Initialize pinned buffer pool for DMA transfers
+	w.initPinnedPool()
+
 	return nil
+}
+
+// initPinnedPool initializes the pinned memory buffer pool for DMA optimization.
+// Creates a pool with default settings (16KB buffers, 32 count) suitable for
+// typical LLM activation sizes (8KB for Llama 7B, 10KB for Llama 13B).
+//
+// If allocation fails (e.g., insufficient memory, CUDA not available), the worker
+// continues without pinned buffers, using regular memory with slower transfer speeds.
+func (w *Worker) initPinnedPool() {
+	pool, err := bindings.NewPinnedBufferPoolWithDefaults()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize pinned buffer pool: %v", err)
+		log.Printf("Worker will use regular memory buffers (slower DMA transfers)")
+		return
+	}
+
+	w.pinnedPool = pool
+	log.Printf("Pinned buffer pool initialized: %d buffers x %d bytes (total: %.1f KB)",
+		pool.Count(), pool.BufSize(), float64(pool.Count())*float64(pool.BufSize())/1024.0)
+}
+
+// GetPinnedPool returns the pinned buffer pool, or nil if not initialized.
+// Use HasPinnedPool() to check availability without getting the pool.
+func (w *Worker) GetPinnedPool() *bindings.PinnedBufferPool {
+	return w.pinnedPool
+}
+
+// HasPinnedPool returns whether the worker has a pinned buffer pool.
+// Returns false if pool initialization failed or worker was created without GPU.
+func (w *Worker) HasPinnedPool() bool {
+	return w.pinnedPool != nil
 }
 
 // loadModelConfigOnly loads model configuration without loading weights.
@@ -803,6 +897,14 @@ func (w *Worker) Shutdown() error {
 	log.Println("Shutting down worker...")
 
 	w.cancel()
+
+	// Close pinned buffer pool
+	if w.pinnedPool != nil {
+		if err := w.pinnedPool.Close(); err != nil {
+			log.Printf("Warning: Failed to close pinned buffer pool: %v", err)
+		}
+		w.pinnedPool = nil
+	}
 
 	if err := w.host.Close(); err != nil {
 		return fmt.Errorf("failed to close host: %w", err)

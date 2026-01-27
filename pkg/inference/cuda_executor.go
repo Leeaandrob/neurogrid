@@ -15,22 +15,77 @@ import (
 
 // CUDALayerExecutor implements LayerExecutor using CUDA kernels.
 // It manages transformer layer weights on the GPU and executes forward passes.
+//
+// The executor preallocates GPU buffers for input/output hidden states to avoid
+// per-call cudaMalloc/cudaFree overhead during inference. This is especially
+// important for distributed inference where activation transfer latency is critical.
+//
+// Thread-safety: all public methods are safe for concurrent use via RWMutex.
+//
+// Resource management: call Close() to free GPU memory when done.
 type CUDALayerExecutor struct {
 	layerWeights map[int]*bindings.LayerWeights
 	kvCaches     map[int]*bindings.KVCache
 	config       *types.LlamaConfig
 	deviceID     int
 	mu           sync.RWMutex
+
+	// Preallocated GPU buffers for Forward() - avoids per-call cudaMalloc/cudaFree.
+	// These buffers are sized for single-token inference (hidden_size * 2 bytes for FP16).
+	// For batch inference or prefill, the executor falls back to dynamic allocation.
+	inputGPU   unsafe.Pointer // GPU buffer for input hidden state
+	outputGPU  unsafe.Pointer // GPU buffer for output hidden state
+	bufferSize uint64         // Size of preallocated buffers in bytes
 }
 
 // NewCUDALayerExecutor creates a new CUDA-based layer executor.
-func NewCUDALayerExecutor(config *types.LlamaConfig, deviceID int) *CUDALayerExecutor {
+//
+// Preallocates GPU buffers for input/output to avoid per-call allocations during
+// forward passes. Buffer size is config.HiddenSize * 2 bytes (FP16 format).
+//
+// Parameters:
+//   - config: LLaMA model configuration (determines buffer sizes)
+//   - deviceID: CUDA device index for GPU memory allocation
+//
+// Returns error if GPU buffer allocation fails. On partial failure, any allocated
+// resources are freed before returning.
+func NewCUDALayerExecutor(config *types.LlamaConfig, deviceID int) (*CUDALayerExecutor, error) {
+	// Calculate buffer size for hidden state (FP16 = 2 bytes per element)
+	// Using max sequence length of 1 for single token inference
+	bufferSize := uint64(config.HiddenSize * 2)
+
+	// Preallocate input buffer on GPU
+	inputGPU, err := bindings.AllocOnDevice(bufferSize, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to preallocate input buffer: %w", err)
+	}
+
+	// Preallocate output buffer on GPU
+	outputGPU, err := bindings.AllocOnDevice(bufferSize, deviceID)
+	if err != nil {
+		bindings.FreeOnDevice(inputGPU, deviceID)
+		return nil, fmt.Errorf("failed to preallocate output buffer: %w", err)
+	}
+
 	return &CUDALayerExecutor{
 		layerWeights: make(map[int]*bindings.LayerWeights),
 		kvCaches:     make(map[int]*bindings.KVCache),
 		config:       config,
 		deviceID:     deviceID,
-	}
+		inputGPU:     inputGPU,
+		outputGPU:    outputGPU,
+		bufferSize:   bufferSize,
+	}, nil
+}
+
+// HasPreallocatedBuffers returns whether the executor has preallocated GPU buffers.
+func (e *CUDALayerExecutor) HasPreallocatedBuffers() bool {
+	return e.inputGPU != nil && e.outputGPU != nil
+}
+
+// GetBufferSize returns the size of preallocated buffers in bytes.
+func (e *CUDALayerExecutor) GetBufferSize() uint64 {
+	return e.bufferSize
 }
 
 // TransformerLayerWeights represents the weights for a single transformer layer.
@@ -90,6 +145,8 @@ func (e *CUDALayerExecutor) LoadLayer(layerID int, weights *TransformerLayerWeig
 
 // Forward executes the transformer layer forward pass on GPU.
 // Returns: output hidden state, K cache data, V cache data
+//
+// OPTIMIZED: Uses preallocated GPU buffers to avoid per-call cudaMalloc/cudaFree.
 func (e *CUDALayerExecutor) Forward(
 	ctx context.Context,
 	layerID int,
@@ -108,53 +165,99 @@ func (e *CUDALayerExecutor) Forward(
 		return nil, nil, nil, fmt.Errorf("KV cache for layer %d not initialized", layerID)
 	}
 
-	// Create input tensor (FP16 on GPU)
+	// Use preallocated buffers if available and size matches
 	hiddenSize := e.config.HiddenSize
-	inputTensor := &types.Tensor{
-		Shape:  []int{1, 1, hiddenSize}, // [batch, seq, hidden]
-		Dtype:  types.DtypeFP16,
-		Device: e.deviceID,
-	}
-	if err := bindings.AllocateTensor(inputTensor); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to allocate input tensor: %w", err)
-	}
-	defer bindings.FreeTensor(inputTensor)
+	expectedSize := uint64(hiddenSize * 2) // FP16
 
-	// Copy hidden state to GPU
-	if err := bindings.CopyToDeviceRaw(inputTensor.Data, getBytePointer(hidden), uint64(len(hidden))); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to copy input to GPU: %w", err)
-	}
+	if e.inputGPU != nil && e.outputGPU != nil && uint64(len(hidden)) <= e.bufferSize {
+		// Use preallocated buffers (no allocation needed)
+		inputTensor := &types.Tensor{
+			Shape:  []int{1, 1, hiddenSize}, // [batch, seq, hidden]
+			Dtype:  types.DtypeFP16,
+			Device: e.deviceID,
+			Data:   e.inputGPU,
+		}
 
-	// Create output tensor
-	outputTensor := &types.Tensor{
-		Shape:  []int{1, 1, hiddenSize},
-		Dtype:  types.DtypeFP16,
-		Device: e.deviceID,
-	}
-	if err := bindings.AllocateTensor(outputTensor); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to allocate output tensor: %w", err)
-	}
-	defer bindings.FreeTensor(outputTensor)
+		// Copy hidden state to preallocated GPU buffer
+		if err := bindings.CopyToDeviceRaw(e.inputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to copy input to GPU: %w", err)
+		}
 
-	// Positions array
-	positions := []int32{int32(position)}
+		outputTensor := &types.Tensor{
+			Shape:  []int{1, 1, hiddenSize},
+			Dtype:  types.DtypeFP16,
+			Device: e.deviceID,
+			Data:   e.outputGPU,
+		}
 
-	// Execute layer forward
-	if err := bindings.LayerForward(
-		outputTensor,
-		inputTensor,
-		weights,
-		cache,
-		positions,
-		e.config,
-	); err != nil {
-		return nil, nil, nil, fmt.Errorf("CUDA layer forward failed: %w", err)
-	}
+		// Positions array
+		positions := []int32{int32(position)}
 
-	// Copy output back to host
-	output = make([]byte, len(hidden))
-	if err := bindings.CopyFromDeviceRaw(getBytePointer(output), outputTensor.Data, uint64(len(output))); err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to copy output from GPU: %w", err)
+		// Execute layer forward
+		if err := bindings.LayerForward(
+			outputTensor,
+			inputTensor,
+			weights,
+			cache,
+			positions,
+			e.config,
+		); err != nil {
+			return nil, nil, nil, fmt.Errorf("CUDA layer forward failed: %w", err)
+		}
+
+		// Copy output back to host
+		output = make([]byte, len(hidden))
+		if err := bindings.CopyFromDeviceRaw(getBytePointer(output), e.outputGPU, uint64(len(output))); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to copy output from GPU: %w", err)
+		}
+	} else {
+		// Fallback: allocate buffers dynamically (for inputs larger than preallocated size)
+		inputTensor := &types.Tensor{
+			Shape:  []int{1, 1, hiddenSize}, // [batch, seq, hidden]
+			Dtype:  types.DtypeFP16,
+			Device: e.deviceID,
+		}
+		if err := bindings.AllocateTensor(inputTensor); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to allocate input tensor: %w", err)
+		}
+		defer bindings.FreeTensor(inputTensor)
+
+		// Copy hidden state to GPU
+		if err := bindings.CopyToDeviceRaw(inputTensor.Data, getBytePointer(hidden), uint64(len(hidden))); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to copy input to GPU: %w", err)
+		}
+
+		// Create output tensor
+		outputTensor := &types.Tensor{
+			Shape:  []int{1, 1, hiddenSize},
+			Dtype:  types.DtypeFP16,
+			Device: e.deviceID,
+		}
+		if err := bindings.AllocateTensor(outputTensor); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to allocate output tensor: %w", err)
+		}
+		defer bindings.FreeTensor(outputTensor)
+
+		// Positions array
+		positions := []int32{int32(position)}
+
+		// Execute layer forward
+		if err := bindings.LayerForward(
+			outputTensor,
+			inputTensor,
+			weights,
+			cache,
+			positions,
+			e.config,
+		); err != nil {
+			return nil, nil, nil, fmt.Errorf("CUDA layer forward failed: %w", err)
+		}
+
+		// Copy output back to host
+		output = make([]byte, len(hidden))
+		if err := bindings.CopyFromDeviceRaw(getBytePointer(output), outputTensor.Data, uint64(len(output))); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to copy output from GPU: %w", err)
+		}
 	}
 
 	// K and V are managed by the KV cache, return empty for now
@@ -162,6 +265,9 @@ func (e *CUDALayerExecutor) Forward(
 	kvSize := e.config.NumKVHeads * e.config.HeadDim * 2 // FP16
 	k = make([]byte, kvSize)
 	v = make([]byte, kvSize)
+
+	// Suppress unused variable warning
+	_ = expectedSize
 
 	return output, k, v, nil
 }
@@ -173,10 +279,20 @@ func (e *CUDALayerExecutor) NumLayers() int {
 	return len(e.layerWeights)
 }
 
-// Close frees all GPU resources.
+// Close frees all GPU resources including preallocated buffers.
 func (e *CUDALayerExecutor) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Free preallocated buffers
+	if e.inputGPU != nil {
+		bindings.FreeOnDevice(e.inputGPU, e.deviceID)
+		e.inputGPU = nil
+	}
+	if e.outputGPU != nil {
+		bindings.FreeOnDevice(e.outputGPU, e.deviceID)
+		e.outputGPU = nil
+	}
 
 	for id, weights := range e.layerWeights {
 		bindings.FreeLayerWeights(weights)
