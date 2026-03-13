@@ -1545,6 +1545,11 @@ func TestCoordinator_SendsConfigBeforeWeights(t *testing.T) {
 		orderMu.Unlock()
 	})
 
+	// Respond immediately to layer status requests so distribution can proceed.
+	workerProto.OnLayerRequestReceived(func(from peer.ID, requestedLayers []int) {
+		_ = workerProto.SendLayerStatus(ctx, from, []int{})
+	})
+
 	// Create layer assignments - all layers to worker
 	var assignments []scheduler.LayerAssignment
 	for i := 0; i < config.NumLayers; i++ {
@@ -1578,7 +1583,7 @@ func TestCoordinator_SendsConfigBeforeWeights(t *testing.T) {
 		ModelConfig:   config,
 		Assignments:   assignments,
 		LocalPeerID:   coordinatorPeerIDStr,
-		WeightTimeout: 10 * time.Second,
+		WeightTimeout: 200 * time.Millisecond,
 	})
 	defer coordinator.Close()
 
@@ -1601,8 +1606,17 @@ func TestCoordinator_SendsConfigBeforeWeights(t *testing.T) {
 		t.Fatalf("Failed to connect: %v", err)
 	}
 
-	// Wait for distribution to happen
-	time.Sleep(500 * time.Millisecond)
+	// Wait for distribution to happen (async callback + protocol handshake)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		orderMu.Lock()
+		n := len(messageOrder)
+		orderMu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	// Verify message order: config should come before weights
 	orderMu.Lock()

@@ -57,7 +57,13 @@ func NewCUDALayerExecutor(config *types.LlamaConfig, deviceID int) (*CUDALayerEx
 	// Preallocate input buffer on GPU
 	inputGPU, err := bindings.AllocOnDevice(bufferSize, deviceID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to preallocate input buffer: %w", err)
+		// Lazy-init multi-GPU manager for single-device executor usage in tests/runtime.
+		if initErr := bindings.InitMultiGPU([]int{deviceID}); initErr == nil {
+			inputGPU, err = bindings.AllocOnDevice(bufferSize, deviceID)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to preallocate input buffer: %w", err)
+		}
 	}
 
 	// Preallocate output buffer on GPU

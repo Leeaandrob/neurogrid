@@ -236,7 +236,7 @@ func (dic *DistributedInferenceCoordinator) requestAndDistributeWeights(peerID p
 		log.Printf("[Coordinator] Requesting layer status from peer %s", shortPeerID(peerIDStr))
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		var err error
-		loadedLayers, err = dic.protocol.RequestLayerStatus(ctx, peerID, 10*time.Second)
+		loadedLayers, err = dic.protocol.RequestLayerStatus(ctx, peerID, dic.weightTimeout)
 		cancel()
 
 		if err != nil {
