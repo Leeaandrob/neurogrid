@@ -652,8 +652,8 @@ func TestDistributedModel_LoadToCluster_Scenario1(t *testing.T) {
 	})
 
 	// Register 5 peers with enough VRAM for 2 layers each
-	// Each peer gets ~1GB for VRAM (enough for mock layers)
-	vramPerPeer := uint64(1024 * 1024 * 1024) // 1GB
+	// We need to account for CUDAWorkspaceReservation (1GB) + model memory
+	vramPerPeer := uint64(4 * 1024 * 1024 * 1024) // 4GB
 	for i := 0; i < 5; i++ {
 		peerID := fmt.Sprintf("peer-%d", i)
 		sched.RegisterPeer(peerID, vramPerPeer, 0)
