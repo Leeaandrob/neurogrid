@@ -1568,7 +1568,7 @@ func TestCoordinator_SendsConfigBeforeWeights(t *testing.T) {
 
 	// Create coordinator
 
-	localProtocol := p2p.NewProtocol(localHost)
+	localProtocol := p2p.NewProtocol(coordinatorHost)
 
 	coordinator := inference.NewDistributedInferenceCoordinator(inference.CoordinatorConfig{
 		Host:          coordinatorHost,

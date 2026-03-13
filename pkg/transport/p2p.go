@@ -89,8 +89,10 @@ func NewP2PTransport(h host.Host, peerID peer.ID, opts ...P2PTransportOption) *P
 		opt(t)
 	}
 
-	// Register stream handler for this peer
-	h.SetStreamHandler(protocol.ID(TransportProtocolID), t.handleStream)
+	// Register stream handler for this peer (skip if host is nil for testing)
+	if h != nil {
+		h.SetStreamHandler(protocol.ID(TransportProtocolID), t.handleStream)
+	}
 
 	return t
 }
@@ -445,7 +447,9 @@ func (t *P2PTransport) Close() error {
 	}
 
 	t.closed = true
-	t.host.RemoveStreamHandler(protocol.ID(TransportProtocolID))
+	if t.host != nil {
+		t.host.RemoveStreamHandler(protocol.ID(TransportProtocolID))
+	}
 	close(t.recvChan)
 
 	// Close all pending response channels
