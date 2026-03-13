@@ -857,10 +857,13 @@ func TestDistributed_EndToEndInference(t *testing.T) {
 	peerManager.Start()
 	defer peerManager.Stop()
 
+	localProtocol := p2p.NewProtocol(localHost)
+
 	coordinator := inference.NewDistributedInferenceCoordinator(inference.CoordinatorConfig{
 		Host:          localHost,
 		Engine:        localEngine,
 		PeerManager:   peerManager,
+		Protocol:      localProtocol,
 		ModelConfig:   config,
 		Assignments:   assignments,
 		LocalPeerID:   localPeerIDStr,
@@ -1132,10 +1135,13 @@ func TestCoordinatorIntegration(t *testing.T) {
 	peerManager := p2p.NewPeerManager(localHost)
 
 	// Create coordinator
+	localProtocol := p2p.NewProtocol(localHost)
+
 	coordinator := inference.NewDistributedInferenceCoordinator(inference.CoordinatorConfig{
 		Host:          localHost,
 		Engine:        localEngine,
 		PeerManager:   peerManager,
+		Protocol:      localProtocol,
 		ModelConfig:   config,
 		Assignments:   assignments,
 		LocalPeerID:   localPeerIDStr,
@@ -1255,10 +1261,14 @@ func TestCoordinatorPeerConnectionCallback(t *testing.T) {
 	defer peerManager.Stop()
 
 	// Create coordinator
+
+	localProtocol := p2p.NewProtocol(localHost)
+
 	coordinator := inference.NewDistributedInferenceCoordinator(inference.CoordinatorConfig{
 		Host:          localHost,
 		Engine:        localEngine,
 		PeerManager:   peerManager,
+		Protocol:      localProtocol, // Shared protocol for response routing
 		ModelConfig:   config,
 		Assignments:   assignments,
 		LocalPeerID:   localPeerIDStr,
@@ -1557,10 +1567,14 @@ func TestCoordinator_SendsConfigBeforeWeights(t *testing.T) {
 	defer peerManager.Stop()
 
 	// Create coordinator
+
+	localProtocol := p2p.NewProtocol(localHost)
+
 	coordinator := inference.NewDistributedInferenceCoordinator(inference.CoordinatorConfig{
 		Host:          coordinatorHost,
 		Engine:        coordinatorEngine,
 		PeerManager:   peerManager,
+		Protocol:      localProtocol, // Shared protocol for response routing
 		ModelConfig:   config,
 		Assignments:   assignments,
 		LocalPeerID:   coordinatorPeerIDStr,
