@@ -298,7 +298,7 @@ func (p *Protocol) handleStream(s network.Stream) {
 	if msgType == MsgTypeTracedActivation || msgType == MsgTypeTracedResponse {
 		// Traced message with trace context
 		p.handleTracedMessage(s, msgType)
-	} else if msgType >= MsgTypeActivation && msgType <= MsgTypeModelConfig {
+	} else if msgType >= MsgTypeActivation && msgType <= MsgTypeGPUInfoRequest {
 		// Extended header format
 		p.handleExtendedMessage(s, msgType)
 	} else {
