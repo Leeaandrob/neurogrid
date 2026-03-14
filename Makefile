@@ -3,7 +3,8 @@
 
 SHELL := /bin/bash
 .PHONY: all binaries test clean cuda install-deps lint fmt flatbuffers \
-	observability-up observability-down observability-logs observability-restart observability-status
+	observability-up observability-down observability-logs observability-restart observability-status \
+	worker
 
 # Directories
 BUILD_DIR := build
@@ -78,6 +79,9 @@ cuda: $(BUILD_DIR)/$(LIB_NAME)
 build: cuda
 	@$(MAKE) --no-print-directory build-coordinator
 	@echo "Build complete: $(BUILD_DIR)/neurogrid"
+
+# Alias: make worker = make build-worker
+worker: build-worker
 
 # Run tests
 test: cuda
