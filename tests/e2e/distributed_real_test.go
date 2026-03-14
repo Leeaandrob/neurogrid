@@ -55,13 +55,9 @@ func DefaultTestConfig() TestConfig {
 	// Remote paths (rtx4090 - we run FROM nobara-pc/rtx2080, remote is rtx4090)
 	remoteModelDir := "~/neurogrid-engine/models/tinyllama"
 
-	// Local paths - the test should run from project root
-	// Model should be at ./models/tinyllama
-	localModelDir := "./models/tinyllama"
-	// Fallback to absolute path if relative doesn't exist
-	if _, err := os.Stat(localModelDir); os.IsNotExist(err) {
-		localModelDir = os.Getenv("HOME") + "/neurogrid-engine/models/tinyllama"
-	}
+	// Local paths - resolve from project root
+	root := projectRoot()
+	localModelDir := root + "/models/tinyllama"
 
 	return TestConfig{
 		RemoteHost:     "rtx4090",
@@ -87,10 +83,8 @@ func DefaultTestConfig() TestConfig {
 func MistralTestConfig() TestConfig {
 	remoteModelDir := "~/neurogrid-engine/models/mistral-7b"
 
-	localModelDir := "./models/mistral-7b"
-	if _, err := os.Stat(localModelDir); os.IsNotExist(err) {
-		localModelDir = os.Getenv("HOME") + "/neurogrid-engine/models/mistral-7b"
-	}
+	root := projectRoot()
+	localModelDir := root + "/models/mistral-7b"
 
 	return TestConfig{
 		RemoteHost:     "rtx4090",
@@ -156,7 +150,7 @@ func (rw *RemoteWorker) startWithModel(ctx context.Context, t *testing.T) error 
 	remoteCmd := fmt.Sprintf(
 		"cd ~/neurogrid-engine && "+
 		"LD_LIBRARY_PATH=./build:$LD_LIBRARY_PATH "+
-		"./build/worker --port=%d --gpu=%d --model='%s' --model-name=%s 2>&1",
+		"./build/worker --port=%d --gpu=%d --model=%s --model-name=%s 2>&1",
 		rw.config.RemotePort,
 		rw.config.RemoteGPUID,
 		rw.config.RemoteModelDir,
@@ -231,7 +225,7 @@ func (rw *RemoteWorker) parseMultiaddr(ctx context.Context, t *testing.T) (strin
 	multiaddrRegex := regexp.MustCompile(`(/ip4/\d+\.\d+\.\d+\.\d+/tcp/\d+/p2p/[A-Za-z0-9]+)`)
 	peerIDRegex := regexp.MustCompile(`Worker peer ID: ([A-Za-z0-9]+)`)
 	// For stateless workers, look for "Waiting for config from coordinator..."
-	waitingConfigRegex := regexp.MustCompile(`Waiting for config from coordinator`)
+	waitingConfigRegex := regexp.MustCompile(`(?i)waiting for (config|weights) from coordinator`)
 
 	scanner := bufio.NewScanner(rw.stdout)
 	var multiaddr, peerID string
@@ -353,7 +347,17 @@ func (lc *LocalCoordinator) Start(ctx context.Context, t *testing.T) error {
 		t.Log("  Mode: Weight transfer enabled (stateless workers)")
 	}
 
-	lc.cmd = exec.CommandContext(ctx, "./neurogrid", args...)
+	// Find the coordinator binary - check project root relative paths
+	coordBin := findBinary("neurogrid")
+	lc.cmd = exec.CommandContext(ctx, coordBin, args...)
+
+	// Set LD_LIBRARY_PATH so the coordinator can find libgpu_engine.so
+	root := projectRoot()
+	ldPath := root + "/build:/usr/local/cuda/lib64"
+	if existing := os.Getenv("LD_LIBRARY_PATH"); existing != "" {
+		ldPath = ldPath + ":" + existing
+	}
+	lc.cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+ldPath)
 
 	var err error
 	lc.stdout, err = lc.cmd.StdoutPipe()
@@ -730,6 +734,35 @@ func validateInferenceResult(t *testing.T, config TestConfig, result *InferenceR
 
 // Helper functions
 
+// projectRoot returns the project root directory by looking for go.mod
+func projectRoot() string {
+	// Walk up from cwd looking for go.mod
+	dir, _ := os.Getwd()
+	for {
+		if _, err := os.Stat(dir + "/go.mod"); err == nil {
+			return dir
+		}
+		parent := dir[:strings.LastIndex(dir, "/")]
+		if parent == dir || parent == "" {
+			break
+		}
+		dir = parent
+	}
+	// Fallback to known location
+	return os.Getenv("HOME") + "/neurogrid-engine"
+}
+
+// findBinary finds the coordinator or worker binary
+func findBinary(name string) string {
+	root := projectRoot()
+	path := root + "/build/" + name
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	// Fallback
+	return "./build/" + name
+}
+
 func verifySSHConnection(host string) error {
 	cmd := exec.Command("ssh", "-o", "ConnectTimeout=5", host, "echo ok")
 	output, err := cmd.CombinedOutput()
@@ -870,12 +903,7 @@ func TestRealDistributed_MultipleRequests(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+// min is provided by Go 1.21+ builtin
 
 // =============================================================================
 // PRP: HYBRID DISTRIBUTED INFERENCE - STATELESS WORKER TESTS (RED PHASE)

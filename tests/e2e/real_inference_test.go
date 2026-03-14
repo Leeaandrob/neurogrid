@@ -718,9 +718,4 @@ func countEnglishWords(words []string) int {
 	return count
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+// min is provided by Go 1.21+ builtin
