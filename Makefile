@@ -2,7 +2,7 @@
 # CUDA + Go build system
 
 SHELL := /bin/bash
-.PHONY: all binaries test clean cuda install-deps lint fmt flatbuffers \
+.PHONY: all binaries test clean cuda install-deps lint fmt flatbuffers worker \
 	observability-up observability-down observability-logs observability-restart observability-status \
 	worker
 
@@ -79,6 +79,9 @@ cuda: $(BUILD_DIR)/$(LIB_NAME)
 build: cuda
 	@$(MAKE) --no-print-directory build-coordinator
 	@echo "Build complete: $(BUILD_DIR)/neurogrid"
+
+# Alias: 'make worker' = 'make build-worker'
+worker: build-worker
 
 # Alias: make worker = make build-worker
 worker: build-worker
