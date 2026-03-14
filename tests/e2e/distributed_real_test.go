@@ -1,7 +1,7 @@
 // Package e2e provides end-to-end tests for distributed inference.
 //
 // This file contains REAL distributed tests that:
-// - SSH into remote machine (rtx2080)
+// - SSH into remote machine (rtx4090)
 // - Start worker with actual GPU execution
 // - Validate inference output is computed, not passthrough
 //
@@ -30,7 +30,7 @@ import (
 // TestConfig holds configuration for real distributed tests
 type TestConfig struct {
 	// Remote worker configuration
-	RemoteHost     string // SSH host alias (e.g., "rtx2080")
+	RemoteHost     string // SSH host alias (e.g., "rtx4090")
 	RemoteGPUID    int
 	RemotePort     int
 	RemoteUser     string
@@ -52,20 +52,19 @@ type TestConfig struct {
 
 // DefaultTestConfig returns sensible defaults
 func DefaultTestConfig() TestConfig {
-	// Remote paths (rtx2080 - note different username 'leandrob')
-	remoteProjectDir := "~/Projects/Personal/llm/inference-engine/neurogrid"
-	remoteModelDir := remoteProjectDir + "/models/tinyllama"
+	// Remote paths (rtx4090 - we run FROM nobara-pc/rtx2080, remote is rtx4090)
+	remoteModelDir := "~/neurogrid-engine/models/tinyllama"
 
 	// Local paths - the test should run from project root
 	// Model should be at ./models/tinyllama
 	localModelDir := "./models/tinyllama"
 	// Fallback to absolute path if relative doesn't exist
 	if _, err := os.Stat(localModelDir); os.IsNotExist(err) {
-		localModelDir = os.Getenv("HOME") + "/Projects/Personal/llm/inference-engine/neurogrid-engine/models/tinyllama"
+		localModelDir = os.Getenv("HOME") + "/neurogrid-engine/models/tinyllama"
 	}
 
 	return TestConfig{
-		RemoteHost:     "rtx2080",
+		RemoteHost:     "rtx4090",
 		RemoteGPUID:    0,
 		RemotePort:     9002,
 		RemoteUser:     "",  // Uses SSH config
@@ -86,16 +85,15 @@ func DefaultTestConfig() TestConfig {
 
 // MistralTestConfig returns configuration for Mistral 7B tests
 func MistralTestConfig() TestConfig {
-	remoteProjectDir := "~/Projects/Personal/llm/inference-engine/neurogrid"
-	remoteModelDir := remoteProjectDir + "/models/mistral-7b"
+	remoteModelDir := "~/neurogrid-engine/models/mistral-7b"
 
 	localModelDir := "./models/mistral-7b"
 	if _, err := os.Stat(localModelDir); os.IsNotExist(err) {
-		localModelDir = os.Getenv("HOME") + "/Projects/Personal/llm/inference-engine/neurogrid-engine/models/mistral-7b"
+		localModelDir = os.Getenv("HOME") + "/neurogrid-engine/models/mistral-7b"
 	}
 
 	return TestConfig{
-		RemoteHost:     "rtx2080",
+		RemoteHost:     "rtx4090",
 		RemoteGPUID:    0,
 		RemotePort:     9002,
 		RemoteUser:     "",
@@ -155,10 +153,8 @@ func (rw *RemoteWorker) startWithModel(ctx context.Context, t *testing.T) error 
 	t.Logf("Starting worker on %s (with local model)...", rw.config.RemoteHost)
 
 	// Build the remote command
-	// Worker binary is at ~/Projects/Personal/llm/inference-engine/neurogrid/build/worker
-	// Model is at ~/Projects/Personal/llm/inference-engine/neurogrid/models/tinyllama
 	remoteCmd := fmt.Sprintf(
-		"cd ~/Projects/Personal/llm/inference-engine/neurogrid && "+
+		"cd ~/neurogrid-engine && "+
 		"LD_LIBRARY_PATH=./build:$LD_LIBRARY_PATH "+
 		"./build/worker --port=%d --gpu=%d --model='%s' --model-name=%s 2>&1",
 		rw.config.RemotePort,
@@ -178,7 +174,7 @@ func (rw *RemoteWorker) startStateless(ctx context.Context, t *testing.T) error 
 	// Build the remote command WITHOUT --model flag
 	// This tests AC3: Worker should wait for config from coordinator
 	remoteCmd := fmt.Sprintf(
-		"cd ~/Projects/Personal/llm/inference-engine/neurogrid && "+
+		"cd ~/neurogrid-engine && "+
 		"LD_LIBRARY_PATH=./build:$LD_LIBRARY_PATH "+
 		"./build/worker --port=%d --gpu=%d 2>&1",
 		rw.config.RemotePort,
