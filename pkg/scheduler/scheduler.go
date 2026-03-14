@@ -228,7 +228,9 @@ func (s *Scheduler) TotalModelMemory() uint64 {
 }
 
 // ComputeAssignments calculates layer-to-peer assignments.
-// Uses a greedy algorithm that assigns layers to peers with most available VRAM.
+// Distributes transformer layers proportionally to each peer's available VRAM,
+// producing contiguous layer ranges per peer to minimize P2P communication.
+// Embedding and output layers are assigned to the peer with the most VRAM.
 func (s *Scheduler) ComputeAssignments() ([]LayerAssignment, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -248,9 +250,9 @@ func (s *Scheduler) ComputeAssignments() ([]LayerAssignment, error) {
 
 	assignments := make([]LayerAssignment, 0, s.config.NumLayers+2)
 
-	// Create a local copy for tracking during assignment
+	// Create a local copy for tracking during assignment.
 	// Reserve CUDA workspace from each peer's available VRAM to ensure
-	// headroom for CUDA runtime, cuBLAS workspace, and memory fragmentation
+	// headroom for CUDA runtime, cuBLAS workspace, and memory fragmentation.
 	available := make(map[string]uint64)
 	for _, p := range peerInfos {
 		avail := p.Available()
@@ -262,32 +264,10 @@ func (s *Scheduler) ComputeAssignments() ([]LayerAssignment, error) {
 		available[p.PeerID] = avail
 	}
 
-	// Helper to find best peer for given memory requirement
-	findBestPeer := func(needed uint64) (string, error) {
-		// Sort peers by available (descending) each time to account for updates
-		var candidates []string
-		for peerID, avail := range available {
-			if avail >= needed {
-				candidates = append(candidates, peerID)
-			}
-		}
-
-		if len(candidates) == 0 {
-			return "", fmt.Errorf("no peer has %d bytes available", needed)
-		}
-
-		// Pick the one with most available
-		sort.Slice(candidates, func(i, j int) bool {
-			return available[candidates[i]] > available[candidates[j]]
-		})
-
-		return candidates[0], nil
-	}
-
-	// Assign embedding layer (layer -1)
-	embedPeer, err := findBestPeer(embedMemory)
-	if err != nil {
-		return nil, fmt.Errorf("cannot assign embedding layer: %w", err)
+	// Assign embedding layer (layer -1) to the peer with the most available VRAM
+	embedPeer := peerInfos[0].PeerID
+	if available[embedPeer] < embedMemory {
+		return nil, fmt.Errorf("cannot assign embedding layer: no peer has %d bytes available", embedMemory)
 	}
 	assignments = append(assignments, LayerAssignment{
 		LayerID:      -1, // Embedding layer
@@ -296,26 +276,93 @@ func (s *Scheduler) ComputeAssignments() ([]LayerAssignment, error) {
 	})
 	available[embedPeer] -= embedMemory
 
-	// Assign transformer layers
-	for i := 0; i < s.config.NumLayers; i++ {
-		peer, err := findBestPeer(layerMemory)
-		if err != nil {
-			return nil, fmt.Errorf("cannot assign layer %d: %w", i, err)
+	// Compute proportional layer distribution based on remaining available VRAM.
+	// Each peer gets layers proportional to its share of total available VRAM.
+	var totalAvail uint64
+	for _, avail := range available {
+		totalAvail += avail
+	}
+	if totalAvail == 0 {
+		return nil, fmt.Errorf("no VRAM available after embedding allocation")
+	}
+
+	// Build ordered peer list (descending by available VRAM) for deterministic assignment
+	orderedPeers := make([]string, 0, len(available))
+	for _, p := range peerInfos {
+		if available[p.PeerID] > 0 {
+			orderedPeers = append(orderedPeers, p.PeerID)
 		}
-		assignments = append(assignments, LayerAssignment{
-			LayerID:      i,
-			PeerID:       peer,
-			MemoryNeeded: layerMemory,
-		})
-		available[peer] -= layerMemory
+	}
+
+	// Calculate layer counts per peer, proportional to available VRAM.
+	// Uses largest-remainder method for fair rounding.
+	layerCounts := make(map[string]int)
+	remainders := make(map[string]float64)
+	assigned := 0
+	numLayers := s.config.NumLayers
+
+	for _, peerID := range orderedPeers {
+		proportion := float64(available[peerID]) / float64(totalAvail)
+		exact := proportion * float64(numLayers)
+		floor := int(exact)
+		layerCounts[peerID] = floor
+		remainders[peerID] = exact - float64(floor)
+		assigned += floor
+	}
+
+	// Distribute remaining layers by largest remainder
+	remaining := numLayers - assigned
+	for remaining > 0 {
+		bestPeer := ""
+		bestRemainder := -1.0
+		for _, peerID := range orderedPeers {
+			if remainders[peerID] > bestRemainder {
+				bestRemainder = remainders[peerID]
+				bestPeer = peerID
+			}
+		}
+		layerCounts[bestPeer]++
+		remainders[bestPeer] = -1.0 // Don't pick again
+		remaining--
+	}
+
+	// Verify each peer can fit its assigned layers
+	for _, peerID := range orderedPeers {
+		needed := uint64(layerCounts[peerID]) * layerMemory
+		if needed > available[peerID] {
+			return nil, fmt.Errorf("peer %s cannot fit %d layers (%d bytes needed, %d available)",
+				peerID, layerCounts[peerID], needed, available[peerID])
+		}
+	}
+
+	// Assign contiguous transformer layer ranges per peer
+	layerIdx := 0
+	for _, peerID := range orderedPeers {
+		count := layerCounts[peerID]
+		for i := 0; i < count; i++ {
+			assignments = append(assignments, LayerAssignment{
+				LayerID:      layerIdx,
+				PeerID:       peerID,
+				MemoryNeeded: layerMemory,
+			})
+			layerIdx++
+		}
 	}
 
 	// Assign output layer (layer NumLayers, shares embedding weights)
-	// Just need logits buffer
 	outputMemory := uint64(s.config.VocabSize * 4) // logits in FP32
-	outputPeer, err := findBestPeer(outputMemory)
-	if err != nil {
-		return nil, fmt.Errorf("cannot assign output layer: %w", err)
+	// Find peer with most remaining VRAM for output
+	var outputPeer string
+	var maxRemaining uint64
+	for _, peerID := range orderedPeers {
+		rem := available[peerID] - uint64(layerCounts[peerID])*layerMemory
+		if rem >= outputMemory && rem > maxRemaining {
+			maxRemaining = rem
+			outputPeer = peerID
+		}
+	}
+	if outputPeer == "" {
+		return nil, fmt.Errorf("cannot assign output layer: no peer has %d bytes available", outputMemory)
 	}
 	assignments = append(assignments, LayerAssignment{
 		LayerID:      s.config.NumLayers, // Output layer
