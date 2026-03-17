@@ -67,12 +67,16 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 		return nil, fmt.Errorf("load lm head: %w", err)
 	}
 
-	// Load final layernorm (model.norm.weight)
+	// Load final layernorm (model.norm.weight or model.embedding_norm.weight for LFM2)
 	log.Printf("Loading final layernorm...")
 	finalNorm, _, err := loader.LoadTensor("model.norm.weight")
 	if err != nil {
-		gpu.Embeddings.Close()
-		return nil, fmt.Errorf("load final norm: %w", err)
+		// Try LFM2 naming: model.embedding_norm.weight
+		finalNorm, _, err = loader.LoadTensor("model.embedding_norm.weight")
+		if err != nil {
+			gpu.Embeddings.Close()
+			return nil, fmt.Errorf("load final norm: %w", err)
+		}
 	}
 
 	gpu.LMHead, err = NewGPULMHeadWithNorm(lmData, finalNorm, e.config.HiddenSize, e.config.VocabSize, e.config.RMSNormEps)
@@ -111,8 +115,36 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 				gpu.Close()
 				return nil, fmt.Errorf("GPU conv layer %d: %w", layerID, err)
 			}
+		} else if e.config.ModelType == "lfm2" {
+			// Load LFM2 attention layer (different tensor names: out_proj, feed_forward, operator_norm)
+			layerWeights, _, _, err := loader.LoadAttentionLayerWeightsLFM2(layerID)
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load LFM2 attn layer %d: %w", layerID, err)
+			}
+
+			qProj := layerWeights.QWeight
+			kProj := layerWeights.KWeight
+			vProj := layerWeights.VWeight
+			oProj := layerWeights.OWeight
+			gateProj := layerWeights.GateWeight
+			upProj := layerWeights.UpWeight
+			downProj := layerWeights.DownWeight
+			attnNorm := layerWeights.AttnNorm
+			ffnNorm := layerWeights.FFNNorm
+
+			weights := &TransformerLayerWeights{
+				QProj: qProj, KProj: kProj, VProj: vProj, OProj: oProj,
+				GateProj: gateProj, UpProj: upProj, DownProj: downProj,
+				AttnNorm: attnNorm, FFNNorm: ffnNorm,
+			}
+
+			if err := gpu.LayerExecutor.LoadLayer(layerID, weights); err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("GPU attn layer %d: %w", layerID, err)
+			}
 		} else {
-			// Load standard attention layer
+			// Load standard Llama attention layer
 			qProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.q_proj.weight", layerID))
 			if err != nil {
 				gpu.Close()

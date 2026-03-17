@@ -363,6 +363,12 @@ func (c *Coordinator) initializeComponents() error {
 		MaxSeqLen:        modelConfig.MaxSeqLen,
 		RMSNormEps:       modelConfig.RMSNormEps,
 		RopeTheta:        ropeTheta,
+		LayerTypes:       modelConfig.LayerTypes,
+		ConvKernelSize:   modelConfig.ConvKernelSize,
+		ConvDim:          modelConfig.ConvDim,
+		TieEmbeddings:    modelConfig.TieEmbeddings,
+		Dtype:            modelConfig.Dtype,
+		ModelType:        modelConfig.ModelType,
 	}
 
 	engineConfig := inference.EngineConfig{
@@ -477,6 +483,13 @@ func (c *Coordinator) initializeComponents() error {
 		log.Printf("Running in mock mode - inference will return placeholder data")
 	} else {
 		defer weightLoader.Close()
+
+		// Set BF16 native loading for LFM2 models
+		dtype := c.engine.Config().Dtype
+		if dtype == "bf16" || dtype == "bfloat16" || c.engine.Config().ModelType == "lfm2" {
+			weightLoader.SetKeepBF16(true)
+			log.Printf("BF16 native loading enabled for model type: %s", c.engine.Config().ModelType)
+		}
 
 		// Initialize GPU and load all weights
 		gpuComponents, err := c.engine.InitializeGPU(weightLoader, c.config.GPUID)
@@ -791,6 +804,18 @@ func getModelConfigFromPath(modelPath string) (scheduler.ModelConfig, error) {
 		headDim = 128 // Default
 	}
 
+	// Use norm_eps if rms_norm_eps is 0 (LFM2 uses norm_eps)
+	normEps := cfg.RMSNormEps
+	if normEps == 0 && cfg.NormEps > 0 {
+		normEps = cfg.NormEps
+	}
+
+	// Determine dtype
+	dtype := cfg.Dtype
+	if dtype == "" {
+		dtype = cfg.TorchDtype
+	}
+
 	return scheduler.ModelConfig{
 		HiddenSize:       int64(cfg.HiddenSize),
 		IntermediateSize: int64(cfg.IntermediateSize),
@@ -800,8 +825,14 @@ func getModelConfigFromPath(modelPath string) (scheduler.ModelConfig, error) {
 		HeadDim:          headDim,
 		MaxSeqLen:        cfg.MaxPositionEmbeddings,
 		VocabSize:        int64(cfg.VocabSize),
-		RMSNormEps:       float32(cfg.RMSNormEps),
+		RMSNormEps:       float32(normEps),
 		RopeTheta:        cfg.RopeTheta,
+		LayerTypes:       cfg.LayerTypes,
+		ConvKernelSize:   cfg.ConvLCache,
+		ConvDim:          cfg.ConvDim,
+		TieEmbeddings:    cfg.TieEmbedding || cfg.TieWordEmbeddings,
+		Dtype:            dtype,
+		ModelType:        cfg.ModelType,
 	}, nil
 }
 

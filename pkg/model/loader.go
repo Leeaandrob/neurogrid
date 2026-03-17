@@ -438,7 +438,8 @@ func (l *WeightLoader) LoadAttentionLayerWeightsLFM2(layerID int) (*LayerWeights
 		return nil, nil, nil, fmt.Errorf("load V weight layer %d: %w", layerID, err)
 	}
 
-	weights.OWeight, _, err = l.LoadTensor(prefix + "self_attn.o_proj.weight")
+	// LFM2 uses out_proj, not o_proj
+	weights.OWeight, _, err = l.LoadTensor(prefix + "self_attn.out_proj.weight")
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("load O weight layer %d: %w", layerID, err)
 	}

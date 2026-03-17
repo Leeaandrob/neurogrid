@@ -51,9 +51,9 @@ func NewTokenizer(modelPath string) (*Tokenizer, error) {
 func NewTokenizerFromJSON(data []byte) (*Tokenizer, error) {
 	var config struct {
 		Model struct {
-			Type   string         `json:"type"`
-			Vocab  map[string]int `json:"vocab"`
-			Merges []string       `json:"merges"`
+			Type   string            `json:"type"`
+			Vocab  map[string]int    `json:"vocab"`
+			Merges json.RawMessage   `json:"merges"`
 		} `json:"model"`
 		AddedTokens []struct {
 			ID      int    `json:"id"`
@@ -64,6 +64,25 @@ func NewTokenizerFromJSON(data []byte) (*Tokenizer, error) {
 
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse tokenizer: %w", err)
+	}
+
+	// Parse merges: support both ["a b", ...] and [["a","b"], ...] formats
+	var mergeStrings []string
+	if len(config.Model.Merges) > 0 {
+		// Try string array first: ["a b", "c d"]
+		if err := json.Unmarshal(config.Model.Merges, &mergeStrings); err != nil {
+			// Try array-of-arrays: [["a","b"], ["c","d"]]
+			var mergeArrays [][]string
+			if err2 := json.Unmarshal(config.Model.Merges, &mergeArrays); err2 != nil {
+				return nil, fmt.Errorf("failed to parse merges (tried string[] and string[][]): %w", err)
+			}
+			mergeStrings = make([]string, len(mergeArrays))
+			for i, pair := range mergeArrays {
+				if len(pair) == 2 {
+					mergeStrings[i] = pair[0] + " " + pair[1]
+				}
+			}
+		}
 	}
 
 	t := &Tokenizer{
@@ -109,7 +128,7 @@ func NewTokenizerFromJSON(data []byte) (*Tokenizer, error) {
 	}
 
 	// Parse merges
-	for i, merge := range config.Model.Merges {
+	for i, merge := range mergeStrings {
 		parts := strings.SplitN(merge, " ", 2)
 		if len(parts) == 2 {
 			t.merges = append(t.merges, BPEMerge{
@@ -129,11 +148,17 @@ func NewTokenizerFromJSON(data []byte) (*Tokenizer, error) {
 			t.specialTokens[added.Content] = added.ID
 		}
 		switch added.Content {
-		case "<s>":
+		case "<s>", "<|startoftext|>":
 			t.bosToken = added.ID
-		case "</s>":
+		case "</s>", "<|endoftext|>":
+			// Only set EOS to </s> equivalent if not already set to im_end
+			if t.eosToken == 2 || t.eosToken == 0 {
+				t.eosToken = added.ID
+			}
+		case "<|im_end|>":
+			// ChatML EOS token (LFM2, Qwen) — takes priority
 			t.eosToken = added.ID
-		case "<pad>":
+		case "<pad>", "<|pad|>":
 			t.padToken = added.ID
 		case "<unk>":
 			t.unkToken = added.ID
