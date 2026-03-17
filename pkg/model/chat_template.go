@@ -156,11 +156,59 @@ func (t *TinyLlamaChatTemplate) Format(messages []Message) string {
 	return result.String()
 }
 
+// ChatMLTemplate formats messages according to ChatML format.
+// Used by LFM2, Qwen, and other models using <|im_start|>/<|im_end|> tokens.
+type ChatMLTemplate struct{}
+
+// NewChatMLTemplate creates a new ChatML chat template.
+func NewChatMLTemplate() *ChatMLTemplate {
+	return &ChatMLTemplate{}
+}
+
+// Format formats messages according to ChatML format.
+func (t *ChatMLTemplate) Format(messages []Message) string {
+	var result strings.Builder
+
+	for _, msg := range messages {
+		result.WriteString("<|im_start|>")
+		result.WriteString(msg.Role)
+		result.WriteString("\n")
+		result.WriteString(msg.Content)
+		result.WriteString("<|im_end|>\n")
+	}
+
+	result.WriteString("<|im_start|>assistant\n")
+
+	return result.String()
+}
+
+// StripThinkingTokens removes <think>...</think> blocks from text.
+func StripThinkingTokens(text string) string {
+	for {
+		start := strings.Index(text, "<think>")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(text, "</think>")
+		if end == -1 {
+			text = text[:start]
+			break
+		}
+		text = text[:start] + text[end+len("</think>"):]
+	}
+	return text
+}
+
 // ChatTemplateFactory returns the appropriate chat template for a model.
 // It selects the template based on the model name or config.
 // For more advanced detection, use LoadModelConfig() and DetectChatTemplate().
 func ChatTemplateFactory(modelName string) ChatTemplate {
 	lower := strings.ToLower(modelName)
+
+	// Check for LFM models (ChatML format)
+	if strings.Contains(lower, "lfm") {
+		return NewChatMLTemplate()
+	}
 
 	// Check for TinyLlama models (ChatML style)
 	if strings.Contains(lower, "tinyllama") {

@@ -1,8 +1,9 @@
 // matmul.cu - Matrix multiplication using cuBLAS
-// Supports FP16 and INT8 operations
+// Supports FP16, BF16, and INT8 operations
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
 #include <stdio.h>
@@ -290,6 +291,98 @@ extern "C" int cuda_batched_gemm_fp16(
         ldc,
         stride_c,
         batch_count
+    ));
+
+    return 0;
+}
+
+// ============================================================================
+// BF16 GEMM via cublasGemmEx
+// ============================================================================
+// Uses CUDA_R_16BF + CUBLAS_COMPUTE_32F (no CUBLAS_COMPUTE_16BF exists)
+
+extern "C" int cuda_gemm_bf16(
+    void* c,
+    const void* a,
+    const void* b,
+    int M,
+    int K,
+    int N,
+    bool transpose_a,
+    bool transpose_b
+) {
+    if (g_cublas_handle == nullptr) {
+        int ret = cublas_init();
+        if (ret != 0) return ret;
+    }
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    cublasOperation_t op_a_cublas = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t op_b_cublas = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    int lda = transpose_a ? M : K;
+    int ldb = transpose_b ? K : N;
+    int ldc = N;
+
+    CUBLAS_CHECK(cublasGemmEx(
+        g_cublas_handle,
+        op_b_cublas, op_a_cublas,
+        N, M, K,
+        &alpha,
+        b, CUDA_R_16BF, ldb,
+        a, CUDA_R_16BF, lda,
+        &beta,
+        c, CUDA_R_16BF, ldc,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    ));
+
+    return 0;
+}
+
+extern "C" int cuda_batched_gemm_bf16(
+    void* c,
+    const void* a,
+    const void* b,
+    int batch_count,
+    int M,
+    int K,
+    int N,
+    bool transpose_a,
+    bool transpose_b,
+    long long int stride_a,
+    long long int stride_b,
+    long long int stride_c
+) {
+    if (g_cublas_handle == nullptr) {
+        int ret = cublas_init();
+        if (ret != 0) return ret;
+    }
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    cublasOperation_t op_a_cublas = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t op_b_cublas = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+    int lda = transpose_a ? M : K;
+    int ldb = transpose_b ? K : N;
+    int ldc = N;
+
+    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+        g_cublas_handle,
+        op_b_cublas, op_a_cublas,
+        N, M, K,
+        &alpha,
+        b, CUDA_R_16BF, ldb, stride_b,
+        a, CUDA_R_16BF, lda, stride_a,
+        &beta,
+        c, CUDA_R_16BF, ldc, stride_c,
+        batch_count,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
     ));
 
     return 0;

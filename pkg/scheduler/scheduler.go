@@ -19,6 +19,14 @@ type ModelConfig struct {
 	VocabSize        int64   // Vocabulary size for embedding
 	RMSNormEps       float32 // RMSNorm epsilon (typically 1e-6)
 	RopeTheta        float64 // RoPE base frequency (10000.0 for Llama 2, 1000000.0 for Mistral Nemo)
+
+	// LFM2 hybrid architecture fields
+	LayerTypes     []string // "conv" or "full_attention" per layer. nil = all attention
+	ConvKernelSize int      // conv_L_cache from config.json (0 = no conv)
+	ConvDim        int      // conv_dim (typically == HiddenSize)
+	TieEmbeddings  bool     // tie_word_embeddings (lm_head == embed_tokens)
+	Dtype          string   // "fp16", "bf16", "int8"
+	ModelType      string   // "llama", "lfm2", etc.
 }
 
 // DefaultLlama7BConfig returns the default configuration for Llama 7B.

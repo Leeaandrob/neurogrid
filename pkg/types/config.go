@@ -13,6 +13,16 @@ type LlamaConfig struct {
 	MaxSeqLen        int     // Maximum sequence length (4096)
 	RMSNormEps       float32 // RMSNorm epsilon (1e-6)
 	RopeTheta        float32 // RoPE base frequency (10000.0 for Llama 2, 1000000.0 for Mistral Nemo)
+
+	// LFM2 hybrid architecture support
+	// Zero-value defaults preserve existing Llama behavior.
+	LayerTypes     []string // "conv" or "full_attention" per layer. nil = all attention (backward compat)
+	ConvKernelSize int      // conv_L_cache from config.json (default 0 = no conv)
+	ConvDim        int      // conv_dim (typically == HiddenSize)
+	ConvBias       bool     // conv_bias (default false)
+	TieEmbeddings  bool     // tie_word_embeddings (lm_head == embed_tokens)
+	Dtype          string   // "fp16", "bf16", "int8" (default "" = fp16)
+	ModelType      string   // "llama", "lfm2", etc.
 }
 
 // Llama7BConfig returns the standard configuration for Llama 2 7B.
@@ -108,4 +118,68 @@ func (c *LlamaConfig) QueryDim() int {
 // HeadRatio returns how many query heads per KV head (for GQA).
 func (c *LlamaConfig) HeadRatio() int {
 	return c.NumHeads / c.NumKVHeads
+}
+
+// IsConvLayer returns true if the given layer is a convolution layer.
+// Returns false when LayerTypes is nil (backward compat: all attention).
+func (c *LlamaConfig) IsConvLayer(layerID int) bool {
+	if c.LayerTypes == nil {
+		return false
+	}
+	if layerID < 0 || layerID >= len(c.LayerTypes) {
+		return false
+	}
+	return c.LayerTypes[layerID] == "conv"
+}
+
+// IsAttentionLayer returns true if the given layer is an attention layer.
+func (c *LlamaConfig) IsAttentionLayer(layerID int) bool {
+	return !c.IsConvLayer(layerID)
+}
+
+// NumConvLayers returns the number of convolution layers.
+func (c *LlamaConfig) NumConvLayers() int {
+	count := 0
+	for _, lt := range c.LayerTypes {
+		if lt == "conv" {
+			count++
+		}
+	}
+	return count
+}
+
+// NumAttentionLayers returns the number of attention layers.
+func (c *LlamaConfig) NumAttentionLayers() int {
+	return c.NumLayers - c.NumConvLayers()
+}
+
+// LFM2_1_2BThinkingConfig returns the configuration for LFM2.5-1.2B-Thinking.
+func LFM2_1_2BThinkingConfig() *LlamaConfig {
+	layerTypes := make([]string, 16)
+	for i := 0; i < 10; i++ {
+		layerTypes[i] = "conv"
+	}
+	for i := 10; i < 16; i++ {
+		layerTypes[i] = "full_attention"
+	}
+
+	return &LlamaConfig{
+		HiddenSize:       2048,
+		IntermediateSize: 5632,
+		NumLayers:        16,
+		NumHeads:         32,
+		NumKVHeads:       8,
+		HeadDim:          64,
+		VocabSize:        65536,
+		MaxSeqLen:        8192,
+		RMSNormEps:       1e-6,
+		RopeTheta:        1000000.0,
+		LayerTypes:       layerTypes,
+		ConvKernelSize:   3,
+		ConvDim:          2048,
+		ConvBias:         false,
+		TieEmbeddings:    true,
+		Dtype:            "bf16",
+		ModelType:        "lfm2",
+	}
 }

@@ -34,6 +34,15 @@ type TransferableConfig struct {
 	MaxSeqLen        int     `json:"max_seq_len"`
 	RMSNormEps       float32 `json:"rms_norm_eps"`
 	RopeTheta        float32 `json:"rope_theta"` // RoPE base frequency (10000.0 for Llama 2, 1000000.0 for Mistral Nemo)
+
+	// LFM2 hybrid architecture fields
+	LayerTypes     []string `json:"layer_types,omitempty"`
+	ConvKernelSize int      `json:"conv_kernel_size,omitempty"`
+	ConvDim        int      `json:"conv_dim,omitempty"`
+	ConvBias       bool     `json:"conv_bias,omitempty"`
+	TieEmbeddings  bool     `json:"tie_embeddings,omitempty"`
+	Dtype          string   `json:"dtype,omitempty"`
+	ModelType      string   `json:"model_type,omitempty"`
 }
 
 // ToLlamaConfig converts TransferableConfig to types.LlamaConfig.
@@ -54,6 +63,13 @@ func (tc *TransferableConfig) ToLlamaConfig() *types.LlamaConfig {
 		MaxSeqLen:        tc.MaxSeqLen,
 		RMSNormEps:       tc.RMSNormEps,
 		RopeTheta:        ropeTheta,
+		LayerTypes:       tc.LayerTypes,
+		ConvKernelSize:   tc.ConvKernelSize,
+		ConvDim:          tc.ConvDim,
+		ConvBias:         tc.ConvBias,
+		TieEmbeddings:    tc.TieEmbeddings,
+		Dtype:            tc.Dtype,
+		ModelType:        tc.ModelType,
 	}
 }
 
@@ -72,6 +88,13 @@ func FromLlamaConfig(config *types.LlamaConfig, modelName string) *TransferableC
 		MaxSeqLen:        config.MaxSeqLen,
 		RMSNormEps:       config.RMSNormEps,
 		RopeTheta:        config.RopeTheta,
+		LayerTypes:       config.LayerTypes,
+		ConvKernelSize:   config.ConvKernelSize,
+		ConvDim:          config.ConvDim,
+		ConvBias:         config.ConvBias,
+		TieEmbeddings:    config.TieEmbeddings,
+		Dtype:            config.Dtype,
+		ModelType:        config.ModelType,
 	}
 }
 

@@ -29,6 +29,15 @@ type ModelConfig struct {
 	RMSNormEps      float64 `json:"rms_norm_eps"`
 	RopeTheta       float64 `json:"rope_theta"`
 
+	// LFM2 hybrid architecture fields
+	LayerTypes        []string `json:"layer_types"`
+	ConvLCache        int      `json:"conv_L_cache"`
+	ConvDim           int      `json:"conv_dim"`
+	ConvBias          bool     `json:"conv_bias"`
+	TieWordEmbeddings bool    `json:"tie_word_embeddings"`
+	TorchDtype        string  `json:"torch_dtype"`
+	EOSTokenID        interface{} `json:"eos_token_id"`
+
 	// Detected settings
 	RoPEStyle       int             // RoPEStyleSplitHalf or RoPEStyleInterleaved
 	ChatTemplate    ChatTemplate    // Detected chat template
@@ -80,6 +89,11 @@ func LoadModelConfig(modelPath string) (*ModelConfig, error) {
 func DetectRoPEStyle(modelType string) int {
 	lower := strings.ToLower(modelType)
 
+	// LFM2 uses interleaved RoPE with theta=1000000
+	if strings.Contains(lower, "lfm") {
+		return RoPEStyleInterleaved
+	}
+
 	// Llama 3 and GPT-NeoX use interleaved pairing
 	if strings.Contains(lower, "llama3") ||
 	   strings.Contains(lower, "llama-3") ||
@@ -98,6 +112,10 @@ func DetectChatTemplate(modelType string, rawTemplate string) ChatTemplate {
 	lower := strings.ToLower(modelType)
 
 	// Check for specific model types first
+	if strings.Contains(lower, "lfm") {
+		return NewChatMLTemplate()
+	}
+
 	if strings.Contains(lower, "tinyllama") {
 		return NewTinyLlamaChatTemplate()
 	}
@@ -112,6 +130,9 @@ func DetectChatTemplate(modelType string, rawTemplate string) ChatTemplate {
 
 	// Try to detect from raw template
 	if rawTemplate != "" {
+		if strings.Contains(rawTemplate, "<|im_start|>") {
+			return NewChatMLTemplate()
+		}
 		if strings.Contains(rawTemplate, "<|user|>") && strings.Contains(rawTemplate, "<|assistant|>") {
 			// ChatML style (TinyLlama, Zephyr, etc.)
 			return NewTinyLlamaChatTemplate()
@@ -232,6 +253,16 @@ var KnownModelFamilies = map[string]ModelFamily{
 		Name:      "Mixtral",
 		RoPEStyle: RoPEStyleSplitHalf,
 		ChatTemplate: func() ChatTemplate { return NewMistralChatTemplate() },
+	},
+	"lfm2": {
+		Name:      "LFM2",
+		RoPEStyle: RoPEStyleInterleaved,
+		ChatTemplate: func() ChatTemplate { return NewChatMLTemplate() },
+	},
+	"lfm": {
+		Name:      "LFM",
+		RoPEStyle: RoPEStyleInterleaved,
+		ChatTemplate: func() ChatTemplate { return NewChatMLTemplate() },
 	},
 }
 
