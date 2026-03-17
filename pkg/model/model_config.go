@@ -30,13 +30,17 @@ type ModelConfig struct {
 	RopeTheta       float64 `json:"rope_theta"`
 
 	// LFM2 hybrid architecture fields
-	LayerTypes        []string `json:"layer_types"`
-	ConvLCache        int      `json:"conv_L_cache"`
-	ConvDim           int      `json:"conv_dim"`
-	ConvBias          bool     `json:"conv_bias"`
-	TieWordEmbeddings bool    `json:"tie_word_embeddings"`
-	TorchDtype        string  `json:"torch_dtype"`
+	LayerTypes        []string    `json:"layer_types"`
+	ConvLCache        int         `json:"conv_L_cache"`
+	ConvDim           int         `json:"conv_dim"`
+	ConvBias          bool        `json:"conv_bias"`
+	TieEmbedding      bool        `json:"tie_embedding"`
+	TieWordEmbeddings bool        `json:"tie_word_embeddings"`
+	Dtype             string      `json:"dtype"`
+	TorchDtype        string      `json:"torch_dtype"`
+	NormEps           float64     `json:"norm_eps"`
 	EOSTokenID        interface{} `json:"eos_token_id"`
+	BOSTokenID        interface{} `json:"bos_token_id"`
 
 	// Detected settings
 	RoPEStyle       int             // RoPEStyleSplitHalf or RoPEStyleInterleaved

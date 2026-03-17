@@ -15,6 +15,7 @@ var modelAliases = map[string]string{
 	"mistral7b":           "mistralai/Mistral-7B-v0.3",
 	"mistral7b-instruct":  "mistralai/Mistral-7B-Instruct-v0.3",
 	"mistral-nemo":        "mistralai/Mistral-Nemo-Instruct-2407",
+	"lfm2-1.2b-thinking": "LiquidAI/LFM2.5-1.2B-Thinking",
 }
 
 // ResolveAlias resolves a model alias to a full HuggingFace repo ID.

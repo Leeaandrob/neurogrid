@@ -154,25 +154,28 @@ func (c *LlamaConfig) NumAttentionLayers() int {
 }
 
 // LFM2_1_2BThinkingConfig returns the configuration for LFM2.5-1.2B-Thinking.
+// Layer types are interleaved: conv,conv,attn,conv,conv,attn,conv,conv,attn,conv,attn,conv,attn,conv,attn,conv
 func LFM2_1_2BThinkingConfig() *LlamaConfig {
-	layerTypes := make([]string, 16)
-	for i := 0; i < 10; i++ {
-		layerTypes[i] = "conv"
-	}
-	for i := 10; i < 16; i++ {
-		layerTypes[i] = "full_attention"
+	layerTypes := []string{
+		"conv", "conv", "full_attention",
+		"conv", "conv", "full_attention",
+		"conv", "conv", "full_attention",
+		"conv", "full_attention",
+		"conv", "full_attention",
+		"conv", "full_attention",
+		"conv",
 	}
 
 	return &LlamaConfig{
 		HiddenSize:       2048,
-		IntermediateSize: 5632,
+		IntermediateSize: 12288,
 		NumLayers:        16,
 		NumHeads:         32,
 		NumKVHeads:       8,
 		HeadDim:          64,
 		VocabSize:        65536,
 		MaxSeqLen:        8192,
-		RMSNormEps:       1e-6,
+		RMSNormEps:       1e-5,
 		RopeTheta:        1000000.0,
 		LayerTypes:       layerTypes,
 		ConvKernelSize:   3,

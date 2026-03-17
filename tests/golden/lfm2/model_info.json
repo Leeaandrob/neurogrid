@@ -1,0 +1,31 @@
+{
+  "model_type": "lfm2",
+  "hidden_size": 2048,
+  "intermediate_size": 12288,
+  "num_hidden_layers": 16,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "vocab_size": 65536,
+  "layer_types": [
+    "conv",
+    "conv",
+    "full_attention",
+    "conv",
+    "conv",
+    "full_attention",
+    "conv",
+    "conv",
+    "full_attention",
+    "conv",
+    "full_attention",
+    "conv",
+    "full_attention",
+    "conv",
+    "full_attention",
+    "conv"
+  ],
+  "conv_L_cache": 3,
+  "eos_token_id": 7,
+  "bos_token_id": 1,
+  "dtype": "torch.bfloat16"
+}
