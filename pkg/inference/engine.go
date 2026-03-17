@@ -60,6 +60,11 @@ type LayerExecutor interface {
 	Forward(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, []byte, []byte, error) // returns hidden, k, v
 }
 
+// ConvLayerExecutor extends LayerExecutor with conv layer support (LFM2).
+type ConvLayerExecutor interface {
+	ForwardConv(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, error)
+}
+
 // EngineConfig holds configuration for the inference engine.
 type EngineConfig struct {
 	ModelConfig      *types.LlamaConfig
@@ -677,8 +682,11 @@ func (e *Engine) forwardAllLayersHidden(ctx context.Context, hidden []byte, posi
 // forwardConvLayer executes a conv layer forward pass (LFM2).
 // Conv layers produce only hidden state output, no K/V.
 func (e *Engine) forwardConvLayer(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, error) {
-	// For now, conv layers use the same routing logic as attention layers
-	// but return only hidden state (no K/V)
+	// Use ConvLayerExecutor if the executor supports it
+	if convExec, ok := e.layerExecutor.(ConvLayerExecutor); ok {
+		return convExec.ForwardConv(ctx, layerID, hidden, position)
+	}
+	// Fallback: try standard forward (won't work for conv layers without GPU)
 	output, _, _, err := e.forwardLayer(ctx, layerID, hidden, position)
 	return output, err
 }
