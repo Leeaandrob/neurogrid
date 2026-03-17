@@ -497,6 +497,47 @@ bench-load:
 	go test -v -run="TestSustainedLoad" ./tests/benchmark/...
 
 #==============================================================================
+# Demo: Distributed Inference (RTX 2080 Ti + RTX 4090)
+#==============================================================================
+
+# Full demo setup: build, sync, start cluster, ready for queries
+demo: build-distributed
+	@./scripts/demo_distributed.sh
+
+# Start demo cluster (skip build)
+demo-start:
+	@./scripts/demo_distributed.sh --start
+
+# Stop demo cluster
+demo-stop:
+	@./scripts/demo_distributed.sh --stop
+
+# Run streaming demo query
+demo-stream:
+	@./scripts/demo_distributed.sh --stream
+
+# Run test query
+demo-test:
+	@./scripts/demo_distributed.sh --test
+
+# Check demo cluster status
+demo-status:
+	@./scripts/demo_distributed.sh --status
+
+# View demo logs
+demo-logs:
+	@./scripts/demo_distributed.sh --logs
+
+# Sync code to remote host (rtx4090)
+demo-sync:
+	@echo "Syncing code to rtx4090..."
+	rsync -avz --exclude='build/' --exclude='models/' --exclude='.git/' \
+		./ rtx4090:~/Projects/Personal/llm/inference-engine/neurogrid-engine/
+	@echo "Building on rtx4090..."
+	ssh rtx4090 "cd ~/Projects/Personal/llm/inference-engine/neurogrid-engine && make build-worker 2>&1 | tail -3"
+	@echo "Sync complete!"
+
+#==============================================================================
 # E2E Integration Script
 #==============================================================================
 
