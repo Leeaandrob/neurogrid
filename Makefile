@@ -200,6 +200,11 @@ download-llama13b-chat: build-download
 	@echo "Downloading Llama 2 13B Chat..."
 	$(BUILD_DIR)/download --repo llama13b-chat --output $(MODELS_DIR)/llama-13b-chat --token "$$HF_TOKEN"
 
+# Download LFM2.5-1.2B-Thinking (public, requires Ampere+ GPU for BF16)
+download-lfm2-thinking: build-download
+	@echo "Downloading LFM2.5-1.2B-Thinking..."
+	$(BUILD_DIR)/download --repo lfm2-1.2b-thinking --output $(MODELS_DIR)/lfm2-1.2b-thinking
+
 # Download Mistral 7B v0.3 (base model)
 download-mistral7b: build-download
 	@echo "Downloading Mistral 7B v0.3..."
@@ -376,6 +381,12 @@ run-mistral: build-coordinator
 	LD_LIBRARY_PATH=$(PWD)/$(BUILD_DIR):$(CUDA_LIB) \
 	$(BUILD_DIR)/neurogrid --http-port $(HTTP_PORT) --gpu $(GPU_ID) \
 		--model ./models/mistral-7b-instruct --model-name mistral-7b --min-peers 0
+
+run-lfm2-thinking: build-coordinator
+	@if [ ! -d "./models/lfm2-1.2b-thinking" ]; then echo "Model not found. Run: make download-lfm2-thinking"; exit 1; fi
+	LD_LIBRARY_PATH=$(PWD)/$(BUILD_DIR):$(CUDA_LIB) \
+	$(BUILD_DIR)/neurogrid --http-port $(HTTP_PORT) --gpu $(GPU_ID) \
+		--model ./models/lfm2-1.2b-thinking --model-name lfm2-1.2b-thinking --min-peers 0
 
 run-llama7b: build-coordinator
 	@if [ ! -d "./models/llama-7b" ]; then echo "Model not found. Run: make download-llama7b"; exit 1; fi

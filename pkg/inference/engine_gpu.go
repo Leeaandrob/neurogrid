@@ -94,77 +94,96 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 	for layerID := 0; layerID < e.config.NumLayers; layerID++ {
 		log.Printf("Loading layer %d/%d to GPU...", layerID+1, e.config.NumLayers)
 
-		// Load weights from SafeTensors
-		qProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.q_proj.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load q_proj layer %d: %w", layerID, err)
-		}
+		if e.config.IsConvLayer(layerID) {
+			// Load LFM2 conv layer
+			convWeights, err := loader.LoadConvLayerWeights(layerID)
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load conv layer %d: %w", layerID, err)
+			}
 
-		kProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.k_proj.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load k_proj layer %d: %w", layerID, err)
-		}
+			if err := gpu.LayerExecutor.LoadConvLayer(layerID,
+				convWeights.InProjWeight, convWeights.ConvWeight, convWeights.OutProjWeight,
+				convWeights.OperatorNorm, convWeights.FFNNorm,
+				convWeights.GateWeight, convWeights.UpWeight, convWeights.DownWeight,
+				e.config.HiddenSize, e.config.IntermediateSize, e.config.ConvKernelSize, e.config.RMSNormEps,
+			); err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("GPU conv layer %d: %w", layerID, err)
+			}
+		} else {
+			// Load standard attention layer
+			qProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.q_proj.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load q_proj layer %d: %w", layerID, err)
+			}
 
-		vProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.v_proj.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load v_proj layer %d: %w", layerID, err)
-		}
+			kProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.k_proj.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load k_proj layer %d: %w", layerID, err)
+			}
 
-		oProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.o_proj.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load o_proj layer %d: %w", layerID, err)
-		}
+			vProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.v_proj.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load v_proj layer %d: %w", layerID, err)
+			}
 
-		gateProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.mlp.gate_proj.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load gate_proj layer %d: %w", layerID, err)
-		}
+			oProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.self_attn.o_proj.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load o_proj layer %d: %w", layerID, err)
+			}
 
-		upProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.mlp.up_proj.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load up_proj layer %d: %w", layerID, err)
-		}
+			gateProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.mlp.gate_proj.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load gate_proj layer %d: %w", layerID, err)
+			}
 
-		downProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.mlp.down_proj.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load down_proj layer %d: %w", layerID, err)
-		}
+			upProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.mlp.up_proj.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load up_proj layer %d: %w", layerID, err)
+			}
 
-		attnNorm, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.input_layernorm.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load attn_norm layer %d: %w", layerID, err)
-		}
+			downProj, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.mlp.down_proj.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load down_proj layer %d: %w", layerID, err)
+			}
 
-		ffnNorm, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.post_attention_layernorm.weight", layerID))
-		if err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("load ffn_norm layer %d: %w", layerID, err)
-		}
+			attnNorm, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.input_layernorm.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load attn_norm layer %d: %w", layerID, err)
+			}
 
-		// Create TransformerLayerWeights and upload to GPU
-		weights := &TransformerLayerWeights{
-			QProj:    qProj,
-			KProj:    kProj,
-			VProj:    vProj,
-			OProj:    oProj,
-			GateProj: gateProj,
-			UpProj:   upProj,
-			DownProj: downProj,
-			AttnNorm: attnNorm,
-			FFNNorm:  ffnNorm,
-		}
+			ffnNorm, _, err := loader.LoadTensor(fmt.Sprintf("model.layers.%d.post_attention_layernorm.weight", layerID))
+			if err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("load ffn_norm layer %d: %w", layerID, err)
+			}
 
-		if err := gpu.LayerExecutor.LoadLayer(layerID, weights); err != nil {
-			gpu.Close()
-			return nil, fmt.Errorf("GPU layer %d: %w", layerID, err)
+			// Create TransformerLayerWeights and upload to GPU
+			weights := &TransformerLayerWeights{
+				QProj:    qProj,
+				KProj:    kProj,
+				VProj:    vProj,
+				OProj:    oProj,
+				GateProj: gateProj,
+				UpProj:   upProj,
+				DownProj: downProj,
+				AttnNorm: attnNorm,
+				FFNNorm:  ffnNorm,
+			}
+
+			if err := gpu.LayerExecutor.LoadLayer(layerID, weights); err != nil {
+				gpu.Close()
+				return nil, fmt.Errorf("GPU layer %d: %w", layerID, err)
+			}
 		}
 	}
 	log.Printf("All %d layers loaded to GPU", e.config.NumLayers)

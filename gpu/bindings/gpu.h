@@ -367,6 +367,53 @@ int cuda_layer_forward(
     float rope_theta
 );
 
+// ============================================================================
+// BF16 Operations
+// ============================================================================
+
+int cuda_check_bf16_support(int* supported);
+
+int cuda_bf16_rmsnorm(void* output, const void* input, const void* weight, int num_tokens, int hidden_dim, float eps);
+int cuda_bf16_silu(void* output, const void* input, size_t num_elements);
+int cuda_bf16_add(void* c, const void* a, const void* b, size_t num_elements);
+int cuda_bf16_mul(void* c, const void* a, const void* b, size_t num_elements);
+int cuda_bf16_to_fp32(void* output, const void* input, size_t num_elements);
+int cuda_fp32_to_bf16(void* output, const void* input, size_t num_elements);
+
+int cuda_bf16_rope_with_theta(void* output, const void* input, const int* positions,
+    int batch_size, int seq_len, int num_heads, int head_dim, int rope_style, float rope_theta);
+
+int cuda_gemm_bf16(void* c, const void* a, const void* b, int M, int K, int N,
+    bool transpose_a, bool transpose_b);
+
+// ============================================================================
+// Causal Conv1d (LFM2)
+// ============================================================================
+
+int cuda_causal_conv1d_fwd_bf16(const void* x, const void* weight, void* out, void* conv_state,
+    int batch, int dim, int seqlen, int width);
+int cuda_causal_conv1d_update_bf16(const void* x, void* out, void* conv_state, const void* weight,
+    int batch, int dim, int width);
+
+void* cuda_conv_state_create(int batch, int dim, int width);
+int cuda_conv_state_reset(void* state, int batch, int dim, int width);
+void cuda_conv_state_free(void* state);
+
+// ============================================================================
+// Conv Layer Forward (LFM2)
+// ============================================================================
+
+int cuda_create_conv_layer_weights_bf16(void** weights_out,
+    const void* h_in_proj, const void* h_conv, const void* h_out_proj,
+    const void* h_op_norm, const void* h_ffn_norm,
+    const void* h_gate, const void* h_up, const void* h_down,
+    int hidden, int intermediate, int kernel_size, float norm_eps);
+
+int cuda_conv_layer_forward_bf16(void* output, const void* input, const void* weights,
+    void* conv_state, int batch, int seq_len, int position);
+
+void cuda_free_conv_layer_weights(void* weights);
+
 #ifdef __cplusplus
 }
 #endif

@@ -586,6 +586,60 @@ func LayerForward(output, input *types.Tensor, weights *LayerWeights, cache *KVC
 }
 
 // =============================================================================
+// LFM2 / BF16 Operations (Stubs)
+// =============================================================================
+
+// ConvLayerWeights holds weights for an LFM2 conv layer (stub).
+type ConvLayerWeights struct {
+	ptr unsafe.Pointer
+}
+
+// CheckBF16Support returns false for stub builds.
+func CheckBF16Support() (bool, error) {
+	return false, ErrNotImplemented
+}
+
+// GEMMBF16 performs BF16 matrix multiplication (stub).
+func GEMMBF16(cPtr, aPtr, bPtr unsafe.Pointer, M, K, N int, transposeA, transposeB bool) error {
+	return ErrNotImplemented
+}
+
+// ConvStateCreate creates a conv state buffer (stub).
+func ConvStateCreate(batch, dim, width int) (unsafe.Pointer, error) {
+	return nil, ErrNotImplemented
+}
+
+// ConvStateReset zeros a conv state buffer (stub).
+func ConvStateReset(state unsafe.Pointer, batch, dim, width int) error {
+	return ErrNotImplemented
+}
+
+// ConvStateFree frees a conv state buffer (stub).
+func ConvStateFree(state unsafe.Pointer) {}
+
+// CreateConvLayerWeightsBF16 creates conv layer weights (stub).
+func CreateConvLayerWeightsBF16(
+	inProj, conv, outProj []byte,
+	opNorm, ffnNorm []byte,
+	gate, up, down []byte,
+	hidden, intermediate, kernelSize int, normEps float32,
+) (*ConvLayerWeights, error) {
+	return nil, ErrNotImplemented
+}
+
+// ConvLayerForwardBF16 executes a conv layer forward pass (stub).
+func ConvLayerForwardBF16(output, input unsafe.Pointer, weights *ConvLayerWeights, convState unsafe.Pointer, batch, seqLen, position int) error {
+	return ErrNotImplemented
+}
+
+// FreeConvLayerWeights releases conv layer weights (stub).
+func FreeConvLayerWeights(w *ConvLayerWeights) {
+	if w != nil {
+		w.ptr = nil
+	}
+}
+
+// =============================================================================
 // Tensor Operations (Stubs)
 // =============================================================================
 

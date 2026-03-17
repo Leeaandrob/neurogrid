@@ -104,6 +104,7 @@ type WeightLoader struct {
 	index    map[string]TensorInfo
 	files    map[string]*os.File // Cached file handles
 	mu       sync.RWMutex
+	keepBF16 bool          // When true, skip BF16->FP16 conversion (for native BF16 models)
 }
 
 // NewWeightLoader creates a new weight loader for a SafeTensors model directory.
@@ -267,8 +268,8 @@ func (l *WeightLoader) LoadTensor(name string) ([]byte, *TensorInfo, error) {
 		return nil, nil, fmt.Errorf("read failed: %w", err)
 	}
 
-	// Convert BF16 to FP16 if needed
-	if info.Dtype == "BF16" {
+	// Convert BF16 to FP16 if needed (skip if keepBF16 is set on loader)
+	if info.Dtype == "BF16" && !l.keepBF16 {
 		fmt.Printf("[BF16->FP16] Converting tensor %s (dtype=%s, size=%d bytes)\n", name, info.Dtype, len(data))
 		// Debug: show first 8 bytes before conversion
 		if len(data) >= 8 {
@@ -348,6 +349,141 @@ func (l *WeightLoader) LoadLayerWeights(layerID int) (*LayerWeights, error) {
 	return weights, nil
 }
 
+// ConvLayerWeights holds weights for an LFM2 conv layer.
+type ConvLayerWeights struct {
+	LayerID      int
+	InProjWeight []byte // [3*hidden, hidden]
+	ConvWeight   []byte // [hidden, kernel_size] (reshaped from [hidden, 1, kernel])
+	OutProjWeight []byte // [hidden, hidden]
+	OperatorNorm []byte // [hidden]
+	FFNNorm      []byte // [hidden]
+	GateWeight   []byte // [intermediate, hidden]
+	UpWeight     []byte // [intermediate, hidden]
+	DownWeight   []byte // [hidden, intermediate]
+}
+
+// LoadConvLayerWeights loads weights for an LFM2 conv layer.
+func (l *WeightLoader) LoadConvLayerWeights(layerID int) (*ConvLayerWeights, error) {
+	prefix := fmt.Sprintf("model.layers.%d.", layerID)
+	weights := &ConvLayerWeights{LayerID: layerID}
+	var err error
+
+	weights.InProjWeight, _, err = l.LoadTensor(prefix + "conv.in_proj.weight")
+	if err != nil {
+		return nil, fmt.Errorf("load conv in_proj layer %d: %w", layerID, err)
+	}
+
+	convData, convInfo, err := l.LoadTensor(prefix + "conv.conv.weight")
+	if err != nil {
+		return nil, fmt.Errorf("load conv weight layer %d: %w", layerID, err)
+	}
+	// Reshape [hidden, 1, kernel] -> [hidden, kernel] by dropping middle dim
+	if convInfo != nil && len(convInfo.Shape) == 3 && convInfo.Shape[1] == 1 {
+		weights.ConvWeight = convData // Already contiguous, just different view
+	} else {
+		weights.ConvWeight = convData
+	}
+
+	weights.OutProjWeight, _, err = l.LoadTensor(prefix + "conv.out_proj.weight")
+	if err != nil {
+		return nil, fmt.Errorf("load conv out_proj layer %d: %w", layerID, err)
+	}
+
+	weights.OperatorNorm, _, err = l.LoadTensor(prefix + "operator_norm.weight")
+	if err != nil {
+		return nil, fmt.Errorf("load operator_norm layer %d: %w", layerID, err)
+	}
+
+	weights.FFNNorm, _, err = l.LoadTensor(prefix + "ffn_norm.weight")
+	if err != nil {
+		return nil, fmt.Errorf("load ffn_norm layer %d: %w", layerID, err)
+	}
+
+	weights.GateWeight, _, err = l.LoadTensor(prefix + "feed_forward.w1.weight")
+	if err != nil {
+		return nil, fmt.Errorf("load gate weight layer %d: %w", layerID, err)
+	}
+
+	weights.UpWeight, _, err = l.LoadTensor(prefix + "feed_forward.w3.weight")
+	if err != nil {
+		return nil, fmt.Errorf("load up weight layer %d: %w", layerID, err)
+	}
+
+	weights.DownWeight, _, err = l.LoadTensor(prefix + "feed_forward.w2.weight")
+	if err != nil {
+		return nil, fmt.Errorf("load down weight layer %d: %w", layerID, err)
+	}
+
+	return weights, nil
+}
+
+// LoadAttentionLayerWeightsLFM2 loads weights for an LFM2 attention layer (with QK norms).
+func (l *WeightLoader) LoadAttentionLayerWeightsLFM2(layerID int) (*LayerWeights, []byte, []byte, error) {
+	prefix := fmt.Sprintf("model.layers.%d.", layerID)
+	weights := &LayerWeights{LayerID: layerID}
+	var err error
+
+	weights.QWeight, _, err = l.LoadTensor(prefix + "self_attn.q_proj.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load Q weight layer %d: %w", layerID, err)
+	}
+
+	weights.KWeight, _, err = l.LoadTensor(prefix + "self_attn.k_proj.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load K weight layer %d: %w", layerID, err)
+	}
+
+	weights.VWeight, _, err = l.LoadTensor(prefix + "self_attn.v_proj.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load V weight layer %d: %w", layerID, err)
+	}
+
+	weights.OWeight, _, err = l.LoadTensor(prefix + "self_attn.o_proj.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load O weight layer %d: %w", layerID, err)
+	}
+
+	// QK LayerNorm weights (LFM2 specific)
+	qLayerNorm, _, err := l.LoadTensor(prefix + "self_attn.q_layernorm.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load q_layernorm layer %d: %w", layerID, err)
+	}
+
+	kLayerNorm, _, err := l.LoadTensor(prefix + "self_attn.k_layernorm.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load k_layernorm layer %d: %w", layerID, err)
+	}
+
+	// LFM2 uses operator_norm instead of input_layernorm
+	weights.AttnNorm, _, err = l.LoadTensor(prefix + "operator_norm.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load operator_norm layer %d: %w", layerID, err)
+	}
+
+	weights.FFNNorm, _, err = l.LoadTensor(prefix + "ffn_norm.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load ffn_norm layer %d: %w", layerID, err)
+	}
+
+	// LFM2 uses feed_forward instead of mlp
+	weights.GateWeight, _, err = l.LoadTensor(prefix + "feed_forward.w1.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load gate weight layer %d: %w", layerID, err)
+	}
+
+	weights.UpWeight, _, err = l.LoadTensor(prefix + "feed_forward.w3.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load up weight layer %d: %w", layerID, err)
+	}
+
+	weights.DownWeight, _, err = l.LoadTensor(prefix + "feed_forward.w2.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load down weight layer %d: %w", layerID, err)
+	}
+
+	return weights, qLayerNorm, kLayerNorm, nil
+}
+
 // LoadEmbeddings loads the token embedding matrix.
 func (l *WeightLoader) LoadEmbeddings() ([]byte, *TensorInfo, error) {
 	return l.LoadTensor("model.embed_tokens.weight")
@@ -361,8 +497,14 @@ func (l *WeightLoader) LoadLMHead() ([]byte, *TensorInfo, error) {
 		return data, info, nil
 	}
 
-	// Llama uses tied embeddings
+	// Llama / LFM2 with tied embeddings
 	return l.LoadEmbeddings()
+}
+
+// SetKeepBF16 configures the loader to skip BF16->FP16 conversion.
+// Used for models that run natively in BF16 (e.g., LFM2).
+func (l *WeightLoader) SetKeepBF16(keep bool) {
+	l.keepBF16 = keep
 }
 
 // ListTensors returns all tensor names in the model.

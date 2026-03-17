@@ -647,23 +647,40 @@ func (e *Engine) forwardAllLayersHidden(ctx context.Context, hidden []byte, posi
 			}, nil)
 		}
 
-		// Execute layer forward pass
-		output, k, v, err := e.forwardLayer(ctx, layerID, current, position)
-		if err != nil {
-			return nil, fmt.Errorf("layer %d forward failed: %w", layerID, err)
-		}
-
-		// Update KV cache
-		if cache, ok := e.kvCaches.GetCache(layerID); ok && cache.IsLocal() {
-			if err := cache.Update(ctx, k, v, position); err != nil {
-				return nil, fmt.Errorf("kv cache update failed for layer %d: %w", layerID, err)
+		if e.config.IsConvLayer(layerID) {
+			// Conv layer: no KV output, no KV cache update
+			output, err := e.forwardConvLayer(ctx, layerID, current, position)
+			if err != nil {
+				return nil, fmt.Errorf("conv layer %d forward failed: %w", layerID, err)
 			}
-		}
+			current = output
+		} else {
+			// Attention layer: standard forward with KV cache
+			output, k, v, err := e.forwardLayer(ctx, layerID, current, position)
+			if err != nil {
+				return nil, fmt.Errorf("layer %d forward failed: %w", layerID, err)
+			}
 
-		current = output
+			// Update KV cache
+			if cache, ok := e.kvCaches.GetCache(layerID); ok && cache.IsLocal() {
+				if err := cache.Update(ctx, k, v, position); err != nil {
+					return nil, fmt.Errorf("kv cache update failed for layer %d: %w", layerID, err)
+				}
+			}
+			current = output
+		}
 	}
 
 	return current, nil
+}
+
+// forwardConvLayer executes a conv layer forward pass (LFM2).
+// Conv layers produce only hidden state output, no K/V.
+func (e *Engine) forwardConvLayer(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, error) {
+	// For now, conv layers use the same routing logic as attention layers
+	// but return only hidden state (no K/V)
+	output, _, _, err := e.forwardLayer(ctx, layerID, hidden, position)
+	return output, err
 }
 
 // forwardLayer executes a single layer forward pass.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"unsafe"
 )
 
 // KVCacheConfig holds configuration for a KV cache.
@@ -204,4 +205,72 @@ func (m *KVCacheManager) CacheCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.caches)
+}
+
+// ConvStateCache manages conv state for a single LFM2 conv layer.
+type ConvStateCache struct {
+	layerID    int
+	hiddenSize int
+	kernelSize int
+	gpuPtr     unsafe.Pointer // GPU FP32 buffer [batch, hidden, kernel]
+}
+
+// NewConvStateCache creates a new conv state cache for a conv layer.
+func NewConvStateCache(layerID, hiddenSize, kernelSize int) *ConvStateCache {
+	return &ConvStateCache{
+		layerID:    layerID,
+		hiddenSize: hiddenSize,
+		kernelSize: kernelSize,
+	}
+}
+
+// GPUPtr returns the GPU pointer for the conv state.
+func (c *ConvStateCache) GPUPtr() unsafe.Pointer {
+	return c.gpuPtr
+}
+
+// SetGPUPtr sets the GPU pointer (created by bindings.ConvStateCreate).
+func (c *ConvStateCache) SetGPUPtr(ptr unsafe.Pointer) {
+	c.gpuPtr = ptr
+}
+
+// HybridCacheManager manages both KV caches (attention) and conv state caches (conv).
+type HybridCacheManager struct {
+	kvManager   *KVCacheManager
+	convCaches  map[int]*ConvStateCache // layerID -> conv state
+	mu          sync.RWMutex
+}
+
+// NewHybridCacheManager creates a cache manager that handles both cache types.
+func NewHybridCacheManager() *HybridCacheManager {
+	return &HybridCacheManager{
+		kvManager:  NewKVCacheManager(),
+		convCaches: make(map[int]*ConvStateCache),
+	}
+}
+
+// KVManager returns the underlying KV cache manager.
+func (h *HybridCacheManager) KVManager() *KVCacheManager {
+	return h.kvManager
+}
+
+// RegisterConvCache registers a conv state cache for a layer.
+func (h *HybridCacheManager) RegisterConvCache(cache *ConvStateCache) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.convCaches[cache.layerID] = cache
+}
+
+// GetConvCache returns the conv state cache for a layer.
+func (h *HybridCacheManager) GetConvCache(layerID int) (*ConvStateCache, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	cache, ok := h.convCaches[layerID]
+	return cache, ok
+}
+
+// ClearAll clears all caches (both KV and conv state).
+func (h *HybridCacheManager) ClearAll() {
+	h.kvManager.ClearAll()
+	// Conv state reset is handled by the CUDA executor (needs GPU calls)
 }

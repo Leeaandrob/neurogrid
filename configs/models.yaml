@@ -35,6 +35,13 @@ aliases:
     requires_auth: true
     description: "Llama 2 13B Chat - Fine-tuned for dialogue"
 
+  # LFM2 - Liquid AI hybrid conv+attention (public, BF16, requires Ampere+ GPU)
+  lfm2-1.2b-thinking:
+    repo: "LiquidAI/LFM2.5-1.2B-Thinking"
+    size_gb: 2.5
+    requires_auth: false
+    description: "LFM2.5 1.2B Thinking - Hybrid conv+attention with reasoning"
+
 # Default model for quick testing
 default: tinyllama
 

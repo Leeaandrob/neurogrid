@@ -30,6 +30,10 @@ type CUDALayerExecutor struct {
 	deviceID     int
 	mu           sync.RWMutex
 
+	// LFM2 conv layer support
+	convLayerWeights map[int]*bindings.ConvLayerWeights
+	convStates       map[int]unsafe.Pointer // GPU conv state pointers
+
 	// Preallocated GPU buffers for Forward() - avoids per-call cudaMalloc/cudaFree.
 	// These buffers are sized for single-token inference (hidden_size * 2 bytes for FP16).
 	// For batch inference or prefill, the executor falls back to dynamic allocation.
@@ -69,7 +73,9 @@ func NewCUDALayerExecutor(config *types.LlamaConfig, deviceID int) (*CUDALayerEx
 
 	return &CUDALayerExecutor{
 		layerWeights: make(map[int]*bindings.LayerWeights),
-		kvCaches:     make(map[int]*bindings.KVCache),
+		kvCaches:         make(map[int]*bindings.KVCache),
+		convLayerWeights: make(map[int]*bindings.ConvLayerWeights),
+		convStates:       make(map[int]unsafe.Pointer),
 		config:       config,
 		deviceID:     deviceID,
 		inputGPU:     inputGPU,
@@ -279,6 +285,88 @@ func (e *CUDALayerExecutor) NumLayers() int {
 	return len(e.layerWeights)
 }
 
+// LoadConvLayer uploads conv layer weights to GPU.
+func (e *CUDALayerExecutor) LoadConvLayer(layerID int, inProj, conv, outProj, opNorm, ffnNorm, gate, up, down []byte,
+	hidden, intermediate, kernelSize int, normEps float32) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Free existing weights
+	if existing, ok := e.convLayerWeights[layerID]; ok {
+		bindings.FreeConvLayerWeights(existing)
+	}
+
+	weights, err := bindings.CreateConvLayerWeightsBF16(
+		inProj, conv, outProj, opNorm, ffnNorm, gate, up, down,
+		hidden, intermediate, kernelSize, normEps,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upload conv layer %d: %w", layerID, err)
+	}
+	e.convLayerWeights[layerID] = weights
+
+	// Create conv state
+	if _, ok := e.convStates[layerID]; !ok {
+		state, err := bindings.ConvStateCreate(1, hidden, kernelSize)
+		if err != nil {
+			return fmt.Errorf("failed to create conv state for layer %d: %w", layerID, err)
+		}
+		e.convStates[layerID] = state
+	}
+
+	return nil
+}
+
+// ForwardConv executes a conv layer forward pass.
+func (e *CUDALayerExecutor) ForwardConv(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, error) {
+	e.mu.RLock()
+	weights, ok := e.convLayerWeights[layerID]
+	state := e.convStates[layerID]
+	e.mu.RUnlock()
+
+	if !ok || weights == nil {
+		return nil, fmt.Errorf("conv layer %d not loaded", layerID)
+	}
+	if state == nil {
+		return nil, fmt.Errorf("conv state for layer %d not initialized", layerID)
+	}
+
+	hiddenSize := e.config.HiddenSize
+	seqLen := 1 // Single token during decode
+
+	// Allocate input/output on GPU
+	bufSize := uint64(seqLen * hiddenSize * 2) // BF16
+	inputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("alloc input: %w", err)
+	}
+	defer bindings.FreeOnDevice(inputGPU, e.deviceID)
+
+	outputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("alloc output: %w", err)
+	}
+	defer bindings.FreeOnDevice(outputGPU, e.deviceID)
+
+	// Copy input to GPU
+	if err := bindings.CopyToDeviceRaw(inputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
+		return nil, fmt.Errorf("copy input: %w", err)
+	}
+
+	// Execute conv layer forward
+	if err := bindings.ConvLayerForwardBF16(outputGPU, inputGPU, weights, state, 1, seqLen, position); err != nil {
+		return nil, fmt.Errorf("conv forward: %w", err)
+	}
+
+	// Copy output back
+	output := make([]byte, len(hidden))
+	if err := bindings.CopyFromDeviceRaw(getBytePointer(output), outputGPU, uint64(len(output))); err != nil {
+		return nil, fmt.Errorf("copy output: %w", err)
+	}
+
+	return output, nil
+}
+
 // Close frees all GPU resources including preallocated buffers.
 func (e *CUDALayerExecutor) Close() error {
 	e.mu.Lock()
@@ -304,6 +392,15 @@ func (e *CUDALayerExecutor) Close() error {
 		delete(e.kvCaches, id)
 	}
 
+	for id, weights := range e.convLayerWeights {
+		bindings.FreeConvLayerWeights(weights)
+		delete(e.convLayerWeights, id)
+	}
+	for id, state := range e.convStates {
+		bindings.ConvStateFree(state)
+		delete(e.convStates, id)
+	}
+
 	return nil
 }
 
@@ -325,6 +422,12 @@ func (e *CUDALayerExecutor) ResetKVCache() error {
 			return fmt.Errorf("failed to reset KV cache for layer %d: %w", layerID, err)
 		}
 		e.kvCaches[layerID] = newCache
+	}
+
+	for layerID, state := range e.convStates {
+		if err := bindings.ConvStateReset(state, 1, e.config.HiddenSize, e.config.ConvKernelSize); err != nil {
+			return fmt.Errorf("failed to reset conv state for layer %d: %w", layerID, err)
+		}
 	}
 
 	return nil

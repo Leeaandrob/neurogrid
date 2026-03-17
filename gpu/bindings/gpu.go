@@ -747,6 +747,103 @@ func LayerForward(output, input *types.Tensor, weights *LayerWeights, cache *KVC
 }
 
 // =============================================================================
+// LFM2 / BF16 Operations
+// =============================================================================
+
+// ConvLayerWeights holds weights for an LFM2 conv layer.
+type ConvLayerWeights struct {
+	ptr unsafe.Pointer
+}
+
+// CheckBF16Support returns true if the current GPU supports BF16 (compute >= 8.0).
+func CheckBF16Support() (bool, error) {
+	var supported C.int
+	result := C.cuda_check_bf16_support(&supported)
+	if result != 0 {
+		return false, fmt.Errorf("failed to check BF16 support: %d", result)
+	}
+	return supported != 0, nil
+}
+
+// GEMMBF16 executes BF16 matrix multiplication C = A @ B.
+func GEMMBF16(cPtr, aPtr, bPtr unsafe.Pointer, M, K, N int, transposeA, transposeB bool) error {
+	result := C.cuda_gemm_bf16(cPtr, aPtr, bPtr, C.int(M), C.int(K), C.int(N),
+		C.bool(transposeA), C.bool(transposeB))
+	if result != 0 {
+		return fmt.Errorf("GEMM BF16 failed: %d", result)
+	}
+	return nil
+}
+
+// ConvStateCreate creates a conv state buffer on GPU.
+func ConvStateCreate(batch, dim, width int) (unsafe.Pointer, error) {
+	ptr := C.cuda_conv_state_create(C.int(batch), C.int(dim), C.int(width))
+	if ptr == nil {
+		return nil, errors.New("failed to create conv state")
+	}
+	return ptr, nil
+}
+
+// ConvStateReset zeros a conv state buffer.
+func ConvStateReset(state unsafe.Pointer, batch, dim, width int) error {
+	result := C.cuda_conv_state_reset(state, C.int(batch), C.int(dim), C.int(width))
+	if result != 0 {
+		return fmt.Errorf("conv state reset failed: %d", result)
+	}
+	return nil
+}
+
+// ConvStateFree frees a conv state buffer.
+func ConvStateFree(state unsafe.Pointer) {
+	if state != nil {
+		C.cuda_conv_state_free(state)
+	}
+}
+
+// CreateConvLayerWeightsBF16 creates conv layer weights from BF16 host data.
+func CreateConvLayerWeightsBF16(
+	inProj, conv, outProj []byte,
+	opNorm, ffnNorm []byte,
+	gate, up, down []byte,
+	hidden, intermediate, kernelSize int, normEps float32,
+) (*ConvLayerWeights, error) {
+	var ptr unsafe.Pointer
+	result := C.cuda_create_conv_layer_weights_bf16(
+		&ptr,
+		unsafe.Pointer(&inProj[0]), unsafe.Pointer(&conv[0]), unsafe.Pointer(&outProj[0]),
+		unsafe.Pointer(&opNorm[0]), unsafe.Pointer(&ffnNorm[0]),
+		unsafe.Pointer(&gate[0]), unsafe.Pointer(&up[0]), unsafe.Pointer(&down[0]),
+		C.int(hidden), C.int(intermediate), C.int(kernelSize), C.float(normEps),
+	)
+	if result != 0 {
+		return nil, fmt.Errorf("failed to create conv layer weights: %d", result)
+	}
+	return &ConvLayerWeights{ptr: ptr}, nil
+}
+
+// ConvLayerForwardBF16 executes a conv layer forward pass.
+func ConvLayerForwardBF16(output, input unsafe.Pointer, weights *ConvLayerWeights, convState unsafe.Pointer, batch, seqLen, position int) error {
+	if weights == nil || weights.ptr == nil {
+		return errors.New("nil conv layer weights")
+	}
+	result := C.cuda_conv_layer_forward_bf16(output, input, weights.ptr, convState,
+		C.int(batch), C.int(seqLen), C.int(position))
+	if result != 0 {
+		return fmt.Errorf("conv layer forward failed: %d", result)
+	}
+	return nil
+}
+
+// FreeConvLayerWeights releases conv layer weight memory.
+func FreeConvLayerWeights(w *ConvLayerWeights) {
+	if w == nil || w.ptr == nil {
+		return
+	}
+	C.cuda_free_conv_layer_weights(w.ptr)
+	w.ptr = nil
+}
+
+// =============================================================================
 // Multi-GPU Operations (TASK-001 through TASK-005)
 // =============================================================================
 
