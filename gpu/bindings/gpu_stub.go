@@ -510,6 +510,7 @@ type KVCache struct {
 	ptr    unsafe.Pointer
 	length int
 }
+func (c *KVCache) Ptr() unsafe.Pointer { return c.ptr }
 
 // NewKVCache creates a new KV cache (stub).
 func NewKVCache(batchSize, numHeads, headDim, maxSeqLen int) (*KVCache, error) {
@@ -593,6 +594,7 @@ func LayerForward(output, input *types.Tensor, weights *LayerWeights, cache *KVC
 type LayerWeightsFP16 struct {
 	ptr unsafe.Pointer
 }
+func (w *LayerWeightsFP16) Ptr() unsafe.Pointer { return w.ptr }
 
 // CreateLayerWeightsFromHostFP16 creates FP16-pure layer weights (stub).
 func CreateLayerWeightsFromHostFP16(
@@ -634,6 +636,22 @@ func LayerForwardFP16WithWorkspace(output, input *types.Tensor, weights *LayerWe
 }
 
 // =============================================================================
+// Full Decode Context (Stubs)
+// =============================================================================
+
+type DecodeContext struct{ ptr unsafe.Pointer }
+
+func CreateDecodeContext(config *types.LlamaConfig) (*DecodeContext, error) {
+	return nil, ErrNotImplemented
+}
+func SetDecodeLayer(ctx *DecodeContext, layerID, layerType int, weights, cache unsafe.Pointer) {}
+func SetDecodeWorkspace(ctx *DecodeContext, workspace *LayerWorkspaceFP16) {}
+func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {
+	return ErrNotImplemented
+}
+func FreeDecodeContext(ctx *DecodeContext) {}
+
+// =============================================================================
 // LFM2 / BF16 Operations (Stubs)
 // =============================================================================
 
@@ -641,6 +659,7 @@ func LayerForwardFP16WithWorkspace(output, input *types.Tensor, weights *LayerWe
 type ConvLayerWeights struct {
 	ptr unsafe.Pointer
 }
+func (w *ConvLayerWeights) Ptr() unsafe.Pointer { return w.ptr }
 
 // CheckBF16Support returns false for stub builds.
 func CheckBF16Support() (bool, error) {

@@ -65,6 +65,11 @@ type ConvLayerExecutor interface {
 	ForwardConv(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, error)
 }
 
+// FullDecoder runs all layers in a single call (eliminates per-layer round-trips).
+type FullDecoder interface {
+	DecodeAll(hidden []byte, position int) ([]byte, error)
+}
+
 // EngineConfig holds configuration for the inference engine.
 type EngineConfig struct {
 	ModelConfig      *types.LlamaConfig
@@ -631,6 +636,14 @@ func (e *Engine) forwardAllLayers(ctx context.Context, hidden []byte, position i
 
 // forwardAllLayersHidden forwards hidden state through all transformer layers.
 func (e *Engine) forwardAllLayersHidden(ctx context.Context, hidden []byte, position int, seqID uint64) ([]byte, error) {
+	// Fast path: use DecodeAll for LFM2 (all layers in single CUDA call)
+	if decoder, ok := e.layerExecutor.(FullDecoder); ok {
+		if out, err := decoder.DecodeAll(hidden, position); err == nil {
+			return out, nil
+		}
+		// Fall through to per-layer path if DecodeAll not available
+	}
+
 	current := hidden
 
 	for layerID := 0; layerID < e.config.NumLayers; layerID++ {

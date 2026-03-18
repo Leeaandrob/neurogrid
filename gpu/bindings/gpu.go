@@ -57,6 +57,9 @@ type KVCache struct {
 	length int
 }
 
+// Ptr returns the underlying C pointer.
+func (c *KVCache) Ptr() unsafe.Pointer { return c.ptr }
+
 // HasCUDA returns true if CUDA is available (compiled with cuda tag).
 func HasCUDA() bool {
 	count, err := GetDeviceCount()
@@ -755,6 +758,9 @@ type LayerWeightsFP16 struct {
 	ptr unsafe.Pointer
 }
 
+// Ptr returns the underlying C pointer.
+func (w *LayerWeightsFP16) Ptr() unsafe.Pointer { return w.ptr }
+
 // CreateLayerWeightsFromHostFP16 creates FP16-pure layer weights (no INT8 quantization).
 func CreateLayerWeightsFromHostFP16(
 	qProj, kProj, vProj, oProj []byte,
@@ -916,6 +922,66 @@ func LayerForwardFP16WithWorkspace(output, input *types.Tensor, weights *LayerWe
 }
 
 // =============================================================================
+// Full Decode Context — all layers in a single CUDA call
+// =============================================================================
+
+// DecodeContext runs all layers in a single CUDA call (eliminates Go↔C round-trips).
+type DecodeContext struct {
+	ptr unsafe.Pointer
+}
+
+// CreateDecodeContext creates a context for full-model decode steps.
+func CreateDecodeContext(config *types.LlamaConfig) (*DecodeContext, error) {
+	var ptr unsafe.Pointer
+	ropeTheta := config.RopeTheta
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0
+	}
+	result := C.cuda_create_decode_context(&ptr,
+		C.int(config.NumLayers), C.int(config.HiddenSize), C.int(config.IntermediateSize),
+		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
+		C.float(config.RMSNormEps), C.float(ropeTheta), C.int(1), // rope_style=1 (interleaved for LFM2)
+		C.int(config.ConvKernelSize))
+	if result != 0 {
+		return nil, fmt.Errorf("failed to create decode context: %d", result)
+	}
+	return &DecodeContext{ptr: ptr}, nil
+}
+
+// SetDecodeLayer registers a layer's weights and cache in the decode context.
+func SetDecodeLayer(ctx *DecodeContext, layerID, layerType int, weights, cache unsafe.Pointer) {
+	C.cuda_set_decode_layer(ctx.ptr, C.int(layerID), C.int(layerType), weights, cache)
+}
+
+// SetDecodeWorkspace sets the shared attention workspace.
+func SetDecodeWorkspace(ctx *DecodeContext, workspace *LayerWorkspaceFP16) {
+	if workspace != nil {
+		C.cuda_set_decode_workspace(ctx.ptr, workspace.ptr)
+	}
+}
+
+// DecodeStep runs all layers for a single token decode step.
+// Input/output are HOST FP16 byte slices.
+func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {
+	result := C.cuda_decode_step(ctx.ptr,
+		unsafe.Pointer(&output[0]),
+		unsafe.Pointer(&input[0]),
+		C.int(position))
+	if result != 0 {
+		return fmt.Errorf("decode step failed: %d", result)
+	}
+	return nil
+}
+
+// FreeDecodeContext releases the decode context.
+func FreeDecodeContext(ctx *DecodeContext) {
+	if ctx != nil && ctx.ptr != nil {
+		C.cuda_free_decode_context(ctx.ptr)
+		ctx.ptr = nil
+	}
+}
+
+// =============================================================================
 // LFM2 / BF16 Operations
 // =============================================================================
 
@@ -923,6 +989,9 @@ func LayerForwardFP16WithWorkspace(output, input *types.Tensor, weights *LayerWe
 type ConvLayerWeights struct {
 	ptr unsafe.Pointer
 }
+
+// Ptr returns the underlying C pointer.
+func (w *ConvLayerWeights) Ptr() unsafe.Pointer { return w.ptr }
 
 // CheckBF16Support returns true if the current GPU supports BF16 (compute >= 8.0).
 func CheckBF16Support() (bool, error) {

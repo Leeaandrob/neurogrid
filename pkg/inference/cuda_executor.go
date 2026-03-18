@@ -37,6 +37,9 @@ type CUDALayerExecutor struct {
 	// FP16-pure attention layers (LFM2 — no INT8 quantization)
 	fp16LayerWeights map[int]*bindings.LayerWeightsFP16
 
+	// Full decode context — runs all layers in single CUDA call
+	decodeCtx *bindings.DecodeContext
+
 	// Preallocated GPU buffers for Forward() - avoids per-call cudaMalloc/cudaFree.
 	// These buffers are sized for single-token inference (hidden_size * 2 bytes for FP16).
 	// For batch inference or prefill, the executor falls back to dynamic allocation.
@@ -398,6 +401,62 @@ func (e *CUDALayerExecutor) NumLayers() int {
 	return len(e.layerWeights)
 }
 
+// BuildDecodeContext creates the full-model decode context for LFM2.
+// Must be called after all layers are loaded. Enables DecodeAll() fast path.
+func (e *CUDALayerExecutor) BuildDecodeContext() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.config.ModelType != "lfm2" {
+		return nil // Only for LFM2 hybrid models
+	}
+
+	ctx, err := bindings.CreateDecodeContext(e.config)
+	if err != nil {
+		return fmt.Errorf("create decode context: %w", err)
+	}
+
+	// Register all layers
+	for i := 0; i < e.config.NumLayers; i++ {
+		if e.config.IsConvLayer(i) {
+			if w, ok := e.convLayerWeights[i]; ok {
+				state := e.convStates[i]
+				bindings.SetDecodeLayer(ctx, i, 0, w.Ptr(), state) // 0=conv
+			}
+		} else {
+			if w, ok := e.fp16LayerWeights[i]; ok {
+				cache := e.kvCaches[i]
+				var cachePtr unsafe.Pointer
+				if cache != nil {
+					cachePtr = cache.Ptr()
+				}
+				bindings.SetDecodeLayer(ctx, i, 1, w.Ptr(), cachePtr) // 1=attention
+			}
+		}
+	}
+
+	// Set workspace
+	if e.fp16Workspace != nil {
+		bindings.SetDecodeWorkspace(ctx, e.fp16Workspace)
+	}
+
+	e.decodeCtx = ctx
+	return nil
+}
+
+// DecodeAll runs all layers for a single decode step in one CUDA call.
+func (e *CUDALayerExecutor) DecodeAll(hidden []byte, position int) ([]byte, error) {
+	if e.decodeCtx == nil {
+		return nil, fmt.Errorf("decode context not initialized")
+	}
+
+	output := make([]byte, len(hidden))
+	if err := bindings.DecodeStep(e.decodeCtx, output, hidden, position); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
 func (e *CUDALayerExecutor) forwardFP16(ctx context.Context, layerID int, hidden []byte, position int,
 	weights *bindings.LayerWeightsFP16, cache *bindings.KVCache) ([]byte, []byte, []byte, error) {
 
@@ -590,6 +649,12 @@ func (e *CUDALayerExecutor) ForwardConv(ctx context.Context, layerID int, hidden
 func (e *CUDALayerExecutor) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	// Free decode context
+	if e.decodeCtx != nil {
+		bindings.FreeDecodeContext(e.decodeCtx)
+		e.decodeCtx = nil
+	}
 
 	// Free preallocated buffers
 	if e.inputGPU != nil {
