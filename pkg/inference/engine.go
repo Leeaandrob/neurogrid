@@ -389,10 +389,13 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 
 	if hasGPUDecoder && gpuInf != nil {
 		// GPU-RESIDENT FAST PATH
-		// Set initial hidden on GPU from prefill result
+		log.Printf("[Generate] Using GPU-resident decode path")
 		if err := gpuDecoder.SetHiddenGPU(hidden); err != nil {
+			log.Printf("[Generate] GPU-resident init failed: %v, falling back", err)
 			hasGPUDecoder = false // fall back
 		}
+	} else {
+		log.Printf("[Generate] Using standard decode path (gpuDecoder=%v, gpuInf=%v)", hasGPUDecoder, gpuInf != nil)
 	}
 
 	for i := 0; i < req.MaxTokens; i++ {
