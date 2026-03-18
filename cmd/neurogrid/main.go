@@ -54,6 +54,7 @@ type CoordinatorConfig struct {
 	SkipWeightTransfer bool            // Skip sending weights to workers (they have local models)
 	MaxSeqLen          int             // Maximum sequence length for KV cache (caps model's max_position_embeddings)
 	DisableMDNS        bool            // Disable mDNS discovery (use only explicit bootstrap peers)
+	PeerVRAMGB         float64         // Override worker GPU VRAM in GB (0 = auto-detect)
 }
 
 // Coordinator orchestrates distributed inference
@@ -298,9 +299,16 @@ func (c *Coordinator) initializeComponents() error {
 				info, err := c.p2pProtocol.RequestGPUInfo(ctx, p.ID, 10*time.Second)
 				cancel()
 				if err != nil {
-					log.Printf("Warning: Failed to get GPU info from peer %s: %v (using local GPU values)", p.ID, err)
-					// Fall back to local GPU values
-					gpuInfo = p2p.GPUInfo{TotalVRAM: totalVRAM, UsedVRAM: usedVRAM, GPUName: "Unknown"}
+					log.Printf("Warning: Failed to get GPU info from peer %s: %v", p.ID, err)
+					// Fall back to --peer-vram-gb if set, else local GPU values
+					if c.config.PeerVRAMGB > 0 {
+						peerVRAM := uint64(c.config.PeerVRAMGB * 1024 * 1024 * 1024)
+						gpuInfo = p2p.GPUInfo{TotalVRAM: peerVRAM, UsedVRAM: 0, GPUName: "Remote (override)"}
+						log.Printf("Using --peer-vram-gb override: %.1f GB", c.config.PeerVRAMGB)
+					} else {
+						gpuInfo = p2p.GPUInfo{TotalVRAM: totalVRAM, UsedVRAM: usedVRAM, GPUName: "Unknown"}
+						log.Printf("Using local GPU values as fallback")
+					}
 				} else {
 					gpuInfo = info
 					c.peerGPUInfoMu.Lock()
@@ -839,6 +847,7 @@ func main() {
 	skipWeightTransfer := flag.Bool("skip-weight-transfer", false, "Skip sending weights to workers (use when workers have local models)")
 	maxSeqLen := flag.Int("max-seq-len", 4096, "Maximum sequence length for KV cache (caps model's max_position_embeddings to save VRAM)")
 	disableMDNS := flag.Bool("disable-mdns", false, "Disable mDNS discovery (workers must connect via bootstrap to this coordinator)")
+	peerVRAMGB := flag.Float64("peer-vram-gb", 0, "Override worker GPU VRAM in GB (workaround for GPU info protocol timeout)")
 	flag.Parse()
 
 	// Parse bootstrap peers
@@ -877,6 +886,7 @@ func main() {
 		SkipWeightTransfer: *skipWeightTransfer,
 		MaxSeqLen:          *maxSeqLen,
 		DisableMDNS:        *disableMDNS,
+		PeerVRAMGB:         *peerVRAMGB,
 	}
 
 	log.Println("================================================")
