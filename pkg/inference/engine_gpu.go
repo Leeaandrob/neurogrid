@@ -117,26 +117,24 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 			}
 		} else if e.config.ModelType == "lfm2" {
 			// Load LFM2 attention layer (different tensor names: out_proj, feed_forward, operator_norm)
-			layerWeights, _, _, err := loader.LoadAttentionLayerWeightsLFM2(layerID)
+			layerWeights, qLayerNorm, kLayerNorm, err := loader.LoadAttentionLayerWeightsLFM2(layerID)
 			if err != nil {
 				gpu.Close()
 				return nil, fmt.Errorf("load LFM2 attn layer %d: %w", layerID, err)
 			}
 
-			qProj := layerWeights.QWeight
-			kProj := layerWeights.KWeight
-			vProj := layerWeights.VWeight
-			oProj := layerWeights.OWeight
-			gateProj := layerWeights.GateWeight
-			upProj := layerWeights.UpWeight
-			downProj := layerWeights.DownWeight
-			attnNorm := layerWeights.AttnNorm
-			ffnNorm := layerWeights.FFNNorm
-
 			weights := &TransformerLayerWeights{
-				QProj: qProj, KProj: kProj, VProj: vProj, OProj: oProj,
-				GateProj: gateProj, UpProj: upProj, DownProj: downProj,
-				AttnNorm: attnNorm, FFNNorm: ffnNorm,
+				QProj:      layerWeights.QWeight,
+				KProj:      layerWeights.KWeight,
+				VProj:      layerWeights.VWeight,
+				OProj:      layerWeights.OWeight,
+				GateProj:   layerWeights.GateWeight,
+				UpProj:     layerWeights.UpWeight,
+				DownProj:   layerWeights.DownWeight,
+				AttnNorm:   layerWeights.AttnNorm,
+				FFNNorm:    layerWeights.FFNNorm,
+				QLayerNorm: qLayerNorm,
+				KLayerNorm: kLayerNorm,
 			}
 
 			if err := gpu.LayerExecutor.LoadLayerFP16(layerID, weights); err != nil {

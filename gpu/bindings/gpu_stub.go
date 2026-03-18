@@ -599,6 +599,7 @@ func CreateLayerWeightsFromHostFP16(
 	qProj, kProj, vProj, oProj []byte,
 	gateProj, upProj, downProj []byte,
 	attnNorm, ffnNorm []byte,
+	qLayerNorm, kLayerNorm []byte,
 	config *types.LlamaConfig,
 ) (*LayerWeightsFP16, error) {
 	return nil, ErrNotImplemented

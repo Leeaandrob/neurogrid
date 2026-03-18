@@ -616,6 +616,8 @@ struct LayerWeightsFP16 {
     half* gate_proj;        // FP16 [intermediate_size, hidden_size]
     half* up_proj;          // FP16 [intermediate_size, hidden_size]
     half* down_proj;        // FP16 [hidden_size, intermediate_size]
+    half* q_layernorm;      // FP16 [head_dim] — per-head QK LayerNorm (NULL if not used)
+    half* k_layernorm;      // FP16 [head_dim] — per-head QK LayerNorm (NULL if not used)
     int hidden_size;
     int intermediate_size;
     int num_heads;
@@ -635,7 +637,59 @@ extern "C" void cuda_free_layer_weights_fp16(void* weights) {
     if (w->gate_proj) cudaFree(w->gate_proj);
     if (w->up_proj) cudaFree(w->up_proj);
     if (w->down_proj) cudaFree(w->down_proj);
+    if (w->q_layernorm) cudaFree(w->q_layernorm);
+    if (w->k_layernorm) cudaFree(w->k_layernorm);
     free(w);
+}
+
+// Per-head RMSNorm kernel for QK LayerNorm
+// Input: [num_tokens, num_heads, head_dim]  (contiguous in memory as [num_tokens, hidden_size])
+// Weight: [head_dim] (shared across all heads)
+// Applies RMSNorm independently to each head's [head_dim] slice
+__global__ void per_head_rmsnorm_kernel(
+    half* __restrict__ output,
+    const half* __restrict__ input,
+    const half* __restrict__ weight,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    float eps
+) {
+    // Each block handles one (token, head) pair
+    int token_head = blockIdx.x;
+    int token = token_head / num_heads;
+    int head = token_head % num_heads;
+    int tid = threadIdx.x;
+
+    if (token >= num_tokens || head >= num_heads) return;
+
+    const half* x = input + token * num_heads * head_dim + head * head_dim;
+    half* y = output + token * num_heads * head_dim + head * head_dim;
+
+    // Compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = __half2float(x[i]);
+        sum_sq += val * val;
+    }
+
+    // Warp reduction
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float s_rsqrt;
+    if (tid == 0) {
+        s_rsqrt = rsqrtf(sum_sq / float(head_dim) + eps);
+    }
+    __syncthreads();
+
+    // Normalize and scale
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = __half2float(x[i]);
+        float w = __half2float(weight[i]);
+        y[i] = __float2half(val * s_rsqrt * w);
+    }
 }
 
 // Helper: Upload FP16 weight matrix (no quantization)
@@ -651,6 +705,7 @@ extern "C" int cuda_create_layer_weights_from_host_fp16(
     const void* h_q_proj, const void* h_k_proj, const void* h_v_proj, const void* h_o_proj,
     const void* h_gate_proj, const void* h_up_proj, const void* h_down_proj,
     const void* h_attn_norm, const void* h_ffn_norm,
+    const void* h_q_layernorm, const void* h_k_layernorm,
     int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim
 ) {
     LayerWeightsFP16* w = (LayerWeightsFP16*)calloc(1, sizeof(LayerWeightsFP16));
@@ -684,6 +739,16 @@ extern "C" int cuda_create_layer_weights_from_host_fp16(
     if (result != 0) goto cleanup;
     result = upload_fp16_weight(&w->down_proj, h_down_proj, hidden_size, intermediate_size);
     if (result != 0) goto cleanup;
+
+    // Upload QK LayerNorm weights (optional — NULL if not provided)
+    if (h_q_layernorm) {
+        result = upload_fp16_norm(&w->q_layernorm, h_q_layernorm, head_dim);
+        if (result != 0) goto cleanup;
+    }
+    if (h_k_layernorm) {
+        result = upload_fp16_norm(&w->k_layernorm, h_k_layernorm, head_dim);
+        if (result != 0) goto cleanup;
+    }
 
     *weights = w;
     return 0;
@@ -729,6 +794,24 @@ extern "C" int cuda_layer_forward_fp16(
     if (result != 0) goto cleanup;
     result = cuda_gemm_fp16(v, normed, w->v_proj, num_tokens, hidden_size, kv_dim, false, true);
     if (result != 0) goto cleanup;
+
+    // 2b. QK LayerNorm (LFM2): per-head RMSNorm on Q and K BEFORE RoPE
+    if (w->q_layernorm != nullptr) {
+        int block_size_qk = min(32, head_dim); // head_dim is typically 64
+        block_size_qk = ((block_size_qk + 31) / 32) * 32;
+        per_head_rmsnorm_kernel<<<num_tokens * num_heads, block_size_qk>>>(
+            q, q, w->q_layernorm, num_tokens, num_heads, head_dim, rms_norm_eps);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) { result = -1; goto cleanup; }
+    }
+    if (w->k_layernorm != nullptr) {
+        int block_size_qk = min(32, head_dim);
+        block_size_qk = ((block_size_qk + 31) / 32) * 32;
+        per_head_rmsnorm_kernel<<<num_tokens * num_kv_heads, block_size_qk>>>(
+            k, k, w->k_layernorm, num_tokens, num_kv_heads, head_dim, rms_norm_eps);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) { result = -1; goto cleanup; }
+    }
 
     // 3. RoPE with configurable style and theta
     result = cuda_rope_with_theta(q, q, positions, batch_size, seq_len, num_heads, head_dim, rope_style, rope_theta);

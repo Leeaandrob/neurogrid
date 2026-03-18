@@ -66,6 +66,7 @@ int cuda_create_layer_weights_from_host_fp16(
     const void* h_q_proj, const void* h_k_proj, const void* h_v_proj, const void* h_o_proj,
     const void* h_gate_proj, const void* h_up_proj, const void* h_down_proj,
     const void* h_attn_norm, const void* h_ffn_norm,
+    const void* h_q_layernorm, const void* h_k_layernorm,
     int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim
 );
 

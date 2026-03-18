@@ -101,15 +101,17 @@ func (e *CUDALayerExecutor) GetBufferSize() uint64 {
 // TransformerLayerWeights represents the weights for a single transformer layer.
 // This is the structure expected by LoadLayer.
 type TransformerLayerWeights struct {
-	QProj    []byte // FP16 [hidden_size, hidden_size]
-	KProj    []byte // FP16 [hidden_size, kv_dim]
-	VProj    []byte // FP16 [hidden_size, kv_dim]
-	OProj    []byte // FP16 [hidden_size, hidden_size]
-	GateProj []byte // FP16 [hidden_size, intermediate_size]
-	UpProj   []byte // FP16 [hidden_size, intermediate_size]
-	DownProj []byte // FP16 [intermediate_size, hidden_size]
-	AttnNorm []byte // FP16 [hidden_size]
-	FFNNorm  []byte // FP16 [hidden_size]
+	QProj      []byte // FP16 [hidden_size, hidden_size]
+	KProj      []byte // FP16 [hidden_size, kv_dim]
+	VProj      []byte // FP16 [hidden_size, kv_dim]
+	OProj      []byte // FP16 [hidden_size, hidden_size]
+	GateProj   []byte // FP16 [hidden_size, intermediate_size]
+	UpProj     []byte // FP16 [hidden_size, intermediate_size]
+	DownProj   []byte // FP16 [intermediate_size, hidden_size]
+	AttnNorm   []byte // FP16 [hidden_size]
+	FFNNorm    []byte // FP16 [hidden_size]
+	QLayerNorm []byte // FP16 [head_dim] — per-head QK LayerNorm (nil if not used)
+	KLayerNorm []byte // FP16 [head_dim] — per-head QK LayerNorm (nil if not used)
 }
 
 // LoadLayer uploads a single layer's weights to GPU memory.
@@ -167,6 +169,7 @@ func (e *CUDALayerExecutor) LoadLayerFP16(layerID int, weights *TransformerLayer
 		weights.QProj, weights.KProj, weights.VProj, weights.OProj,
 		weights.GateProj, weights.UpProj, weights.DownProj,
 		weights.AttnNorm, weights.FFNNorm,
+		weights.QLayerNorm, weights.KLayerNorm,
 		e.config,
 	)
 	if err != nil {

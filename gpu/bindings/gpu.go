@@ -760,9 +760,20 @@ func CreateLayerWeightsFromHostFP16(
 	qProj, kProj, vProj, oProj []byte,
 	gateProj, upProj, downProj []byte,
 	attnNorm, ffnNorm []byte,
+	qLayerNorm, kLayerNorm []byte,
 	config *types.LlamaConfig,
 ) (*LayerWeightsFP16, error) {
 	var ptr unsafe.Pointer
+
+	// QK LayerNorm pointers (nil-safe: pass NULL if empty)
+	var qLNPtr, kLNPtr unsafe.Pointer
+	if len(qLayerNorm) > 0 {
+		qLNPtr = unsafe.Pointer(&qLayerNorm[0])
+	}
+	if len(kLayerNorm) > 0 {
+		kLNPtr = unsafe.Pointer(&kLayerNorm[0])
+	}
+
 	result := C.cuda_create_layer_weights_from_host_fp16(
 		&ptr,
 		unsafe.Pointer(&qProj[0]), unsafe.Pointer(&kProj[0]),
@@ -770,6 +781,7 @@ func CreateLayerWeightsFromHostFP16(
 		unsafe.Pointer(&gateProj[0]), unsafe.Pointer(&upProj[0]),
 		unsafe.Pointer(&downProj[0]),
 		unsafe.Pointer(&attnNorm[0]), unsafe.Pointer(&ffnNorm[0]),
+		qLNPtr, kLNPtr,
 		C.int(config.HiddenSize), C.int(config.IntermediateSize),
 		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
 	)
