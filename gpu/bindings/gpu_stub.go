@@ -614,6 +614,25 @@ func LayerForwardFP16(output, input *types.Tensor, weights *LayerWeightsFP16, ca
 	return ErrNotImplemented
 }
 
+// LayerWorkspaceFP16 holds pre-allocated GPU buffers (stub).
+type LayerWorkspaceFP16 struct {
+	ptr unsafe.Pointer
+}
+
+// CreateLayerWorkspaceFP16 pre-allocates workspace buffers (stub).
+func CreateLayerWorkspaceFP16(maxTokens int, config *types.LlamaConfig) (*LayerWorkspaceFP16, error) {
+	return nil, ErrNotImplemented
+}
+
+// FreeLayerWorkspaceFP16 frees workspace buffers (stub).
+func FreeLayerWorkspaceFP16(ws *LayerWorkspaceFP16) {}
+
+// LayerForwardFP16WithWorkspace executes FP16 layer forward with workspace (stub).
+func LayerForwardFP16WithWorkspace(output, input *types.Tensor, weights *LayerWeightsFP16, cache *KVCache,
+	positions []int32, config *types.LlamaConfig, ropeStyle int, workspace *LayerWorkspaceFP16) error {
+	return ErrNotImplemented
+}
+
 // =============================================================================
 // LFM2 / BF16 Operations (Stubs)
 // =============================================================================

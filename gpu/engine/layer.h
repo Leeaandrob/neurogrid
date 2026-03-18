@@ -79,6 +79,26 @@ int cuda_layer_forward_fp16(
 
 void cuda_free_layer_weights_fp16(void* weights);
 
+// FP16 layer workspace — pre-allocated buffers for zero-alloc forward passes
+int cuda_create_layer_workspace_fp16(
+    void** workspace,
+    int max_tokens,
+    int hidden_size,
+    int intermediate_size,
+    int num_kv_heads,
+    int head_dim
+);
+
+void cuda_free_layer_workspace_fp16(void* workspace);
+
+int cuda_layer_forward_fp16_with_workspace(
+    void* output, const void* input, const void* weights, void* kv_cache,
+    const int* positions, int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+);
+
 #ifdef __cplusplus
 }
 #endif

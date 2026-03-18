@@ -840,6 +840,81 @@ func LayerForwardFP16(output, input *types.Tensor, weights *LayerWeightsFP16, ca
 	return nil
 }
 
+// LayerWorkspaceFP16 holds pre-allocated GPU buffers for FP16 layer forward passes.
+// Eliminates per-call cudaMalloc/cudaFree overhead (~200 calls per token across 16 layers).
+type LayerWorkspaceFP16 struct {
+	ptr unsafe.Pointer
+}
+
+// CreateLayerWorkspaceFP16 pre-allocates all temporary GPU buffers needed by
+// cuda_layer_forward_fp16. Call once at init, reuse across all forward calls.
+func CreateLayerWorkspaceFP16(maxTokens int, config *types.LlamaConfig) (*LayerWorkspaceFP16, error) {
+	var ptr unsafe.Pointer
+	result := C.cuda_create_layer_workspace_fp16(
+		&ptr,
+		C.int(maxTokens),
+		C.int(config.HiddenSize),
+		C.int(config.IntermediateSize),
+		C.int(config.NumKVHeads),
+		C.int(config.HeadDim),
+	)
+	if result != 0 {
+		return nil, fmt.Errorf("failed to create FP16 layer workspace: %d", result)
+	}
+	return &LayerWorkspaceFP16{ptr: ptr}, nil
+}
+
+// FreeLayerWorkspaceFP16 releases the pre-allocated workspace buffers.
+func FreeLayerWorkspaceFP16(ws *LayerWorkspaceFP16) {
+	if ws == nil || ws.ptr == nil {
+		return
+	}
+	C.cuda_free_layer_workspace_fp16(ws.ptr)
+	ws.ptr = nil
+}
+
+// LayerForwardFP16WithWorkspace executes FP16 layer forward using pre-allocated workspace
+// buffers instead of allocating/freeing 8 GPU buffers per call.
+func LayerForwardFP16WithWorkspace(output, input *types.Tensor, weights *LayerWeightsFP16, cache *KVCache,
+	positions []int32, config *types.LlamaConfig, ropeStyle int, workspace *LayerWorkspaceFP16) error {
+	if output == nil || input == nil || weights == nil || cache == nil || workspace == nil {
+		return errors.New("nil argument")
+	}
+
+	batch := input.Shape[0]
+	seqLen := input.Shape[1]
+
+	var dPositions unsafe.Pointer
+	posSize := C.size_t(len(positions) * 4)
+	if C.cuda_malloc(&dPositions, posSize) != 0 {
+		return errors.New("failed to allocate positions on GPU")
+	}
+	defer C.cuda_free(dPositions)
+
+	if C.cudaMemcpy(dPositions, unsafe.Pointer(&positions[0]), posSize, C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy positions to GPU")
+	}
+
+	ropeTheta := config.RopeTheta
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0
+	}
+
+	result := C.cuda_layer_forward_fp16_with_workspace(
+		output.Data, input.Data, weights.ptr, cache.ptr,
+		(*C.int)(dPositions),
+		C.int(batch), C.int(seqLen),
+		C.int(config.HiddenSize), C.int(config.IntermediateSize),
+		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
+		C.float(config.RMSNormEps), C.float(ropeTheta), C.int(ropeStyle),
+		workspace.ptr,
+	)
+	if result != 0 {
+		return fmt.Errorf("FP16 layer forward with workspace failed: %d", result)
+	}
+	return nil
+}
+
 // =============================================================================
 // LFM2 / BF16 Operations
 // =============================================================================

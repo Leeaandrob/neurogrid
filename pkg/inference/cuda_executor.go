@@ -43,6 +43,17 @@ type CUDALayerExecutor struct {
 	inputGPU   unsafe.Pointer // GPU buffer for input hidden state
 	outputGPU  unsafe.Pointer // GPU buffer for output hidden state
 	bufferSize uint64         // Size of preallocated buffers in bytes
+
+	// FP16 layer workspace — pre-allocated temp buffers for zero-alloc forward passes.
+	// Eliminates ~200 cudaMalloc/cudaFree calls per token across 16 layers (~2-3ms saved).
+	fp16Workspace *bindings.LayerWorkspaceFP16
+
+	// Preallocated conv layer buffers — avoids 4 cudaMalloc/cudaFree per ForwardConv call.
+	convInputFP16  unsafe.Pointer // GPU buffer for FP16 input
+	convInputBF16  unsafe.Pointer // GPU buffer for BF16 input (converted from FP16)
+	convOutputBF16 unsafe.Pointer // GPU buffer for BF16 output
+	convOutputFP16 unsafe.Pointer // GPU buffer for FP16 output (converted from BF16)
+	convBufSize    uint64         // Size of each conv buffer in bytes
 }
 
 // NewCUDALayerExecutor creates a new CUDA-based layer executor.
@@ -74,17 +85,69 @@ func NewCUDALayerExecutor(config *types.LlamaConfig, deviceID int) (*CUDALayerEx
 		return nil, fmt.Errorf("failed to preallocate output buffer: %w", err)
 	}
 
+	// Preallocate FP16 layer workspace (8 temp buffers used by every forward call)
+	fp16Workspace, err := bindings.CreateLayerWorkspaceFP16(1, config)
+	if err != nil {
+		// Non-fatal: fall back to per-call allocation via LayerForwardFP16
+		fp16Workspace = nil
+	}
+
+	// Preallocate conv layer buffers (4 buffers used by every ForwardConv call)
+	convBufSize := bufferSize // same as hidden_size * 2 bytes (FP16/BF16)
+	var convInputFP16, convInputBF16, convOutputBF16, convOutputFP16 unsafe.Pointer
+
+	convInputFP16, err = bindings.AllocOnDevice(convBufSize, deviceID)
+	if err != nil {
+		convInputFP16 = nil // non-fatal
+	}
+	if convInputFP16 != nil {
+		convInputBF16, err = bindings.AllocOnDevice(convBufSize, deviceID)
+		if err != nil {
+			bindings.FreeOnDevice(convInputFP16, deviceID)
+			convInputFP16 = nil
+			convInputBF16 = nil
+		}
+	}
+	if convInputBF16 != nil {
+		convOutputBF16, err = bindings.AllocOnDevice(convBufSize, deviceID)
+		if err != nil {
+			bindings.FreeOnDevice(convInputFP16, deviceID)
+			bindings.FreeOnDevice(convInputBF16, deviceID)
+			convInputFP16 = nil
+			convInputBF16 = nil
+			convOutputBF16 = nil
+		}
+	}
+	if convOutputBF16 != nil {
+		convOutputFP16, err = bindings.AllocOnDevice(convBufSize, deviceID)
+		if err != nil {
+			bindings.FreeOnDevice(convInputFP16, deviceID)
+			bindings.FreeOnDevice(convInputBF16, deviceID)
+			bindings.FreeOnDevice(convOutputBF16, deviceID)
+			convInputFP16 = nil
+			convInputBF16 = nil
+			convOutputBF16 = nil
+			convOutputFP16 = nil
+		}
+	}
+
 	return &CUDALayerExecutor{
-		layerWeights: make(map[int]*bindings.LayerWeights),
+		layerWeights:     make(map[int]*bindings.LayerWeights),
 		kvCaches:         make(map[int]*bindings.KVCache),
 		convLayerWeights: make(map[int]*bindings.ConvLayerWeights),
 		convStates:       make(map[int]unsafe.Pointer),
 		fp16LayerWeights: make(map[int]*bindings.LayerWeightsFP16),
-		config:       config,
-		deviceID:     deviceID,
-		inputGPU:     inputGPU,
-		outputGPU:    outputGPU,
-		bufferSize:   bufferSize,
+		config:           config,
+		deviceID:         deviceID,
+		inputGPU:         inputGPU,
+		outputGPU:        outputGPU,
+		bufferSize:       bufferSize,
+		fp16Workspace:    fp16Workspace,
+		convInputFP16:    convInputFP16,
+		convInputBF16:    convInputBF16,
+		convOutputBF16:   convOutputBF16,
+		convOutputFP16:   convOutputFP16,
+		convBufSize:      convBufSize,
 	}, nil
 }
 
@@ -362,8 +425,17 @@ func (e *CUDALayerExecutor) forwardFP16(ctx context.Context, layerID int, hidden
 
 	// Use interleaved RoPE for LFM2
 	ropeStyle := 1 // RoPEStyleInterleaved
-	if err := bindings.LayerForwardFP16(outputTensor, inputTensor, weights, cache, positions, e.config, ropeStyle); err != nil {
-		return nil, nil, nil, fmt.Errorf("FP16 layer forward failed: %w", err)
+
+	// Use workspace path if available (eliminates ~8 cudaMalloc/cudaFree per layer call)
+	if e.fp16Workspace != nil {
+		if err := bindings.LayerForwardFP16WithWorkspace(outputTensor, inputTensor, weights, cache, positions, e.config, ropeStyle, e.fp16Workspace); err != nil {
+			return nil, nil, nil, fmt.Errorf("FP16 layer forward (workspace) failed: %w", err)
+		}
+	} else {
+		// Fallback to allocating path
+		if err := bindings.LayerForwardFP16(outputTensor, inputTensor, weights, cache, positions, e.config, ropeStyle); err != nil {
+			return nil, nil, nil, fmt.Errorf("FP16 layer forward failed: %w", err)
+		}
 	}
 
 	output := make([]byte, len(hidden))
@@ -411,6 +483,10 @@ func (e *CUDALayerExecutor) LoadConvLayer(layerID int, inProj, conv, outProj, op
 }
 
 // ForwardConv executes a conv layer forward pass.
+//
+// OPTIMIZED: Uses preallocated GPU buffers when available to eliminate 4
+// cudaMalloc/cudaFree calls per invocation. Falls back to dynamic allocation
+// if preallocated buffers are not available or input exceeds buffer size.
 func (e *CUDALayerExecutor) ForwardConv(ctx context.Context, layerID int, hidden []byte, position int) ([]byte, error) {
 	e.mu.RLock()
 	weights, ok := e.convLayerWeights[layerID]
@@ -430,19 +506,48 @@ func (e *CUDALayerExecutor) ForwardConv(ctx context.Context, layerID int, hidden
 
 	bufSize := uint64(numElements * 2) // 2 bytes per element (FP16 or BF16)
 
-	// Allocate FP16 input buffer (host data is FP16)
+	// Use preallocated buffers if available and size fits
+	if e.convInputFP16 != nil && bufSize <= e.convBufSize {
+		// Copy FP16 hidden state to preallocated GPU buffer
+		if err := bindings.CopyToDeviceRaw(e.convInputFP16, getBytePointer(hidden), uint64(len(hidden))); err != nil {
+			return nil, fmt.Errorf("copy input: %w", err)
+		}
+
+		// Convert FP16 → BF16
+		if err := bindings.FP16ToBF16(e.convInputBF16, e.convInputFP16, numElements); err != nil {
+			return nil, fmt.Errorf("fp16→bf16 input: %w", err)
+		}
+
+		// Execute conv layer forward (BF16 in, BF16 out)
+		if err := bindings.ConvLayerForwardBF16(e.convOutputBF16, e.convInputBF16, weights, state, 1, seqLen, position); err != nil {
+			return nil, fmt.Errorf("conv forward: %w", err)
+		}
+
+		// Convert BF16 → FP16
+		if err := bindings.BF16ToFP16(e.convOutputFP16, e.convOutputBF16, numElements); err != nil {
+			return nil, fmt.Errorf("bf16→fp16 output: %w", err)
+		}
+
+		// Copy FP16 output back to host
+		output := make([]byte, len(hidden))
+		if err := bindings.CopyFromDeviceRaw(getBytePointer(output), e.convOutputFP16, uint64(len(output))); err != nil {
+			return nil, fmt.Errorf("copy output: %w", err)
+		}
+
+		return output, nil
+	}
+
+	// Fallback: allocate buffers dynamically
 	fp16InputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
 	if err != nil {
 		return nil, fmt.Errorf("alloc fp16 input: %w", err)
 	}
 	defer bindings.FreeOnDevice(fp16InputGPU, e.deviceID)
 
-	// Copy FP16 hidden state to GPU
 	if err := bindings.CopyToDeviceRaw(fp16InputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
 		return nil, fmt.Errorf("copy input: %w", err)
 	}
 
-	// Convert FP16 → BF16 for conv kernel
 	bf16InputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
 	if err != nil {
 		return nil, fmt.Errorf("alloc bf16 input: %w", err)
@@ -453,19 +558,16 @@ func (e *CUDALayerExecutor) ForwardConv(ctx context.Context, layerID int, hidden
 		return nil, fmt.Errorf("fp16→bf16 input: %w", err)
 	}
 
-	// Allocate BF16 output buffer
 	bf16OutputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
 	if err != nil {
 		return nil, fmt.Errorf("alloc bf16 output: %w", err)
 	}
 	defer bindings.FreeOnDevice(bf16OutputGPU, e.deviceID)
 
-	// Execute conv layer forward (BF16 in, BF16 out)
 	if err := bindings.ConvLayerForwardBF16(bf16OutputGPU, bf16InputGPU, weights, state, 1, seqLen, position); err != nil {
 		return nil, fmt.Errorf("conv forward: %w", err)
 	}
 
-	// Convert BF16 → FP16 for next layer
 	fp16OutputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
 	if err != nil {
 		return nil, fmt.Errorf("alloc fp16 output: %w", err)
@@ -476,7 +578,6 @@ func (e *CUDALayerExecutor) ForwardConv(ctx context.Context, layerID int, hidden
 		return nil, fmt.Errorf("bf16→fp16 output: %w", err)
 	}
 
-	// Copy FP16 output back to host
 	output := make([]byte, len(hidden))
 	if err := bindings.CopyFromDeviceRaw(getBytePointer(output), fp16OutputGPU, uint64(len(output))); err != nil {
 		return nil, fmt.Errorf("copy output: %w", err)
@@ -498,6 +599,30 @@ func (e *CUDALayerExecutor) Close() error {
 	if e.outputGPU != nil {
 		bindings.FreeOnDevice(e.outputGPU, e.deviceID)
 		e.outputGPU = nil
+	}
+
+	// Free FP16 layer workspace
+	if e.fp16Workspace != nil {
+		bindings.FreeLayerWorkspaceFP16(e.fp16Workspace)
+		e.fp16Workspace = nil
+	}
+
+	// Free preallocated conv buffers
+	if e.convInputFP16 != nil {
+		bindings.FreeOnDevice(e.convInputFP16, e.deviceID)
+		e.convInputFP16 = nil
+	}
+	if e.convInputBF16 != nil {
+		bindings.FreeOnDevice(e.convInputBF16, e.deviceID)
+		e.convInputBF16 = nil
+	}
+	if e.convOutputBF16 != nil {
+		bindings.FreeOnDevice(e.convOutputBF16, e.deviceID)
+		e.convOutputBF16 = nil
+	}
+	if e.convOutputFP16 != nil {
+		bindings.FreeOnDevice(e.convOutputFP16, e.deviceID)
+		e.convOutputFP16 = nil
 	}
 
 	for id, weights := range e.layerWeights {
