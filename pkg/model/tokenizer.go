@@ -252,19 +252,99 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+// gpt2ByteToUnicode returns the GPT-2 byte-to-unicode mapping.
+// In GPT-2 tokenizers, each byte value maps to a unique Unicode character.
+// Printable ASCII bytes map to themselves; control chars and extended bytes
+// are shifted to the Unicode range starting at 0x100.
+func gpt2ByteToUnicode() map[byte]rune {
+	m := make(map[byte]rune)
+	n := 0
+	// Printable ranges that map to themselves
+	for b := byte('!'); b <= '~'; b++ {
+		m[b] = rune(b)
+		n++
+	}
+	for b := byte(0xA1); b <= 0xAC; b++ {
+		m[b] = rune(b)
+		n++
+	}
+	for b := byte(0xAE); b <= 0xFF; b++ {
+		m[b] = rune(b)
+		n++
+	}
+	// All other bytes (control chars, etc.) mapped to 0x100+
+	offset := 0
+	for b := 0; b < 256; b++ {
+		if _, ok := m[byte(b)]; !ok {
+			m[byte(b)] = rune(256 + offset)
+			offset++
+		}
+	}
+	return m
+}
+
+var byteToUnicodeMap = gpt2ByteToUnicode()
+var unicodeToByteMap = func() map[rune]byte {
+	m := make(map[rune]byte)
+	for b, r := range byteToUnicodeMap {
+		m[r] = b
+	}
+	return m
+}()
+
+// gpt2UnicodeToBytes converts GPT-2 unicode representation back to raw bytes.
+func gpt2UnicodeToBytes(text string) string {
+	var b []byte
+	for _, r := range text {
+		if byteVal, ok := unicodeToByteMap[r]; ok {
+			b = append(b, byteVal)
+		} else {
+			// Not a GPT-2 encoded char, write as UTF-8
+			buf := make([]byte, 4)
+			n := utf8.EncodeRune(buf, r)
+			b = append(b, buf[:n]...)
+		}
+	}
+	return string(b)
+}
+
+// bytesToGPT2Unicode converts raw bytes to GPT-2 unicode representation.
+// This is needed because GPT-2 vocabs store tokens using this encoding
+// (e.g., '\n' is stored as 'Ċ', ' ' is stored as 'Ġ').
+func bytesToGPT2Unicode(text string) string {
+	var b strings.Builder
+	for i := 0; i < len(text); i++ {
+		b.WriteRune(byteToUnicodeMap[text[i]])
+	}
+	return b.String()
+}
+
 // preTokenize splits text into preliminary tokens (words).
 func (t *Tokenizer) preTokenize(text string) []string {
+	// For GPT-2 style tokenizers, convert all bytes to GPT-2 unicode first.
+	// This ensures that control chars like \n become Ċ, \t becomes ĉ, etc.
+	if t.spaceMarker == "Ġ" {
+		text = bytesToGPT2Unicode(text)
+	}
+
 	var words []string
 	var current strings.Builder
 
 	for _, r := range text {
-		if r == ' ' {
+		if t.spaceMarker == "Ġ" && r == 'Ġ' {
+			// GPT-2 style: Ġ is the space marker (already converted)
 			if current.Len() > 0 {
 				words = append(words, current.String())
 				current.Reset()
 			}
-			// Use the detected space marker (Ġ for GPT-2, ▁ for SentencePiece)
-			current.WriteString(t.spaceMarker)
+			current.WriteRune('Ġ')
+		} else if t.spaceMarker == "▁" && r == ' ' {
+			// SentencePiece style: space → ▁
+			if current.Len() > 0 {
+				words = append(words, current.String())
+				current.Reset()
+			}
+			current.WriteString("▁")
 		} else {
 			current.WriteRune(r)
 		}
@@ -388,6 +468,12 @@ func (t *Tokenizer) Decode(tokens []int) (string, error) {
 	}
 
 	text := result.String()
+
+	// For GPT-2 style tokenizers, convert GPT-2 unicode back to bytes
+	if t.spaceMarker == "Ġ" {
+		text = gpt2UnicodeToBytes(text)
+	}
+
 	// Trim leading space that might be from first token
 	text = strings.TrimPrefix(text, " ")
 
