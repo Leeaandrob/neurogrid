@@ -219,6 +219,7 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 	log.Printf("All %d layers loaded to GPU", e.config.NumLayers)
 
 	// Build full-model decode context for fast single-call inference
+	log.Printf("Building decode context (ModelType=%q, NumLayers=%d)", e.config.ModelType, e.config.NumLayers)
 	if err := gpu.LayerExecutor.BuildDecodeContext(); err != nil {
 		log.Printf("Warning: Could not build decode context (will use per-layer path): %v", err)
 	} else {
