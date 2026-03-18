@@ -45,6 +45,16 @@ int cublas_init() {
     return 0;
 }
 
+// Set CUDA stream for cuBLAS (needed for CUDA Graph capture)
+extern "C" int cublas_set_stream(void* stream) {
+    if (g_cublas_handle == nullptr) {
+        int ret = cublas_init();
+        if (ret != 0) return ret;
+    }
+    CUBLAS_CHECK(cublasSetStream(g_cublas_handle, (cudaStream_t)stream));
+    return 0;
+}
+
 void cublas_shutdown() {
     if (g_cublas_handle != nullptr) {
         cublasDestroy(g_cublas_handle);
