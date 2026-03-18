@@ -311,6 +311,14 @@ extern "C" int cuda_decode_step(
 // + 1 output copy (logits float32 array).
 // The hidden state from the previous step stays in hidden_a/hidden_b.
 
+// Set hidden state from another GPU buffer (GPU→GPU, zero-copy)
+extern "C" int cuda_decode_set_hidden_from_gpu(void* ctx_ptr, const void* d_hidden) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    CUDA_CHECK(cudaMemcpy(ctx->hidden_a, d_hidden,
+        ctx->hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+    return 0;
+}
+
 // Set initial hidden state from host (called once for first token after prefill)
 extern "C" int cuda_decode_set_hidden(void* ctx_ptr, const void* h_hidden) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;

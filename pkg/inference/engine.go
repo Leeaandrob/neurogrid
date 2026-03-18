@@ -74,6 +74,7 @@ type FullDecoder interface {
 // GPUResidentDecoder keeps hidden state on GPU between tokens (zero-copy decode).
 type GPUResidentDecoder interface {
 	SetHiddenGPU(hidden []byte) error
+	SetHiddenFromGPU(gpuPtr unsafe.Pointer) error
 	DecodeStepGPUResident(position int) error
 	GetHiddenGPUPtr() unsafe.Pointer
 	GetHiddenGPU(hidden []byte) error
@@ -82,6 +83,11 @@ type GPUResidentDecoder interface {
 // GPULMHeadForwarder applies LM head from a GPU pointer (avoids GPU→Host→GPU copy).
 type GPULMHeadForwarder interface {
 	ApplyLMHeadFromGPU(hiddenGPUPtr unsafe.Pointer) ([]float32, error)
+}
+
+// GPUEmbeddingLookup looks up token embedding directly on GPU.
+type GPUEmbeddingLookup interface {
+	EmbedTokenGPUPtr(tokenID int) (unsafe.Pointer, error)
 }
 
 // EngineConfig holds configuration for the inference engine.
@@ -483,15 +489,30 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		}
 
 		// Get embedding for next token and prepare for next step
-		hidden, err = e.embedToken(nextToken)
-		if err != nil {
-			return nil, fmt.Errorf("embed token failed: %w", err)
-		}
-
-		// For GPU-resident path: upload new embedding to GPU
 		if hasGPUDecoder {
-			if err := gpuDecoder.SetHiddenGPU(hidden); err != nil {
-				return nil, fmt.Errorf("set hidden GPU failed: %w", err)
+			// GPU-resident: use GPU→GPU embedding copy (zero host copy)
+			if embedLookup, ok := gpuInf.(GPUEmbeddingLookup); ok {
+				embPtr, embErr := embedLookup.EmbedTokenGPUPtr(nextToken)
+				if embErr != nil {
+					return nil, fmt.Errorf("GPU embed token failed: %w", embErr)
+				}
+				if err := gpuDecoder.SetHiddenFromGPU(embPtr); err != nil {
+					return nil, fmt.Errorf("set hidden from GPU failed: %w", err)
+				}
+			} else {
+				// Fallback: host copy
+				hidden, err = e.embedToken(nextToken)
+				if err != nil {
+					return nil, fmt.Errorf("embed token failed: %w", err)
+				}
+				if err := gpuDecoder.SetHiddenGPU(hidden); err != nil {
+					return nil, fmt.Errorf("set hidden GPU failed: %w", err)
+				}
+			}
+		} else {
+			hidden, err = e.embedToken(nextToken)
+			if err != nil {
+				return nil, fmt.Errorf("embed token failed: %w", err)
 			}
 		}
 	}

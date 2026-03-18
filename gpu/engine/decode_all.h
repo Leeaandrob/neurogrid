@@ -19,6 +19,7 @@ int cuda_decode_step(void* ctx, void* h_output, const void* h_input, int positio
 
 // GPU-resident decode: hidden stays on GPU between tokens
 int cuda_decode_set_hidden(void* ctx, const void* h_hidden);
+int cuda_decode_set_hidden_from_gpu(void* ctx, const void* d_hidden);
 int cuda_decode_get_hidden(void* ctx, void* h_hidden);
 int cuda_decode_step_gpu(void* ctx, int position);
 void* cuda_decode_get_hidden_gpu_ptr(void* ctx);

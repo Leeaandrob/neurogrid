@@ -466,6 +466,14 @@ func (e *CUDALayerExecutor) DecodeStepGPUResident(position int) error {
 	return bindings.DecodeStepGPU(e.decodeCtx, position)
 }
 
+// SetHiddenFromGPU copies hidden from another GPU buffer (zero-copy).
+func (e *CUDALayerExecutor) SetHiddenFromGPU(gpuPtr unsafe.Pointer) error {
+	if e.decodeCtx == nil {
+		return fmt.Errorf("decode context not initialized")
+	}
+	return bindings.DecodeSetHiddenFromGPU(e.decodeCtx, gpuPtr)
+}
+
 // SetHiddenGPU copies hidden state from host to GPU decode context.
 func (e *CUDALayerExecutor) SetHiddenGPU(hidden []byte) error {
 	if e.decodeCtx == nil {

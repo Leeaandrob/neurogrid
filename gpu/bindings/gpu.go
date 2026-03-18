@@ -973,6 +973,15 @@ func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {
 	return nil
 }
 
+// DecodeSetHiddenFromGPU copies hidden from another GPU buffer (GPU→GPU, zero-copy).
+func DecodeSetHiddenFromGPU(ctx *DecodeContext, gpuPtr unsafe.Pointer) error {
+	result := C.cuda_decode_set_hidden_from_gpu(ctx.ptr, gpuPtr)
+	if result != 0 {
+		return fmt.Errorf("decode set hidden from GPU failed: %d", result)
+	}
+	return nil
+}
+
 // DecodeSetHidden copies initial hidden state from host to GPU.
 func DecodeSetHidden(ctx *DecodeContext, hidden []byte) error {
 	result := C.cuda_decode_set_hidden(ctx.ptr, unsafe.Pointer(&hidden[0]))

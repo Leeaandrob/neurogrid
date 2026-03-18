@@ -401,6 +401,7 @@ void cuda_set_decode_layer(void* ctx, int layer_id, int layer_type, void* weight
 void cuda_set_decode_workspace(void* ctx, void* workspace);
 int cuda_decode_step(void* ctx, void* h_output, const void* h_input, int position);
 int cuda_decode_set_hidden(void* ctx, const void* h_hidden);
+int cuda_decode_set_hidden_from_gpu(void* ctx, const void* d_hidden);
 int cuda_decode_get_hidden(void* ctx, void* h_hidden);
 int cuda_decode_step_gpu(void* ctx, int position);
 void* cuda_decode_get_hidden_gpu_ptr(void* ctx);

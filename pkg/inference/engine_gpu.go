@@ -278,6 +278,14 @@ func (g *GPUComponents) ApplyLMHeadGPU(hidden []byte) ([]float32, error) {
 	return g.LMHead.Forward(hidden)
 }
 
+// EmbedTokenGPUPtr returns a GPU pointer to the token embedding (no host copy).
+func (g *GPUComponents) EmbedTokenGPUPtr(tokenID int) (unsafe.Pointer, error) {
+	if g.Embeddings == nil {
+		return nil, fmt.Errorf("GPU embeddings not initialized")
+	}
+	return g.Embeddings.Lookup(tokenID)
+}
+
 // ApplyLMHeadFromGPU applies LM head from GPU pointer (zero-copy for GPU-resident decode).
 func (g *GPUComponents) ApplyLMHeadFromGPU(hiddenGPUPtr unsafe.Pointer) ([]float32, error) {
 	if g.LMHead == nil {
