@@ -586,6 +586,34 @@ func LayerForward(output, input *types.Tensor, weights *LayerWeights, cache *KVC
 }
 
 // =============================================================================
+// FP16-Pure Layer (Stubs) — for LFM2 attention layers
+// =============================================================================
+
+// LayerWeightsFP16 holds FP16-pure weights (stub).
+type LayerWeightsFP16 struct {
+	ptr unsafe.Pointer
+}
+
+// CreateLayerWeightsFromHostFP16 creates FP16-pure layer weights (stub).
+func CreateLayerWeightsFromHostFP16(
+	qProj, kProj, vProj, oProj []byte,
+	gateProj, upProj, downProj []byte,
+	attnNorm, ffnNorm []byte,
+	config *types.LlamaConfig,
+) (*LayerWeightsFP16, error) {
+	return nil, ErrNotImplemented
+}
+
+// FreeLayerWeightsFP16 frees FP16-pure layer weights (stub).
+func FreeLayerWeightsFP16(w *LayerWeightsFP16) {}
+
+// LayerForwardFP16 executes FP16-pure layer forward (stub).
+func LayerForwardFP16(output, input *types.Tensor, weights *LayerWeightsFP16, cache *KVCache,
+	positions []int32, config *types.LlamaConfig, ropeStyle int) error {
+	return ErrNotImplemented
+}
+
+// =============================================================================
 // LFM2 / BF16 Operations (Stubs)
 // =============================================================================
 

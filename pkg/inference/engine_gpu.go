@@ -139,7 +139,7 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 				AttnNorm: attnNorm, FFNNorm: ffnNorm,
 			}
 
-			if err := gpu.LayerExecutor.LoadLayer(layerID, weights); err != nil {
+			if err := gpu.LayerExecutor.LoadLayerFP16(layerID, weights); err != nil {
 				gpu.Close()
 				return nil, fmt.Errorf("GPU attn layer %d: %w", layerID, err)
 			}

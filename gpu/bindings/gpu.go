@@ -747,6 +747,88 @@ func LayerForward(output, input *types.Tensor, weights *LayerWeights, cache *KVC
 }
 
 // =============================================================================
+// FP16-Pure Layer (no INT8 quantization) — for LFM2 attention layers
+// =============================================================================
+
+// LayerWeightsFP16 holds FP16-pure weights (no INT8 quantization).
+type LayerWeightsFP16 struct {
+	ptr unsafe.Pointer
+}
+
+// CreateLayerWeightsFromHostFP16 creates FP16-pure layer weights (no INT8 quantization).
+func CreateLayerWeightsFromHostFP16(
+	qProj, kProj, vProj, oProj []byte,
+	gateProj, upProj, downProj []byte,
+	attnNorm, ffnNorm []byte,
+	config *types.LlamaConfig,
+) (*LayerWeightsFP16, error) {
+	var ptr unsafe.Pointer
+	result := C.cuda_create_layer_weights_from_host_fp16(
+		&ptr,
+		unsafe.Pointer(&qProj[0]), unsafe.Pointer(&kProj[0]),
+		unsafe.Pointer(&vProj[0]), unsafe.Pointer(&oProj[0]),
+		unsafe.Pointer(&gateProj[0]), unsafe.Pointer(&upProj[0]),
+		unsafe.Pointer(&downProj[0]),
+		unsafe.Pointer(&attnNorm[0]), unsafe.Pointer(&ffnNorm[0]),
+		C.int(config.HiddenSize), C.int(config.IntermediateSize),
+		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
+	)
+	if result != 0 {
+		return nil, fmt.Errorf("failed to create FP16 layer weights: %d", result)
+	}
+	return &LayerWeightsFP16{ptr: ptr}, nil
+}
+
+// FreeLayerWeightsFP16 frees FP16-pure layer weights.
+func FreeLayerWeightsFP16(w *LayerWeightsFP16) {
+	if w == nil || w.ptr == nil {
+		return
+	}
+	C.cuda_free_layer_weights_fp16(w.ptr)
+	w.ptr = nil
+}
+
+// LayerForwardFP16 executes a FP16-pure transformer layer forward pass.
+func LayerForwardFP16(output, input *types.Tensor, weights *LayerWeightsFP16, cache *KVCache,
+	positions []int32, config *types.LlamaConfig, ropeStyle int) error {
+	if output == nil || input == nil || weights == nil || cache == nil {
+		return errors.New("nil argument")
+	}
+
+	batch := input.Shape[0]
+	seqLen := input.Shape[1]
+
+	var dPositions unsafe.Pointer
+	posSize := C.size_t(len(positions) * 4)
+	if C.cuda_malloc(&dPositions, posSize) != 0 {
+		return errors.New("failed to allocate positions on GPU")
+	}
+	defer C.cuda_free(dPositions)
+
+	if C.cudaMemcpy(dPositions, unsafe.Pointer(&positions[0]), posSize, C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy positions to GPU")
+	}
+
+	ropeTheta := config.RopeTheta
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0
+	}
+
+	result := C.cuda_layer_forward_fp16(
+		output.Data, input.Data, weights.ptr, cache.ptr,
+		(*C.int)(dPositions),
+		C.int(batch), C.int(seqLen),
+		C.int(config.HiddenSize), C.int(config.IntermediateSize),
+		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
+		C.float(config.RMSNormEps), C.float(ropeTheta), C.int(ropeStyle),
+	)
+	if result != 0 {
+		return fmt.Errorf("FP16 layer forward failed: %d", result)
+	}
+	return nil
+}
+
+// =============================================================================
 // LFM2 / BF16 Operations
 // =============================================================================
 

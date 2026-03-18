@@ -34,6 +34,9 @@ type CUDALayerExecutor struct {
 	convLayerWeights map[int]*bindings.ConvLayerWeights
 	convStates       map[int]unsafe.Pointer // GPU conv state pointers
 
+	// FP16-pure attention layers (LFM2 — no INT8 quantization)
+	fp16LayerWeights map[int]*bindings.LayerWeightsFP16
+
 	// Preallocated GPU buffers for Forward() - avoids per-call cudaMalloc/cudaFree.
 	// These buffers are sized for single-token inference (hidden_size * 2 bytes for FP16).
 	// For batch inference or prefill, the executor falls back to dynamic allocation.
@@ -76,6 +79,7 @@ func NewCUDALayerExecutor(config *types.LlamaConfig, deviceID int) (*CUDALayerEx
 		kvCaches:         make(map[int]*bindings.KVCache),
 		convLayerWeights: make(map[int]*bindings.ConvLayerWeights),
 		convStates:       make(map[int]unsafe.Pointer),
+		fp16LayerWeights: make(map[int]*bindings.LayerWeightsFP16),
 		config:       config,
 		deviceID:     deviceID,
 		inputGPU:     inputGPU,
@@ -149,6 +153,43 @@ func (e *CUDALayerExecutor) LoadLayer(layerID int, weights *TransformerLayerWeig
 	return nil
 }
 
+// LoadLayerFP16 uploads attention layer weights as FP16 (no INT8 quantization).
+// Used for LFM2 where INT8 quantization destroys precision.
+func (e *CUDALayerExecutor) LoadLayerFP16(layerID int, weights *TransformerLayerWeights) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if existing, ok := e.fp16LayerWeights[layerID]; ok {
+		bindings.FreeLayerWeightsFP16(existing)
+	}
+
+	gpuWeights, err := bindings.CreateLayerWeightsFromHostFP16(
+		weights.QProj, weights.KProj, weights.VProj, weights.OProj,
+		weights.GateProj, weights.UpProj, weights.DownProj,
+		weights.AttnNorm, weights.FFNNorm,
+		e.config,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upload FP16 layer %d: %w", layerID, err)
+	}
+	e.fp16LayerWeights[layerID] = gpuWeights
+
+	// Create KV cache
+	if _, ok := e.kvCaches[layerID]; !ok {
+		maxSeqLen := 2048
+		if e.config.MaxSeqLen > 0 {
+			maxSeqLen = e.config.MaxSeqLen
+		}
+		cache, err := bindings.NewKVCache(1, e.config.NumKVHeads, e.config.HeadDim, maxSeqLen)
+		if err != nil {
+			return fmt.Errorf("failed to create KV cache for layer %d: %w", layerID, err)
+		}
+		e.kvCaches[layerID] = cache
+	}
+
+	return nil
+}
+
 // Forward executes the transformer layer forward pass on GPU.
 // Returns: output hidden state, K cache data, V cache data
 //
@@ -161,8 +202,14 @@ func (e *CUDALayerExecutor) Forward(
 ) (output []byte, k []byte, v []byte, err error) {
 	e.mu.RLock()
 	weights, ok := e.layerWeights[layerID]
+	fp16Weights, fp16Ok := e.fp16LayerWeights[layerID]
 	cache := e.kvCaches[layerID]
 	e.mu.RUnlock()
+
+	// Use FP16-pure path if available (LFM2 attention layers)
+	if fp16Ok && fp16Weights != nil {
+		return e.forwardFP16(ctx, layerID, hidden, position, fp16Weights, cache)
+	}
 
 	if !ok {
 		return nil, nil, nil, fmt.Errorf("layer %d not loaded", layerID)
@@ -283,6 +330,49 @@ func (e *CUDALayerExecutor) NumLayers() int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return len(e.layerWeights)
+}
+
+func (e *CUDALayerExecutor) forwardFP16(ctx context.Context, layerID int, hidden []byte, position int,
+	weights *bindings.LayerWeightsFP16, cache *bindings.KVCache) ([]byte, []byte, []byte, error) {
+
+	hiddenSize := e.config.HiddenSize
+
+	inputTensor := &types.Tensor{
+		Shape:  []int{1, 1, hiddenSize},
+		Dtype:  types.DtypeFP16,
+		Device: e.deviceID,
+		Data:   e.inputGPU,
+	}
+
+	if err := bindings.CopyToDeviceRaw(e.inputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
+		return nil, nil, nil, fmt.Errorf("copy input: %w", err)
+	}
+
+	outputTensor := &types.Tensor{
+		Shape:  []int{1, 1, hiddenSize},
+		Dtype:  types.DtypeFP16,
+		Device: e.deviceID,
+		Data:   e.outputGPU,
+	}
+
+	positions := []int32{int32(position)}
+
+	// Use interleaved RoPE for LFM2
+	ropeStyle := 1 // RoPEStyleInterleaved
+	if err := bindings.LayerForwardFP16(outputTensor, inputTensor, weights, cache, positions, e.config, ropeStyle); err != nil {
+		return nil, nil, nil, fmt.Errorf("FP16 layer forward failed: %w", err)
+	}
+
+	output := make([]byte, len(hidden))
+	if err := bindings.CopyFromDeviceRaw(getBytePointer(output), e.outputGPU, uint64(len(output))); err != nil {
+		return nil, nil, nil, fmt.Errorf("copy output: %w", err)
+	}
+
+	kvSize := e.config.NumKVHeads * e.config.HeadDim * 2
+	k := make([]byte, kvSize)
+	v := make([]byte, kvSize)
+
+	return output, k, v, nil
 }
 
 // LoadConvLayer uploads conv layer weights to GPU.
@@ -415,6 +505,11 @@ func (e *CUDALayerExecutor) Close() error {
 	for id, cache := range e.kvCaches {
 		bindings.FreeKVCache(cache)
 		delete(e.kvCaches, id)
+	}
+
+	for id, w := range e.fp16LayerWeights {
+		bindings.FreeLayerWeightsFP16(w)
+		delete(e.fp16LayerWeights, id)
 	}
 
 	for id, weights := range e.convLayerWeights {

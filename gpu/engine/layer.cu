@@ -601,3 +601,189 @@ cleanup:
 
     return result;
 }
+
+// ============================================================================
+// FP16-Pure Layer (no INT8 quantization) — for LFM2 attention layers
+// ============================================================================
+
+struct LayerWeightsFP16 {
+    half* attn_norm;
+    half* ffn_norm;
+    half* q_proj;           // FP16 [hidden_size, hidden_size]
+    half* k_proj;           // FP16 [kv_dim, hidden_size]
+    half* v_proj;           // FP16 [kv_dim, hidden_size]
+    half* o_proj;           // FP16 [hidden_size, hidden_size]
+    half* gate_proj;        // FP16 [intermediate_size, hidden_size]
+    half* up_proj;          // FP16 [intermediate_size, hidden_size]
+    half* down_proj;        // FP16 [hidden_size, intermediate_size]
+    int hidden_size;
+    int intermediate_size;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+};
+
+extern "C" void cuda_free_layer_weights_fp16(void* weights) {
+    if (!weights) return;
+    LayerWeightsFP16* w = (LayerWeightsFP16*)weights;
+    if (w->attn_norm) cudaFree(w->attn_norm);
+    if (w->ffn_norm) cudaFree(w->ffn_norm);
+    if (w->q_proj) cudaFree(w->q_proj);
+    if (w->k_proj) cudaFree(w->k_proj);
+    if (w->v_proj) cudaFree(w->v_proj);
+    if (w->o_proj) cudaFree(w->o_proj);
+    if (w->gate_proj) cudaFree(w->gate_proj);
+    if (w->up_proj) cudaFree(w->up_proj);
+    if (w->down_proj) cudaFree(w->down_proj);
+    free(w);
+}
+
+// Helper: Upload FP16 weight matrix (no quantization)
+static int upload_fp16_weight(half** d_weight, const void* h_weight, int rows, int cols) {
+    size_t size = (size_t)rows * cols * sizeof(half);
+    CUDA_CHECK(cudaMalloc(d_weight, size));
+    CUDA_CHECK(cudaMemcpy(*d_weight, h_weight, size, cudaMemcpyHostToDevice));
+    return 0;
+}
+
+extern "C" int cuda_create_layer_weights_from_host_fp16(
+    void** weights,
+    const void* h_q_proj, const void* h_k_proj, const void* h_v_proj, const void* h_o_proj,
+    const void* h_gate_proj, const void* h_up_proj, const void* h_down_proj,
+    const void* h_attn_norm, const void* h_ffn_norm,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim
+) {
+    LayerWeightsFP16* w = (LayerWeightsFP16*)calloc(1, sizeof(LayerWeightsFP16));
+    if (!w) return -1;
+
+    w->hidden_size = hidden_size;
+    w->intermediate_size = intermediate_size;
+    w->num_heads = num_heads;
+    w->num_kv_heads = num_kv_heads;
+    w->head_dim = head_dim;
+
+    int kv_dim = num_kv_heads * head_dim;
+    int result;
+
+    result = upload_fp16_norm(&w->attn_norm, h_attn_norm, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_fp16_norm(&w->ffn_norm, h_ffn_norm, hidden_size);
+    if (result != 0) goto cleanup;
+
+    result = upload_fp16_weight(&w->q_proj, h_q_proj, hidden_size, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_fp16_weight(&w->k_proj, h_k_proj, kv_dim, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_fp16_weight(&w->v_proj, h_v_proj, kv_dim, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_fp16_weight(&w->o_proj, h_o_proj, hidden_size, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_fp16_weight(&w->gate_proj, h_gate_proj, intermediate_size, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_fp16_weight(&w->up_proj, h_up_proj, intermediate_size, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_fp16_weight(&w->down_proj, h_down_proj, hidden_size, intermediate_size);
+    if (result != 0) goto cleanup;
+
+    *weights = w;
+    return 0;
+
+cleanup:
+    cuda_free_layer_weights_fp16(w);
+    return -1;
+}
+
+extern "C" int cuda_layer_forward_fp16(
+    void* output, const void* input, const void* weights, void* kv_cache,
+    const int* positions, int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style
+) {
+    LayerWeightsFP16* w = (LayerWeightsFP16*)weights;
+    int num_tokens = batch_size * seq_len;
+    int kv_dim = num_kv_heads * head_dim;
+
+    half *normed, *q, *k, *v, *attn_out, *residual, *gate_buf, *up_buf;
+    CUDA_CHECK(cudaMalloc(&normed, num_tokens * hidden_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&q, num_tokens * hidden_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&k, num_tokens * kv_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&v, num_tokens * kv_dim * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&attn_out, num_tokens * hidden_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&residual, num_tokens * hidden_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&gate_buf, num_tokens * intermediate_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&up_buf, num_tokens * intermediate_size * sizeof(half)));
+
+    int result;
+
+    // Save residual
+    CUDA_CHECK(cudaMemcpy(residual, input, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+
+    // 1. Attention RMSNorm
+    result = cuda_rmsnorm(normed, input, w->attn_norm, num_tokens, hidden_size, rms_norm_eps);
+    if (result != 0) goto cleanup;
+
+    // 2. Q, K, V projections (FP16 GEMM — no INT8 quantization)
+    result = cuda_gemm_fp16(q, normed, w->q_proj, num_tokens, hidden_size, hidden_size, false, true);
+    if (result != 0) goto cleanup;
+    result = cuda_gemm_fp16(k, normed, w->k_proj, num_tokens, hidden_size, kv_dim, false, true);
+    if (result != 0) goto cleanup;
+    result = cuda_gemm_fp16(v, normed, w->v_proj, num_tokens, hidden_size, kv_dim, false, true);
+    if (result != 0) goto cleanup;
+
+    // 3. RoPE with configurable style and theta
+    result = cuda_rope_with_theta(q, q, positions, batch_size, seq_len, num_heads, head_dim, rope_style, rope_theta);
+    if (result != 0) goto cleanup;
+    result = cuda_rope_with_theta(k, k, positions, batch_size, seq_len, num_kv_heads, head_dim, rope_style, rope_theta);
+    if (result != 0) goto cleanup;
+
+    // 4. Attention
+    if (seq_len == 1 && kv_cache != nullptr) {
+        int position;
+        CUDA_CHECK(cudaMemcpy(&position, positions, sizeof(int), cudaMemcpyDeviceToHost));
+        result = cuda_attention_with_kvcache(attn_out, q, k, v, kv_cache,
+            batch_size, num_heads, num_kv_heads, head_dim, position);
+    } else {
+        result = cuda_basic_attention_gqa(attn_out, q, k, v,
+            batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
+    }
+    if (result != 0) goto cleanup;
+
+    // 5. O projection (FP16)
+    result = cuda_gemm_fp16(normed, attn_out, w->o_proj, num_tokens, hidden_size, hidden_size, false, true);
+    if (result != 0) goto cleanup;
+
+    // 6. Residual add
+    result = cuda_add(normed, normed, residual, num_tokens * hidden_size);
+    if (result != 0) goto cleanup;
+
+    // Save new residual
+    CUDA_CHECK(cudaMemcpy(residual, normed, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+
+    // 7. FFN RMSNorm
+    result = cuda_rmsnorm(normed, normed, w->ffn_norm, num_tokens, hidden_size, rms_norm_eps);
+    if (result != 0) goto cleanup;
+
+    // 8. SwiGLU FFN (FP16 GEMM)
+    result = cuda_gemm_fp16(gate_buf, normed, w->gate_proj, num_tokens, hidden_size, intermediate_size, false, true);
+    if (result != 0) goto cleanup;
+    result = cuda_gemm_fp16(up_buf, normed, w->up_proj, num_tokens, hidden_size, intermediate_size, false, true);
+    if (result != 0) goto cleanup;
+
+    // SiLU(gate) * up
+    result = cuda_silu(gate_buf, gate_buf, num_tokens * intermediate_size);
+    if (result != 0) goto cleanup;
+    result = cuda_mul(gate_buf, gate_buf, up_buf, num_tokens * intermediate_size);
+    if (result != 0) goto cleanup;
+
+    // Down projection
+    result = cuda_gemm_fp16(normed, gate_buf, w->down_proj, num_tokens, intermediate_size, hidden_size, false, true);
+    if (result != 0) goto cleanup;
+
+    // 9. Final residual add
+    result = cuda_add(output, normed, residual, num_tokens * hidden_size);
+
+cleanup:
+    cudaFree(normed); cudaFree(q); cudaFree(k); cudaFree(v);
+    cudaFree(attn_out); cudaFree(residual); cudaFree(gate_buf); cudaFree(up_buf);
+    return result;
+}
