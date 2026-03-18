@@ -67,6 +67,21 @@ int cuda_rope_with_theta(
     float rope_theta  // Base frequency (10000.0 for Llama 2, 1000000.0 for Mistral Nemo)
 );
 
+// Fused SiLU + Mul (SwiGLU): output = SiLU(gate) * up
+int cuda_silu_mul(void* output, const void* gate, const void* up, size_t num_elements);
+
+// Fused Residual Add + RMSNorm: normed = RMSNorm(input + residual, weight)
+int cuda_add_rmsnorm(
+    void* normed_output,
+    void* residual_output,
+    const void* input,
+    const void* residual_input,
+    const void* weight,
+    int num_tokens,
+    int hidden_dim,
+    float eps
+);
+
 // Softmax along last dimension
 int cuda_softmax(void* output, const void* input, int num_rows, int row_size);
 

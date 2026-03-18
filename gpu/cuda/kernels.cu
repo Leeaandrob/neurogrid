@@ -150,6 +150,116 @@ extern "C" int cuda_silu(void* output, const void* input, size_t num_elements) {
 }
 
 // ============================================================================
+// Fused SiLU + Mul (SwiGLU) Kernel
+// ============================================================================
+// Computes: output = SiLU(gate) * up = (gate * sigmoid(gate)) * up
+// Fuses 3 memory accesses (SiLU write + Mul read gate + Mul read up) into 1 pass
+
+__global__ void silu_mul_kernel(
+    half* __restrict__ output,
+    const half* __restrict__ gate,
+    const half* __restrict__ up,
+    size_t n
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float g = __half2float(gate[idx]);
+        float u = __half2float(up[idx]);
+        float sigmoid_g = 1.0f / (1.0f + expf(-g));
+        output[idx] = __float2half(g * sigmoid_g * u);
+    }
+}
+
+extern "C" int cuda_silu_mul(void* output, const void* gate, const void* up, size_t num_elements) {
+    int block_size = 256;
+    int num_blocks = (num_elements + block_size - 1) / block_size;
+
+    silu_mul_kernel<<<num_blocks, block_size>>>(
+        (half*)output,
+        (const half*)gate,
+        (const half*)up,
+        num_elements
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// ============================================================================
+// Fused Residual Add + RMSNorm Kernel
+// ============================================================================
+// Computes: normed = RMSNorm(x + residual, weight)
+// Fuses residual add + RMSNorm into single kernel (saves 1 memory pass)
+
+__global__ void add_rmsnorm_kernel(
+    half* __restrict__ normed_output,
+    half* __restrict__ residual_output,  // also writes the sum back
+    const half* __restrict__ input,
+    const half* __restrict__ residual_input,
+    const half* __restrict__ weight,
+    int hidden_dim,
+    float eps
+) {
+    int token_idx = blockIdx.x;
+    int tid = threadIdx.x;
+
+    const half* x = input + token_idx * hidden_dim;
+    const half* res = residual_input + token_idx * hidden_dim;
+    half* sum_out = residual_output + token_idx * hidden_dim;
+    half* y = normed_output + token_idx * hidden_dim;
+
+    // Step 1: Add + compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = __half2float(x[i]) + __half2float(res[i]);
+        sum_out[i] = __float2half(val);  // write sum
+        sum_sq += val * val;
+    }
+
+    sum_sq = block_reduce_sum(sum_sq);
+
+    __shared__ float s_rsqrt;
+    if (tid == 0) {
+        s_rsqrt = rsqrtf(sum_sq / float(hidden_dim) + eps);
+    }
+    __syncthreads();
+
+    // Step 2: Normalize and scale
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = __half2float(sum_out[i]);
+        float w = __half2float(weight[i]);
+        y[i] = __float2half(val * s_rsqrt * w);
+    }
+}
+
+extern "C" int cuda_add_rmsnorm(
+    void* normed_output,
+    void* residual_output,
+    const void* input,
+    const void* residual_input,
+    const void* weight,
+    int num_tokens,
+    int hidden_dim,
+    float eps
+) {
+    int block_size = min(1024, hidden_dim);
+    block_size = ((block_size + 31) / 32) * 32;
+
+    add_rmsnorm_kernel<<<num_tokens, block_size>>>(
+        (half*)normed_output,
+        (half*)residual_output,
+        (const half*)input,
+        (const half*)residual_input,
+        (const half*)weight,
+        hidden_dim,
+        eps
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// ============================================================================
 // Add Kernel
 // ============================================================================
 // Computes: c = a + b (element-wise)

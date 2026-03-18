@@ -1027,15 +1027,10 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
     result = cuda_gemm_fp16(normed, attn_out, w->o_proj, num_tokens, hidden_size, hidden_size, false, true);
     if (result != 0) return result;
 
-    // 6. Residual add
-    result = cuda_add(normed, normed, residual, num_tokens * hidden_size);
-    if (result != 0) return result;
-
-    // Save new residual
-    CUDA_CHECK(cudaMemcpy(residual, normed, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
-
-    // 7. FFN RMSNorm
-    result = cuda_rmsnorm(normed, normed, w->ffn_norm, num_tokens, hidden_size, rms_norm_eps);
+    // 6+7. Fused: Residual Add + RMSNorm (saves 2 kernel launches + 1 memcpy)
+    // normed = RMSNorm(O_proj_out + residual), residual = O_proj_out + residual
+    result = cuda_add_rmsnorm(normed, residual, normed, residual, w->ffn_norm,
+                              num_tokens, hidden_size, rms_norm_eps);
     if (result != 0) return result;
 
     // 8. SwiGLU FFN (FP16 GEMM)
@@ -1044,10 +1039,8 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
     result = cuda_gemm_fp16(up_buf, normed, w->up_proj, num_tokens, hidden_size, intermediate_size, false, true);
     if (result != 0) return result;
 
-    // SiLU(gate) * up
-    result = cuda_silu(gate_buf, gate_buf, num_tokens * intermediate_size);
-    if (result != 0) return result;
-    result = cuda_mul(gate_buf, gate_buf, up_buf, num_tokens * intermediate_size);
+    // Fused SiLU(gate) * up (saves 1 kernel launch + 1 memory pass)
+    result = cuda_silu_mul(gate_buf, gate_buf, up_buf, num_tokens * intermediate_size);
     if (result != 0) return result;
 
     // Down projection
