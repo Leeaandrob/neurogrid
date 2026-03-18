@@ -5,6 +5,34 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-18
+
+### Added
+
+#### LFM2.5-1.2B-Thinking — First Non-Transformer Architecture
+- Hybrid conv+attention architecture (10 conv + 6 attention layers, interleaved)
+- BF16 CUDA kernels: RMSNorm, SiLU, Add, Mul, RoPE, GEMM (cublasGemmEx)
+- Depthwise causal conv1d kernel (prefill + decode with FP32 state)
+- LIV conv layer forward pass with FP16↔BF16 boundary conversion
+- FP16-pure attention forward (no INT8 quantization) with QK LayerNorm
+- Per-head RMSNorm on Q/K before RoPE (critical for accuracy)
+- ChatML template with `<think>` reasoning token support
+- GPT-2 byte-to-unicode encoding in BPE tokenizer
+- Golden test data validated against HuggingFace reference (100% match)
+
+#### Performance
+- LFM2 1.2B: ~210 tok/s on RTX 4090 (matches HuggingFace transformers)
+- First token matches golden reference: `<think>` (token 64400)
+
+### Fixed
+- GPT-2 tokenizer: byte-to-unicode mapping for control chars (\n → Ċ)
+- Byte overflow in GPT-2 mapping table (infinite loop crash)
+- SwiGLU intermediate_size: use 2/3 of block_ff_dim from config
+- LFM2 tensor naming: out_proj, feed_forward, operator_norm, embedding_norm
+- BF16/FP16 dtype boundary at conv↔attention layer transitions
+
+---
+
 ## [0.4.0] - 2026-03-18
 
 ### Added
