@@ -813,9 +813,21 @@ func getModelConfigFromPath(modelPath string) (scheduler.ModelConfig, error) {
 		dtype = cfg.TorchDtype
 	}
 
+	// LFM2 SwiGLU: intermediate_size in config.json is block_ff_dim,
+	// but actual tensor size is 2/3 of that (SwiGLU adjustment).
+	intermediateSize := cfg.IntermediateSize
+	if cfg.ModelType == "lfm2" {
+		// Use 2/3 of block_ff_dim, rounded to multiple_of
+		swiGLUSize := (intermediateSize * 2) / 3
+		multipleOf := 256
+		swiGLUSize = ((swiGLUSize + multipleOf - 1) / multipleOf) * multipleOf
+		log.Printf("LFM2 SwiGLU: adjusting intermediate_size %d → %d", intermediateSize, swiGLUSize)
+		intermediateSize = swiGLUSize
+	}
+
 	return scheduler.ModelConfig{
 		HiddenSize:       int64(cfg.HiddenSize),
-		IntermediateSize: int64(cfg.IntermediateSize),
+		IntermediateSize: int64(intermediateSize),
 		NumLayers:        cfg.NumHiddenLayers,
 		NumHeads:         cfg.NumAttentionHeads,
 		NumKVHeads:       cfg.NumKeyValueHeads,

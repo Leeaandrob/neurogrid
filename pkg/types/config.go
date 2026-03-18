@@ -168,7 +168,7 @@ func LFM2_1_2BThinkingConfig() *LlamaConfig {
 
 	return &LlamaConfig{
 		HiddenSize:       2048,
-		IntermediateSize: 12288,
+		IntermediateSize: 8192, // SwiGLU: 2/3 of block_ff_dim (12288)
 		NumLayers:        16,
 		NumHeads:         32,
 		NumKVHeads:       8,
