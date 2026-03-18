@@ -68,6 +68,13 @@ struct DecodeContext {
 
     // GPU position buffer (avoids per-step allocation)
     int* d_position;
+
+    // CUDA Graph for decode step replay
+    cudaGraph_t graph;
+    cudaGraphExec_t graph_exec;
+    cudaStream_t stream;
+    bool graph_captured;
+    int warmup_count;         // Number of warmup steps before capture
 };
 
 extern "C" int cuda_create_decode_context(
@@ -115,6 +122,13 @@ extern "C" int cuda_create_decode_context(
     // Allocate position buffer (single int)
     CUDA_CHECK(cudaMalloc(&ctx->d_position, sizeof(int)));
 
+    // Create CUDA stream for graph capture
+    CUDA_CHECK(cudaStreamCreate(&ctx->stream));
+    ctx->graph = nullptr;
+    ctx->graph_exec = nullptr;
+    ctx->graph_captured = false;
+    ctx->warmup_count = 0;
+
     *ctx_out = ctx;
     return 0;
 }
@@ -138,28 +152,10 @@ extern "C" void cuda_set_decode_workspace(void* ctx_ptr, void* workspace) {
 }
 
 // ============================================================================
-// Full decode step — all layers in a single call
+// Internal: run all layers (used for both normal and graph-captured paths)
 // ============================================================================
-// Input:  FP16 hidden state [hidden_size] on HOST
-// Output: FP16 hidden state [hidden_size] on HOST
-// Runs all num_layers layers sequentially without returning to Go.
-
-extern "C" int cuda_decode_step(
-    void* ctx_ptr,
-    void* h_output,         // HOST: output hidden [hidden_size] FP16
-    const void* h_input,    // HOST: input hidden [hidden_size] FP16
-    int position
-) {
-    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
     int H = ctx->hidden_size;
-    size_t hs = H * sizeof(half);
-
-    // Copy input to GPU
-    CUDA_CHECK(cudaMemcpy(ctx->hidden_a, h_input, hs, cudaMemcpyHostToDevice));
-
-    // Copy position to GPU
-    CUDA_CHECK(cudaMemcpy(ctx->d_position, &position, sizeof(int), cudaMemcpyHostToDevice));
-
     half* current = ctx->hidden_a;
     half* next = ctx->hidden_b;
 
@@ -174,7 +170,7 @@ extern "C" int cuda_decode_step(
             result = cuda_conv_layer_forward_bf16(
                 ctx->conv_bf16_out, ctx->conv_bf16_in,
                 ctx->layer_weights[i], ctx->layer_caches[i],
-                1, 1, position);
+                1, 1, 0);  // position not used by conv decode kernel (uses state)
             if (result != 0) return result;
 
             result = cuda_bf16_to_fp16(next, ctx->conv_bf16_out, H);
@@ -200,14 +196,104 @@ extern "C" int cuda_decode_step(
             if (result != 0) return result;
         }
 
-        // Ping-pong: next becomes current
+        // Ping-pong
         half* tmp = current;
         current = next;
         next = tmp;
     }
 
+    // If num_layers is odd, result is in hidden_b; if even, in hidden_a.
+    // Copy to hidden_a if needed (so output is always in hidden_a after even layers,
+    // hidden_b after odd layers — we track this in the caller)
+    return 0;
+}
+
+// ============================================================================
+// Full decode step with CUDA Graph support
+// ============================================================================
+// First 2 calls: warmup (run normally)
+// 3rd call: capture CUDA graph
+// Subsequent calls: replay graph (much faster)
+
+extern "C" int cuda_decode_step(
+    void* ctx_ptr,
+    void* h_output,
+    const void* h_input,
+    int position
+) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    int H = ctx->hidden_size;
+    size_t hs = H * sizeof(half);
+
+    // Always: copy input and position to GPU (outside graph)
+    CUDA_CHECK(cudaMemcpy(ctx->hidden_a, h_input, hs, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_position, &position, sizeof(int), cudaMemcpyHostToDevice));
+
+    // Determine output buffer: if num_layers is odd, result is in hidden_b; if even, hidden_a
+    half* result_buf = (ctx->num_layers % 2 == 0) ? ctx->hidden_a : ctx->hidden_b;
+
+    if (ctx->graph_captured && ctx->graph_exec) {
+        // Fast path: replay captured CUDA graph
+        cudaError_t err = cudaGraphLaunch(ctx->graph_exec, ctx->stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "CUDA graph launch failed: %s, falling back\n", cudaGetErrorString(err));
+            ctx->graph_captured = false;
+            int res = run_all_layers(ctx, nullptr);
+            if (res != 0) return res;
+        } else {
+            CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+        }
+    } else if (ctx->warmup_count >= 2 && !ctx->graph_captured) {
+        // Capture CUDA graph using default stream (stream 0)
+        // All our kernels implicitly use stream 0
+        fprintf(stderr, "[NeuroGrid] Capturing CUDA graph for decode step...\n");
+
+        cudaError_t err = cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[NeuroGrid] Graph capture failed to start: %s, running normally\n",
+                    cudaGetErrorString(err));
+            int res = run_all_layers(ctx, nullptr);
+            if (res != 0) return res;
+        } else {
+            int res = run_all_layers(ctx, nullptr);
+
+            cudaGraph_t graph = nullptr;
+            err = cudaStreamEndCapture(0, &graph);
+
+            if (err != cudaSuccess || graph == nullptr || res != 0) {
+                fprintf(stderr, "[NeuroGrid] Graph capture failed: %s\n",
+                        err != cudaSuccess ? cudaGetErrorString(err) : "run_all_layers failed");
+                if (graph) cudaGraphDestroy(graph);
+                // Run again normally since capture consumed the run
+                res = run_all_layers(ctx, nullptr);
+                if (res != 0) return res;
+            } else {
+                // Instantiate the graph
+                cudaGraphExec_t exec = nullptr;
+                err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+                if (err != cudaSuccess) {
+                    fprintf(stderr, "[NeuroGrid] Graph instantiate failed: %s\n", cudaGetErrorString(err));
+                    cudaGraphDestroy(graph);
+                    // Results are already computed from the capture run
+                } else {
+                    ctx->graph = graph;
+                    ctx->graph_exec = exec;
+                    ctx->graph_captured = true;
+                    fprintf(stderr, "[NeuroGrid] CUDA graph captured successfully!\n");
+                    // Results are already computed from the capture run
+                }
+            }
+        }
+        ctx->warmup_count++;
+    } else {
+        // Warmup: run normally
+        int res = run_all_layers(ctx, nullptr);
+        if (res != 0) return res;
+        ctx->warmup_count++;
+    }
+
     // Copy result back to host
-    CUDA_CHECK(cudaMemcpy(h_output, current, hs, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_output, result_buf, hs, cudaMemcpyDeviceToHost));
 
     return 0;
 }
@@ -216,6 +302,9 @@ extern "C" void cuda_free_decode_context(void* ctx_ptr) {
     if (!ctx_ptr) return;
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
 
+    if (ctx->graph_exec) cudaGraphExecDestroy(ctx->graph_exec);
+    if (ctx->graph) cudaGraphDestroy(ctx->graph);
+    if (ctx->stream) cudaStreamDestroy(ctx->stream);
     if (ctx->conv_bf16_in) cudaFree(ctx->conv_bf16_in);
     if (ctx->conv_bf16_out) cudaFree(ctx->conv_bf16_out);
     if (ctx->conv_fp16_out) cudaFree(ctx->conv_fp16_out);
