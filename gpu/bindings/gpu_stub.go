@@ -649,6 +649,10 @@ func SetDecodeWorkspace(ctx *DecodeContext, workspace *LayerWorkspaceFP16) {}
 func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {
 	return ErrNotImplemented
 }
+func DecodeSetHidden(ctx *DecodeContext, hidden []byte) error { return ErrNotImplemented }
+func DecodeGetHidden(ctx *DecodeContext, hidden []byte) error { return ErrNotImplemented }
+func DecodeStepGPU(ctx *DecodeContext, position int) error     { return ErrNotImplemented }
+func DecodeGetHiddenGPUPtr(ctx *DecodeContext) unsafe.Pointer  { return nil }
 func FreeDecodeContext(ctx *DecodeContext) {}
 
 // =============================================================================

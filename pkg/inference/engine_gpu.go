@@ -6,6 +6,7 @@ package inference
 import (
 	"fmt"
 	"log"
+	"unsafe"
 
 	"github.com/neurogrid/engine/gpu/bindings"
 	"github.com/neurogrid/engine/pkg/model"
@@ -275,4 +276,12 @@ func (g *GPUComponents) ApplyLMHeadGPU(hidden []byte) ([]float32, error) {
 		return nil, fmt.Errorf("GPU LM head not initialized")
 	}
 	return g.LMHead.Forward(hidden)
+}
+
+// ApplyLMHeadFromGPU applies LM head from GPU pointer (zero-copy for GPU-resident decode).
+func (g *GPUComponents) ApplyLMHeadFromGPU(hiddenGPUPtr unsafe.Pointer) ([]float32, error) {
+	if g.LMHead == nil {
+		return nil, fmt.Errorf("GPU LM head not initialized")
+	}
+	return g.LMHead.ForwardFromGPU(hiddenGPUPtr)
 }

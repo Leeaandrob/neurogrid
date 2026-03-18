@@ -973,6 +973,38 @@ func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {
 	return nil
 }
 
+// DecodeSetHidden copies initial hidden state from host to GPU.
+func DecodeSetHidden(ctx *DecodeContext, hidden []byte) error {
+	result := C.cuda_decode_set_hidden(ctx.ptr, unsafe.Pointer(&hidden[0]))
+	if result != 0 {
+		return fmt.Errorf("decode set hidden failed: %d", result)
+	}
+	return nil
+}
+
+// DecodeGetHidden copies hidden state from GPU to host.
+func DecodeGetHidden(ctx *DecodeContext, hidden []byte) error {
+	result := C.cuda_decode_get_hidden(ctx.ptr, unsafe.Pointer(&hidden[0]))
+	if result != 0 {
+		return fmt.Errorf("decode get hidden failed: %d", result)
+	}
+	return nil
+}
+
+// DecodeStepGPU runs all layers with hidden state staying on GPU.
+func DecodeStepGPU(ctx *DecodeContext, position int) error {
+	result := C.cuda_decode_step_gpu(ctx.ptr, C.int(position))
+	if result != 0 {
+		return fmt.Errorf("decode step GPU failed: %d", result)
+	}
+	return nil
+}
+
+// DecodeGetHiddenGPUPtr returns GPU pointer to current hidden state (for LM head).
+func DecodeGetHiddenGPUPtr(ctx *DecodeContext) unsafe.Pointer {
+	return C.cuda_decode_get_hidden_gpu_ptr(ctx.ptr)
+}
+
 // FreeDecodeContext releases the decode context.
 func FreeDecodeContext(ctx *DecodeContext) {
 	if ctx != nil && ctx.ptr != nil {

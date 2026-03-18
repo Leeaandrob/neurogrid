@@ -457,6 +457,39 @@ func (e *CUDALayerExecutor) DecodeAll(hidden []byte, position int) ([]byte, erro
 	return output, nil
 }
 
+// DecodeStepGPUResident runs all layers with hidden state on GPU.
+// Call SetHiddenGPU first, then this for each token. Hidden stays on GPU.
+func (e *CUDALayerExecutor) DecodeStepGPUResident(position int) error {
+	if e.decodeCtx == nil {
+		return fmt.Errorf("decode context not initialized")
+	}
+	return bindings.DecodeStepGPU(e.decodeCtx, position)
+}
+
+// SetHiddenGPU copies hidden state from host to GPU decode context.
+func (e *CUDALayerExecutor) SetHiddenGPU(hidden []byte) error {
+	if e.decodeCtx == nil {
+		return fmt.Errorf("decode context not initialized")
+	}
+	return bindings.DecodeSetHidden(e.decodeCtx, hidden)
+}
+
+// GetHiddenGPU copies hidden state from GPU to host.
+func (e *CUDALayerExecutor) GetHiddenGPU(hidden []byte) error {
+	if e.decodeCtx == nil {
+		return fmt.Errorf("decode context not initialized")
+	}
+	return bindings.DecodeGetHidden(e.decodeCtx, hidden)
+}
+
+// GetHiddenGPUPtr returns GPU pointer to current hidden (for LM head).
+func (e *CUDALayerExecutor) GetHiddenGPUPtr() unsafe.Pointer {
+	if e.decodeCtx == nil {
+		return nil
+	}
+	return bindings.DecodeGetHiddenGPUPtr(e.decodeCtx)
+}
+
 func (e *CUDALayerExecutor) forwardFP16(ctx context.Context, layerID int, hidden []byte, position int,
 	weights *bindings.LayerWeightsFP16, cache *bindings.KVCache) ([]byte, []byte, []byte, error) {
 

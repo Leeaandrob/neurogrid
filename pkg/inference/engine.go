@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/neurogrid/engine/pkg/metrics"
 	"github.com/neurogrid/engine/pkg/model"
@@ -68,6 +69,19 @@ type ConvLayerExecutor interface {
 // FullDecoder runs all layers in a single call (eliminates per-layer round-trips).
 type FullDecoder interface {
 	DecodeAll(hidden []byte, position int) ([]byte, error)
+}
+
+// GPUResidentDecoder keeps hidden state on GPU between tokens (zero-copy decode).
+type GPUResidentDecoder interface {
+	SetHiddenGPU(hidden []byte) error
+	DecodeStepGPUResident(position int) error
+	GetHiddenGPUPtr() unsafe.Pointer
+	GetHiddenGPU(hidden []byte) error
+}
+
+// GPULMHeadForwarder applies LM head from a GPU pointer (avoids GPU→Host→GPU copy).
+type GPULMHeadForwarder interface {
+	ApplyLMHeadFromGPU(hiddenGPUPtr unsafe.Pointer) ([]float32, error)
 }
 
 // EngineConfig holds configuration for the inference engine.
@@ -369,6 +383,18 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	outputTokens := make([]int, 0, req.MaxTokens)
 	stopReason := "max_tokens"
 
+	// Try GPU-resident decode path (hidden stays on GPU, eliminates copies)
+	gpuDecoder, hasGPUDecoder := e.layerExecutor.(GPUResidentDecoder)
+	gpuInf := e.gpuInference // for embedding lookup + LM head on GPU
+
+	if hasGPUDecoder && gpuInf != nil {
+		// GPU-RESIDENT FAST PATH
+		// Set initial hidden on GPU from prefill result
+		if err := gpuDecoder.SetHiddenGPU(hidden); err != nil {
+			hasGPUDecoder = false // fall back
+		}
+	}
+
 	for i := 0; i < req.MaxTokens; i++ {
 		select {
 		case <-ctx.Done():
@@ -376,10 +402,34 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		default:
 		}
 
-		// Forward pass through all layers
-		logits, err := e.forwardAllLayers(ctx, hidden, len(inputTokens)+i, seqID)
-		if err != nil {
-			return nil, fmt.Errorf("forward pass failed at step %d: %w", i, err)
+		var logits []float32
+
+		if hasGPUDecoder && gpuInf != nil {
+			// GPU-resident: layers run on GPU, LM head reads from GPU pointer
+			if err := gpuDecoder.DecodeStepGPUResident(len(inputTokens) + i); err != nil {
+				return nil, fmt.Errorf("GPU decode step %d failed: %w", i, err)
+			}
+			// Apply LM head directly from GPU hidden state
+			hiddenGPUPtr := gpuDecoder.GetHiddenGPUPtr()
+			if lmForwarder, ok := gpuInf.(GPULMHeadForwarder); ok {
+				logits, err = lmForwarder.ApplyLMHeadFromGPU(hiddenGPUPtr)
+				if err != nil {
+					return nil, fmt.Errorf("LM head GPU forward failed at step %d: %w", i, err)
+				}
+			} else {
+				// Fallback: copy hidden from GPU and use standard LM head
+				gpuDecoder.GetHiddenGPU(hidden)
+				logits, err = e.applyLMHead(hidden)
+				if err != nil {
+					return nil, fmt.Errorf("LM head failed at step %d: %w", i, err)
+				}
+			}
+		} else {
+			// Standard path: forward all layers + LM head (with host copies)
+			logits, err = e.forwardAllLayers(ctx, hidden, len(inputTokens)+i, seqID)
+			if err != nil {
+				return nil, fmt.Errorf("forward pass failed at step %d: %w", i, err)
+			}
 		}
 
 		// Sample next token
@@ -409,17 +459,14 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 			break
 		}
 
-		// Check for stop strings in generated text
+		// Check for stop strings
 		if len(req.StopStrings) > 0 {
 			currentText, _ := e.tokenizer.Decode(outputTokens)
 			for _, stopStr := range req.StopStrings {
 				if idx := strings.Index(currentText, stopStr); idx != -1 {
-					// Truncate output at the stop string
 					log.Printf("[Generate] Stop string %q found at position %d", stopStr, idx)
-					// Re-encode the truncated text to get correct token count
 					truncatedText := currentText[:idx]
 					outputTokens, _ = e.tokenizer.Encode(truncatedText)
-					// Remove BOS if present (Encode adds it)
 					if len(outputTokens) > 0 && outputTokens[0] == e.tokenizer.BOSToken() {
 						outputTokens = outputTokens[1:]
 					}
@@ -432,10 +479,17 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 			}
 		}
 
-		// Get embedding for next token
+		// Get embedding for next token and prepare for next step
 		hidden, err = e.embedToken(nextToken)
 		if err != nil {
 			return nil, fmt.Errorf("embed token failed: %w", err)
+		}
+
+		// For GPU-resident path: upload new embedding to GPU
+		if hasGPUDecoder {
+			if err := gpuDecoder.SetHiddenGPU(hidden); err != nil {
+				return nil, fmt.Errorf("set hidden GPU failed: %w", err)
+			}
 		}
 	}
 

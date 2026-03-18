@@ -304,6 +304,59 @@ extern "C" int cuda_decode_step(
     return 0;
 }
 
+// ============================================================================
+// GPU-Resident decode: hidden stays on GPU, only logits returned to host
+// ============================================================================
+// Eliminates 4 cudaMemcpy per token → only 1 small copy (position int)
+// + 1 output copy (logits float32 array).
+// The hidden state from the previous step stays in hidden_a/hidden_b.
+
+// Set initial hidden state from host (called once for first token after prefill)
+extern "C" int cuda_decode_set_hidden(void* ctx_ptr, const void* h_hidden) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    CUDA_CHECK(cudaMemcpy(ctx->hidden_a, h_hidden,
+        ctx->hidden_size * sizeof(half), cudaMemcpyHostToDevice));
+    return 0;
+}
+
+// Get hidden state to host (for distributed mode: transfer to next peer)
+extern "C" int cuda_decode_get_hidden(void* ctx_ptr, void* h_hidden) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    half* result_buf = (ctx->num_layers % 2 == 0) ? ctx->hidden_a : ctx->hidden_b;
+    CUDA_CHECK(cudaMemcpy(h_hidden, result_buf,
+        ctx->hidden_size * sizeof(half), cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+// Run all layers, hidden stays on GPU. Only position is copied from host.
+// After this call, result is in hidden_a or hidden_b (depending on num_layers parity).
+extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+
+    // Only copy position (4 bytes) — hidden already on GPU from previous step
+    CUDA_CHECK(cudaMemcpy(ctx->d_position, &position, sizeof(int), cudaMemcpyHostToDevice));
+
+    int res = run_all_layers(ctx, nullptr);
+    if (res != 0) return res;
+
+    // Swap buffers: result is in the "next" buffer after run_all_layers
+    // For next call, we need input in hidden_a. If num_layers is odd, result is in hidden_b.
+    if (ctx->num_layers % 2 != 0) {
+        // Swap a↔b so result is always in hidden_a for next call
+        half* tmp = ctx->hidden_a;
+        ctx->hidden_a = ctx->hidden_b;
+        ctx->hidden_b = tmp;
+    }
+    // Now result is always in hidden_a
+    return 0;
+}
+
+// Get the GPU pointer to current hidden state (for LM head application on GPU)
+extern "C" void* cuda_decode_get_hidden_gpu_ptr(void* ctx_ptr) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    return ctx->hidden_a;  // Always contains latest result after cuda_decode_step_gpu
+}
+
 extern "C" void cuda_free_decode_context(void* ctx_ptr) {
     if (!ctx_ptr) return;
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;

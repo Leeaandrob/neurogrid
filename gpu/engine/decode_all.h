@@ -17,6 +17,12 @@ void cuda_set_decode_workspace(void* ctx, void* workspace);
 
 int cuda_decode_step(void* ctx, void* h_output, const void* h_input, int position);
 
+// GPU-resident decode: hidden stays on GPU between tokens
+int cuda_decode_set_hidden(void* ctx, const void* h_hidden);
+int cuda_decode_get_hidden(void* ctx, void* h_hidden);
+int cuda_decode_step_gpu(void* ctx, int position);
+void* cuda_decode_get_hidden_gpu_ptr(void* ctx);
+
 void cuda_free_decode_context(void* ctx);
 
 #ifdef __cplusplus
