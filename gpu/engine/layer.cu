@@ -1011,11 +1011,12 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
     result = cuda_rope_with_theta(k, k, positions, batch_size, seq_len, num_kv_heads, head_dim, rope_style, rope_theta);
     if (result != 0) return result;
 
-    // 4. Attention
+    // 4. Attention (Flash Decode for single-token, naive for prefill)
     if (seq_len == 1 && kv_cache != nullptr) {
         int position;
         CUDA_CHECK(cudaMemcpy(&position, positions, sizeof(int), cudaMemcpyDeviceToHost));
-        result = cuda_attention_with_kvcache(attn_out, q, k, v, kv_cache,
+        // Use Flash Attention decode (online softmax, no score materialization)
+        result = cuda_flash_attention_with_kvcache(attn_out, q, k, v, kv_cache,
             batch_size, num_heads, num_kv_heads, head_dim, position);
     } else {
         result = cuda_basic_attention_gqa(attn_out, q, k, v,

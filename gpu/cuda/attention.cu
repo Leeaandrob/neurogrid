@@ -434,15 +434,8 @@ extern "C" int cuda_basic_attention_gqa(
 // KV Cache Structure
 // ============================================================================
 
-struct KVCache {
-    half* k_cache;      // [batch, num_heads, max_seq, head_dim]
-    half* v_cache;      // [batch, num_heads, max_seq, head_dim]
-    int batch_size;
-    int num_heads;
-    int head_dim;
-    int max_seq_len;
-    int current_len;    // Current sequence length
-};
+// KVCache struct is now defined in attention.h
+// Cast void* to half* when accessing caches
 
 extern "C" int cuda_kvcache_create(
     void** cache,
@@ -533,7 +526,7 @@ extern "C" int cuda_kvcache_update(
     int num_blocks = (total + block_size - 1) / block_size;
 
     update_cache_kernel<<<num_blocks, block_size>>>(
-        kv->k_cache,
+        ((half*)kv->k_cache),
         (const half*)k,
         kv->batch_size,
         kv->num_heads,
@@ -544,7 +537,7 @@ extern "C" int cuda_kvcache_update(
     CUDA_CHECK(cudaGetLastError());
 
     update_cache_kernel<<<num_blocks, block_size>>>(
-        kv->v_cache,
+        ((half*)kv->v_cache),
         (const half*)v,
         kv->batch_size,
         kv->num_heads,
@@ -698,8 +691,8 @@ extern "C" int cuda_attention_with_kvcache(
     gqa_attention_kernel<<<total_query_heads, block_size, shared_size>>>(
         (half*)output,
         (const half*)query,
-        kv->k_cache,
-        kv->v_cache,
+        ((half*)kv->k_cache),
+        ((half*)kv->v_cache),
         batch_size,
         num_heads,
         num_kv_heads,

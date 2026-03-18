@@ -38,6 +38,25 @@ int cuda_basic_attention_gqa(
     bool causal
 );
 
+// KVCache struct (shared between attention.cu and flash_decode.cu)
+#ifdef __cplusplus
+struct KVCache {
+    void* k_cache;
+    void* v_cache;
+    int batch_size;
+    int num_heads;
+    int head_dim;
+    int max_seq_len;
+    int current_len;
+};
+#endif
+
+// Flash Attention decode (online softmax, no score materialization)
+int cuda_flash_attention_with_kvcache(
+    void* output, const void* query, const void* new_key, const void* new_value,
+    void* cache, int batch_size, int num_heads, int num_kv_heads, int head_dim, int position);
+int cuda_flash_attention_supported(void);
+
 // KV Cache management
 int cuda_kvcache_create(
     void** cache,
