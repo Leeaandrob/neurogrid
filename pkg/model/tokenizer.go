@@ -258,19 +258,15 @@ func truncateString(s string, maxLen int) string {
 // are shifted to the Unicode range starting at 0x100.
 func gpt2ByteToUnicode() map[byte]rune {
 	m := make(map[byte]rune)
-	n := 0
-	// Printable ranges that map to themselves
-	for b := byte('!'); b <= '~'; b++ {
-		m[b] = rune(b)
-		n++
+	// Printable ranges that map to themselves (use int to avoid byte overflow)
+	for b := int('!'); b <= int('~'); b++ {
+		m[byte(b)] = rune(b)
 	}
-	for b := byte(0xA1); b <= 0xAC; b++ {
-		m[b] = rune(b)
-		n++
+	for b := 0xA1; b <= 0xAC; b++ {
+		m[byte(b)] = rune(b)
 	}
-	for b := byte(0xAE); b <= 0xFF; b++ {
-		m[b] = rune(b)
-		n++
+	for b := 0xAE; b <= 0xFF; b++ {
+		m[byte(b)] = rune(b)
 	}
 	// All other bytes (control chars, etc.) mapped to 0x100+
 	offset := 0
