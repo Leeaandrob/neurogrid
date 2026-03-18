@@ -765,6 +765,24 @@ func CheckBF16Support() (bool, error) {
 	return supported != 0, nil
 }
 
+// FP16ToBF16 converts FP16 data to BF16 on GPU.
+func FP16ToBF16(output, input unsafe.Pointer, numElements int) error {
+	result := C.cuda_fp16_to_bf16(output, input, C.size_t(numElements))
+	if result != 0 {
+		return fmt.Errorf("FP16→BF16 failed: %d", result)
+	}
+	return nil
+}
+
+// BF16ToFP16 converts BF16 data to FP16 on GPU.
+func BF16ToFP16(output, input unsafe.Pointer, numElements int) error {
+	result := C.cuda_bf16_to_fp16(output, input, C.size_t(numElements))
+	if result != 0 {
+		return fmt.Errorf("BF16→FP16 failed: %d", result)
+	}
+	return nil
+}
+
 // GEMMBF16 executes BF16 matrix multiplication C = A @ B.
 func GEMMBF16(cPtr, aPtr, bPtr unsafe.Pointer, M, K, N int, transposeA, transposeB bool) error {
 	result := C.cuda_gemm_bf16(cPtr, aPtr, bPtr, C.int(M), C.int(K), C.int(N),

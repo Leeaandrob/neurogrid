@@ -265,6 +265,60 @@ extern "C" int cuda_fp32_to_bf16(void* output, const void* input, size_t num_ele
 }
 
 // ============================================================================
+// FP16 <-> BF16 Direct Conversion Kernels
+// ============================================================================
+
+__global__ void fp16_to_bf16_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const half* __restrict__ input,
+    size_t n
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __float2bfloat16(__half2float(input[idx]));
+    }
+}
+
+extern "C" int cuda_fp16_to_bf16(void* output, const void* input, size_t num_elements) {
+    int block_size = 256;
+    int num_blocks = (num_elements + block_size - 1) / block_size;
+
+    fp16_to_bf16_kernel<<<num_blocks, block_size>>>(
+        (__nv_bfloat16*)output,
+        (const half*)input,
+        num_elements
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+__global__ void bf16_to_fp16_kernel(
+    half* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    size_t n
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __float2half(__bfloat162float(input[idx]));
+    }
+}
+
+extern "C" int cuda_bf16_to_fp16(void* output, const void* input, size_t num_elements) {
+    int block_size = 256;
+    int num_blocks = (num_elements + block_size - 1) / block_size;
+
+    bf16_to_fp16_kernel<<<num_blocks, block_size>>>(
+        (half*)output,
+        (const __nv_bfloat16*)input,
+        num_elements
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// ============================================================================
 // BF16 RoPE Kernel with configurable theta
 // ============================================================================
 

@@ -35,6 +35,12 @@ int cuda_bf16_to_fp32(void* output, const void* input, size_t num_elements);
 // FP32 to BF16 conversion
 int cuda_fp32_to_bf16(void* output, const void* input, size_t num_elements);
 
+// FP16 to BF16 conversion (via FP32 intermediate)
+int cuda_fp16_to_bf16(void* output, const void* input, size_t num_elements);
+
+// BF16 to FP16 conversion (via FP32 intermediate)
+int cuda_bf16_to_fp16(void* output, const void* input, size_t num_elements);
+
 // BF16 RoPE with configurable theta
 int cuda_bf16_rope_with_theta(
     void* output,

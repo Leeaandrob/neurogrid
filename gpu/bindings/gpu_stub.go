@@ -599,6 +599,16 @@ func CheckBF16Support() (bool, error) {
 	return false, ErrNotImplemented
 }
 
+// FP16ToBF16 converts FP16 to BF16 (stub).
+func FP16ToBF16(output, input unsafe.Pointer, numElements int) error {
+	return ErrNotImplemented
+}
+
+// BF16ToFP16 converts BF16 to FP16 (stub).
+func BF16ToFP16(output, input unsafe.Pointer, numElements int) error {
+	return ErrNotImplemented
+}
+
 // GEMMBF16 performs BF16 matrix multiplication (stub).
 func GEMMBF16(cPtr, aPtr, bPtr unsafe.Pointer, M, K, N int, transposeA, transposeB bool) error {
 	return ErrNotImplemented

@@ -332,35 +332,60 @@ func (e *CUDALayerExecutor) ForwardConv(ctx context.Context, layerID int, hidden
 	}
 
 	hiddenSize := e.config.HiddenSize
-	seqLen := 1 // Single token during decode
+	numElements := hiddenSize // single token
+	seqLen := 1
 
-	// Allocate input/output on GPU
-	bufSize := uint64(seqLen * hiddenSize * 2) // BF16
-	inputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
+	bufSize := uint64(numElements * 2) // 2 bytes per element (FP16 or BF16)
+
+	// Allocate FP16 input buffer (host data is FP16)
+	fp16InputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
 	if err != nil {
-		return nil, fmt.Errorf("alloc input: %w", err)
+		return nil, fmt.Errorf("alloc fp16 input: %w", err)
 	}
-	defer bindings.FreeOnDevice(inputGPU, e.deviceID)
+	defer bindings.FreeOnDevice(fp16InputGPU, e.deviceID)
 
-	outputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
-	if err != nil {
-		return nil, fmt.Errorf("alloc output: %w", err)
-	}
-	defer bindings.FreeOnDevice(outputGPU, e.deviceID)
-
-	// Copy input to GPU
-	if err := bindings.CopyToDeviceRaw(inputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
+	// Copy FP16 hidden state to GPU
+	if err := bindings.CopyToDeviceRaw(fp16InputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
 		return nil, fmt.Errorf("copy input: %w", err)
 	}
 
-	// Execute conv layer forward
-	if err := bindings.ConvLayerForwardBF16(outputGPU, inputGPU, weights, state, 1, seqLen, position); err != nil {
+	// Convert FP16 → BF16 for conv kernel
+	bf16InputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("alloc bf16 input: %w", err)
+	}
+	defer bindings.FreeOnDevice(bf16InputGPU, e.deviceID)
+
+	if err := bindings.FP16ToBF16(bf16InputGPU, fp16InputGPU, numElements); err != nil {
+		return nil, fmt.Errorf("fp16→bf16 input: %w", err)
+	}
+
+	// Allocate BF16 output buffer
+	bf16OutputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("alloc bf16 output: %w", err)
+	}
+	defer bindings.FreeOnDevice(bf16OutputGPU, e.deviceID)
+
+	// Execute conv layer forward (BF16 in, BF16 out)
+	if err := bindings.ConvLayerForwardBF16(bf16OutputGPU, bf16InputGPU, weights, state, 1, seqLen, position); err != nil {
 		return nil, fmt.Errorf("conv forward: %w", err)
 	}
 
-	// Copy output back
+	// Convert BF16 → FP16 for next layer
+	fp16OutputGPU, err := bindings.AllocOnDevice(bufSize, e.deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("alloc fp16 output: %w", err)
+	}
+	defer bindings.FreeOnDevice(fp16OutputGPU, e.deviceID)
+
+	if err := bindings.BF16ToFP16(fp16OutputGPU, bf16OutputGPU, numElements); err != nil {
+		return nil, fmt.Errorf("bf16→fp16 output: %w", err)
+	}
+
+	// Copy FP16 output back to host
 	output := make([]byte, len(hidden))
-	if err := bindings.CopyFromDeviceRaw(getBytePointer(output), outputGPU, uint64(len(output))); err != nil {
+	if err := bindings.CopyFromDeviceRaw(getBytePointer(output), fp16OutputGPU, uint64(len(output))); err != nil {
 		return nil, fmt.Errorf("copy output: %w", err)
 	}
 

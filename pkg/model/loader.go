@@ -268,8 +268,8 @@ func (l *WeightLoader) LoadTensor(name string) ([]byte, *TensorInfo, error) {
 		return nil, nil, fmt.Errorf("read failed: %w", err)
 	}
 
-	// Convert BF16 to FP16 if needed (skip if keepBF16 is set on loader)
-	if info.Dtype == "BF16" && !l.keepBF16 {
+	// Convert BF16 to FP16 if needed
+	if info.Dtype == "BF16" {
 		fmt.Printf("[BF16->FP16] Converting tensor %s (dtype=%s, size=%d bytes)\n", name, info.Dtype, len(data))
 		// Debug: show first 8 bytes before conversion
 		if len(data) >= 8 {
@@ -286,6 +286,45 @@ func (l *WeightLoader) LoadTensor(name string) ([]byte, *TensorInfo, error) {
 		fmt.Printf("[LOAD] Tensor %s has dtype=%s (no conversion)\n", name, info.Dtype)
 	}
 
+	return data, &info, nil
+}
+
+// LoadTensorNative loads a tensor without any dtype conversion.
+// Used for BF16 weights that go to BF16-native CUDA kernels (conv layers).
+func (l *WeightLoader) LoadTensorNative(name string) ([]byte, *TensorInfo, error) {
+	l.mu.RLock()
+	info, ok := l.index[name]
+	l.mu.RUnlock()
+
+	if !ok {
+		return nil, nil, fmt.Errorf("tensor not found: %s", name)
+	}
+
+	l.mu.RLock()
+	f, ok := l.files[info.File]
+	l.mu.RUnlock()
+
+	if !ok {
+		return nil, nil, fmt.Errorf("file not loaded: %s", info.File)
+	}
+
+	size := info.Offsets[1] - info.Offsets[0]
+	data := make([]byte, size)
+
+	l.mu.Lock()
+	_, err := f.Seek(info.Offsets[0], io.SeekStart)
+	if err != nil {
+		l.mu.Unlock()
+		return nil, nil, fmt.Errorf("seek failed: %w", err)
+	}
+	_, err = io.ReadFull(f, data)
+	l.mu.Unlock()
+
+	if err != nil {
+		return nil, nil, fmt.Errorf("read failed: %w", err)
+	}
+
+	fmt.Printf("[LOAD-NATIVE] Tensor %s dtype=%s size=%d bytes (no conversion)\n", name, info.Dtype, len(data))
 	return data, &info, nil
 }
 
@@ -363,53 +402,54 @@ type ConvLayerWeights struct {
 }
 
 // LoadConvLayerWeights loads weights for an LFM2 conv layer.
+// Uses LoadTensorNative to keep BF16 data for BF16-native CUDA kernels.
 func (l *WeightLoader) LoadConvLayerWeights(layerID int) (*ConvLayerWeights, error) {
 	prefix := fmt.Sprintf("model.layers.%d.", layerID)
 	weights := &ConvLayerWeights{LayerID: layerID}
 	var err error
 
-	weights.InProjWeight, _, err = l.LoadTensor(prefix + "conv.in_proj.weight")
+	weights.InProjWeight, _, err = l.LoadTensorNative(prefix + "conv.in_proj.weight")
 	if err != nil {
 		return nil, fmt.Errorf("load conv in_proj layer %d: %w", layerID, err)
 	}
 
-	convData, convInfo, err := l.LoadTensor(prefix + "conv.conv.weight")
+	convData, convInfo, err := l.LoadTensorNative(prefix + "conv.conv.weight")
 	if err != nil {
 		return nil, fmt.Errorf("load conv weight layer %d: %w", layerID, err)
 	}
 	// Reshape [hidden, 1, kernel] -> [hidden, kernel] by dropping middle dim
 	if convInfo != nil && len(convInfo.Shape) == 3 && convInfo.Shape[1] == 1 {
-		weights.ConvWeight = convData // Already contiguous, just different view
+		weights.ConvWeight = convData
 	} else {
 		weights.ConvWeight = convData
 	}
 
-	weights.OutProjWeight, _, err = l.LoadTensor(prefix + "conv.out_proj.weight")
+	weights.OutProjWeight, _, err = l.LoadTensorNative(prefix + "conv.out_proj.weight")
 	if err != nil {
 		return nil, fmt.Errorf("load conv out_proj layer %d: %w", layerID, err)
 	}
 
-	weights.OperatorNorm, _, err = l.LoadTensor(prefix + "operator_norm.weight")
+	weights.OperatorNorm, _, err = l.LoadTensorNative(prefix + "operator_norm.weight")
 	if err != nil {
 		return nil, fmt.Errorf("load operator_norm layer %d: %w", layerID, err)
 	}
 
-	weights.FFNNorm, _, err = l.LoadTensor(prefix + "ffn_norm.weight")
+	weights.FFNNorm, _, err = l.LoadTensorNative(prefix + "ffn_norm.weight")
 	if err != nil {
 		return nil, fmt.Errorf("load ffn_norm layer %d: %w", layerID, err)
 	}
 
-	weights.GateWeight, _, err = l.LoadTensor(prefix + "feed_forward.w1.weight")
+	weights.GateWeight, _, err = l.LoadTensorNative(prefix + "feed_forward.w1.weight")
 	if err != nil {
 		return nil, fmt.Errorf("load gate weight layer %d: %w", layerID, err)
 	}
 
-	weights.UpWeight, _, err = l.LoadTensor(prefix + "feed_forward.w3.weight")
+	weights.UpWeight, _, err = l.LoadTensorNative(prefix + "feed_forward.w3.weight")
 	if err != nil {
 		return nil, fmt.Errorf("load up weight layer %d: %w", layerID, err)
 	}
 
-	weights.DownWeight, _, err = l.LoadTensor(prefix + "feed_forward.w2.weight")
+	weights.DownWeight, _, err = l.LoadTensorNative(prefix + "feed_forward.w2.weight")
 	if err != nil {
 		return nil, fmt.Errorf("load down weight layer %d: %w", layerID, err)
 	}

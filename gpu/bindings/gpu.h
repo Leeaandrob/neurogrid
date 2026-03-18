@@ -379,6 +379,8 @@ int cuda_bf16_add(void* c, const void* a, const void* b, size_t num_elements);
 int cuda_bf16_mul(void* c, const void* a, const void* b, size_t num_elements);
 int cuda_bf16_to_fp32(void* output, const void* input, size_t num_elements);
 int cuda_fp32_to_bf16(void* output, const void* input, size_t num_elements);
+int cuda_fp16_to_bf16(void* output, const void* input, size_t num_elements);
+int cuda_bf16_to_fp16(void* output, const void* input, size_t num_elements);
 
 int cuda_bf16_rope_with_theta(void* output, const void* input, const int* positions,
     int batch_size, int seq_len, int num_heads, int head_dim, int rope_style, float rope_theta);

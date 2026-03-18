@@ -484,12 +484,9 @@ func (c *Coordinator) initializeComponents() error {
 	} else {
 		defer weightLoader.Close()
 
-		// Set BF16 native loading for LFM2 models
-		dtype := c.engine.Config().Dtype
-		if dtype == "bf16" || dtype == "bfloat16" || c.engine.Config().ModelType == "lfm2" {
-			weightLoader.SetKeepBF16(true)
-			log.Printf("BF16 native loading enabled for model type: %s", c.engine.Config().ModelType)
-		}
+		// Note: BF16→FP16 conversion happens by default for all tensors.
+		// Conv layer weights are loaded natively as BF16 via LoadTensorNative().
+		// This keeps embeddings, attention layers, and LM head in FP16.
 
 		// Initialize GPU and load all weights
 		gpuComponents, err := c.engine.InitializeGPU(weightLoader, c.config.GPUID)
