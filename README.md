@@ -50,8 +50,11 @@ That's it! The server auto-detects the model and starts on port `8090`.
 | Mistral 7B Instruct | ~15GB | ~14GB | `make download-mistral7b-instruct` |
 | Llama 2 7B | ~13GB | ~14GB | `make download-llama7b` ¹ |
 | Llama 2 13B | ~26GB | ~26GB | `make download-llama13b` ¹ |
+| LFM2.5-1.2B-Thinking | ~2.5GB | ~3GB | `make download-lfm2-thinking` ² |
 
 ¹ Requires `HF_TOKEN` environment variable (get token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens))
+
+² Hybrid conv+attention architecture (branch `feat/lfm2-support`). Requires Ampere+ GPU (RTX 3090/4090) for BF16.
 
 ### Download Any HuggingFace Model
 
@@ -229,6 +232,7 @@ make run-coordinator MIN_PEERS=2
 | `-skip-weight-transfer` | false | Skip P2P weight distribution (workers have local models) |
 | `-disable-mdns` | false | Disable mDNS discovery (use explicit bootstrap) |
 | `-max-seq-len` | 4096 | Max sequence length (caps KV cache size) |
+| `-peer-vram-gb` | 0 | Override worker GPU VRAM in GB (workaround for GPU info timeout) |
 
 #### Worker Flags
 
@@ -397,6 +401,6 @@ Contact: **leandrobar93@gmail.com**
 ---
 
 <p align="center">
-  <strong>NeuroGrid Engine v0.1.0</strong><br>
+  <strong>NeuroGrid Engine v0.4.0</strong><br>
   Built with Go + CUDA
 </p>

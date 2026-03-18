@@ -5,6 +5,46 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-03-18
+
+### Added
+
+#### Distributed Demo Tooling
+- **`demo_distributed.sh`** — One-command setup for distributed inference demo
+- **Makefile targets**: `make demo`, `make demo-stream`, `make demo-stop`, `make demo-status`
+- Supports RTX 2080 Ti (coordinator) + RTX 4090 (worker) topology
+
+#### `--peer-vram-gb` Flag
+- Override remote worker GPU VRAM when GPU info protocol times out
+- Enables correct layer scheduling on heterogeneous clusters
+- Example: `--peer-vram-gb 24` for RTX 4090 workers
+
+#### LFM2 Architecture Support (branch `feat/lfm2-support`)
+- **First non-Llama model**: LiquidAI LFM2.5-1.2B-Thinking (hybrid conv+attention)
+- BF16 CUDA kernels: RMSNorm, SiLU, Add, Mul, RoPE, GEMM via cublasGemmEx
+- Depthwise causal conv1d kernel (prefill + decode with FP32 state)
+- LIV conv layer forward pass (conv_layer.cu)
+- FP16-pure attention layer (no INT8 quantization) with configurable RoPE style
+- FP16/BF16 conversion kernels at conv/attention layer boundaries
+- ChatML template with `<think>` token support
+- BPE tokenizer: array-of-arrays merges format, `<|im_end|>` EOS detection
+- HuggingFace golden test data generator
+
+#### Validated Distributed Configurations
+| Model | GPUs | VRAM Used | Status |
+|-------|------|-----------|--------|
+| TinyLlama 1.1B | 2080 Ti + 4090 | ~3 GB | Tested |
+| Mistral 7B Instruct | 2080 Ti + 4090 | ~14 GB | Tested |
+| LFM2.5-1.2B-Thinking | 4090 only | ~3 GB | Tested (BF16) |
+
+### Fixed
+- Tokenizer: support merges as `[["a","b"],...]` format (LFM2/Qwen)
+- Config: LFM2 SwiGLU intermediate_size adjustment (2/3 of block_ff_dim)
+- Empty responses on some model configurations
+- Chat template detection for ChatML-style models
+
+---
+
 ## [0.3.1] - 2026-01-26
 
 ### Added
