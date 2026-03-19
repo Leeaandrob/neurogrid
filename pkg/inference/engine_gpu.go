@@ -117,8 +117,8 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 				return nil, fmt.Errorf("GPU conv layer %d: %w", layerID, err)
 			}
 		} else if e.config.ModelType == "lfm2" {
-			// Load LFM2 attention layer — BF16 native (no FP16 conversion, preserves precision)
-			layerWeights, qLayerNorm, kLayerNorm, err := loader.LoadAttentionLayerWeightsLFM2Native(layerID)
+			// Load LFM2 attention layer (FP16 path for A/B test)
+			layerWeights, qLayerNorm, kLayerNorm, err := loader.LoadAttentionLayerWeightsLFM2(layerID)
 			if err != nil {
 				gpu.Close()
 				return nil, fmt.Errorf("load LFM2 attn layer %d: %w", layerID, err)
@@ -133,9 +133,9 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 				QLayerNorm: qLayerNorm, KLayerNorm: kLayerNorm,
 			}
 
-			if err := gpu.LayerExecutor.LoadLayerBF16Native(layerID, weights); err != nil {
+			if err := gpu.LayerExecutor.LoadLayerFP16(layerID, weights); err != nil {
 				gpu.Close()
-				return nil, fmt.Errorf("GPU attn layer %d (BF16 native): %w", layerID, err)
+				return nil, fmt.Errorf("GPU attn layer %d: %w", layerID, err)
 			}
 		} else {
 			// Load standard Llama attention layer
