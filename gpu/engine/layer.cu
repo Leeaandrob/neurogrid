@@ -1127,6 +1127,9 @@ extern "C" int cuda_layer_forward_fp16_paged(
 
     // 4. Paged Attention (replaces flash/contiguous attention)
     if (seq_len == 1 && paged_cache != nullptr) {
+        // Note: position is read from GPU via D2H copy. During CUDA Graph capture,
+        // this is the only D2H copy in the hot path. If it fails during capture,
+        // it means this path isn't graph-compatible yet.
         int position;
         CUDA_CHECK(cudaMemcpy(&position, positions, sizeof(int), cudaMemcpyDeviceToHost));
         result = cuda_paged_attention(attn_out, q, k, v, paged_cache, d_block_table,

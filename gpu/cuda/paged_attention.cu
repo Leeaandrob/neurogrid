@@ -277,13 +277,16 @@ extern "C" int cuda_paged_attention(
     float scale_val = 1.0f / sqrtf((float)head_dim);
 
     int num_threads = 128;
-    int shared_size = (seq_len + num_threads) * sizeof(float);
+    // Use max shared memory to support CUDA Graph replay with different seq_lens
+    // Max: 4096 tokens * 4 bytes + 128 threads * 4 bytes = ~16.5KB (well within limits)
+    int max_seq_for_shared = 4096;
+    int shared_size = (max_seq_for_shared + num_threads) * sizeof(float);
 
     paged_attention_v1_kernel<<<num_heads, num_threads, shared_size>>>(
         (half*)output,
         (const half*)query,
-        cache->key_cache,
-        cache->value_cache,
+        (const half*)cache->key_cache,
+        (const half*)cache->value_cache,
         d_block_table,
         num_heads,
         num_kv_heads,

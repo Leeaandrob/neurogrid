@@ -51,6 +51,7 @@ struct DecodeContext {
     float rope_theta;
     int rope_style;
     int conv_kernel_size;
+    int current_position;  // Host-side position (avoids D2H copy during graph capture)
 
     // Per-layer info
     int* layer_types;           // 0=conv, 1=attention
@@ -182,6 +183,9 @@ extern "C" void cuda_set_decode_paged_layer(void* ctx_ptr, int layer_id, void* p
 // ============================================================================
 // Internal: run all layers (used for both normal and graph-captured paths)
 // ============================================================================
+// Forward declaration for paged attention without D2H copy
+extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*, void*, const int*, int, int, int, int);
+
 static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
     int H = ctx->hidden_size;
     half* current = ctx->hidden_a;
@@ -206,7 +210,8 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
         } else {
             // Attention layer: FP16 forward
             if (ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i] && ctx->attn_workspace) {
-                // Paged attention path: per-layer block-based KV cache
+                // Paged attention path: use workspace forward but replace attention
+                // with paged attention call using host position (no D2H copy - CUDA Graph safe)
                 result = cuda_layer_forward_fp16_paged(
                     next, current, ctx->layer_weights[i],
                     ctx->paged_caches[i], ctx->d_block_table,
@@ -264,9 +269,9 @@ extern "C" int cuda_decode_step(
     size_t hs = H * sizeof(half);
 
     // Copy input and position to persistent GPU buffers (OUTSIDE graph)
-    // These buffers have fixed addresses — graph reads from same address every replay
     CUDA_CHECK(cudaMemcpy(ctx->hidden_a, h_input, hs, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx->d_position, &position, sizeof(int), cudaMemcpyHostToDevice));
+    ctx->current_position = position;  // Host-side position (used inside graph to avoid D2H copy)
 
     // Determine output buffer
     half* result_buf = (ctx->num_layers % 2 == 0) ? ctx->hidden_a : ctx->hidden_b;
@@ -288,7 +293,7 @@ extern "C" int cuda_decode_step(
         // All our kernels (cuBLAS, custom) use stream 0 implicitly
         fprintf(stderr, "[NeuroGrid] Capturing CUDA graph on default stream...\n");
 
-        cudaError_t err = cudaStreamBeginCapture((cudaStream_t)0, cudaStreamCaptureModeGlobal);
+        cudaError_t err = cudaStreamBeginCapture((cudaStream_t)0, cudaStreamCaptureModeRelaxed);
         if (err != cudaSuccess) {
             fprintf(stderr, "[NeuroGrid] Graph capture start failed: %s\n", cudaGetErrorString(err));
             int res = run_all_layers(ctx, nullptr);
