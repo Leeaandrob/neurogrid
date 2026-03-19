@@ -413,6 +413,25 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	outputTokens := make([]int, 0, req.MaxTokens)
 	stopReason := "max_tokens"
 
+	// Debug: log first prefill logits
+	{
+		prefillLogits, pfErr := e.forwardAllLayers(ctx, hidden, len(inputTokens)-1, seqID)
+		if pfErr == nil && len(prefillLogits) > 4 {
+			log.Printf("[DBG-LOGITS] prefill logits[0:4]=[%.4f, %.4f, %.4f, %.4f] len=%d",
+				prefillLogits[0], prefillLogits[1], prefillLogits[2], prefillLogits[3], len(prefillLogits))
+			// Find argmax
+			maxVal := prefillLogits[0]
+			maxIdx := 0
+			for j, v := range prefillLogits {
+				if v > maxVal {
+					maxVal = v
+					maxIdx = j
+				}
+			}
+			log.Printf("[DBG-LOGITS] argmax=%d val=%.4f (expected 64400 for <think>)", maxIdx, maxVal)
+		}
+	}
+
 	// Try GPU-resident decode path (hidden stays on GPU, eliminates copies)
 	// Now works with paged cache too — block table updated before each step
 	gpuDecoder, hasGPUDecoder := e.layerExecutor.(GPUResidentDecoder)
