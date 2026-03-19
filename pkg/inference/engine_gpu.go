@@ -117,33 +117,41 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 				return nil, fmt.Errorf("GPU conv layer %d: %w", layerID, err)
 			}
 		} else if e.config.ModelType == "lfm2" {
-			// Load LFM2 attention layer
-			// TODO: BF16-native path needs debugging — reverted to FP16 for stability
-			layerWeights, qLayerNorm, kLayerNorm, err := loader.LoadAttentionLayerWeightsLFM2(layerID)
-			if err != nil {
-				gpu.Close()
-				return nil, fmt.Errorf("load LFM2 attn layer %d: %w", layerID, err)
+			// Load LFM2 attention layer — try BF16-native first, fallback to FP16
+			bf16Weights, bf16QLN, bf16KLN, bf16Err := loader.LoadAttentionLayerWeightsLFM2Native(layerID)
+			if bf16Err == nil {
+				weights := &TransformerLayerWeights{
+					QProj: bf16Weights.QWeight, KProj: bf16Weights.KWeight,
+					VProj: bf16Weights.VWeight, OProj: bf16Weights.OWeight,
+					GateProj: bf16Weights.GateWeight, UpProj: bf16Weights.UpWeight,
+					DownProj: bf16Weights.DownWeight,
+					AttnNorm: bf16Weights.AttnNorm, FFNNorm: bf16Weights.FFNNorm,
+					QLayerNorm: bf16QLN, KLayerNorm: bf16KLN,
+				}
+				if err := gpu.LayerExecutor.LoadLayerBF16Native(layerID, weights); err != nil {
+					log.Printf("BF16 native failed for layer %d: %v, falling back to FP16", layerID, err)
+					bf16Err = err // trigger FP16 fallback below
+				}
 			}
-
-			weights := &TransformerLayerWeights{
-				QProj:      layerWeights.QWeight,
-				KProj:      layerWeights.KWeight,
-				VProj:      layerWeights.VWeight,
-				OProj:      layerWeights.OWeight,
-				GateProj:   layerWeights.GateWeight,
-				UpProj:     layerWeights.UpWeight,
-				DownProj:   layerWeights.DownWeight,
-				AttnNorm:   layerWeights.AttnNorm,
-				FFNNorm:    layerWeights.FFNNorm,
-				QLayerNorm: qLayerNorm,
-				KLayerNorm: kLayerNorm,
-			}
-
-			// Use FP16-pure path (stable)
-			// TODO: BF16-native path created but needs weight dtype propagation fix
-			if err := gpu.LayerExecutor.LoadLayerFP16(layerID, weights); err != nil {
-				gpu.Close()
-				return nil, fmt.Errorf("GPU attn layer %d: %w", layerID, err)
+			if bf16Err != nil {
+				// FP16 fallback: reload with conversion
+				fp16Weights, fp16QLN, fp16KLN, err := loader.LoadAttentionLayerWeightsLFM2(layerID)
+				if err != nil {
+					gpu.Close()
+					return nil, fmt.Errorf("load LFM2 attn layer %d: %w", layerID, err)
+				}
+				weights := &TransformerLayerWeights{
+					QProj: fp16Weights.QWeight, KProj: fp16Weights.KWeight,
+					VProj: fp16Weights.VWeight, OProj: fp16Weights.OWeight,
+					GateProj: fp16Weights.GateWeight, UpProj: fp16Weights.UpWeight,
+					DownProj: fp16Weights.DownWeight,
+					AttnNorm: fp16Weights.AttnNorm, FFNNorm: fp16Weights.FFNNorm,
+					QLayerNorm: fp16QLN, KLayerNorm: fp16KLN,
+				}
+				if err := gpu.LayerExecutor.LoadLayerFP16(layerID, weights); err != nil {
+					gpu.Close()
+					return nil, fmt.Errorf("GPU attn layer %d: %w", layerID, err)
+				}
 			}
 		} else {
 			// Load standard Llama attention layer

@@ -794,23 +794,43 @@ func (e *CUDALayerExecutor) forwardBF16(ctx context.Context, layerID int, hidden
 	weights *bindings.LayerWeightsBF16, cache *bindings.KVCache) ([]byte, []byte, []byte, error) {
 
 	hiddenSize := e.config.HiddenSize
+	bufSize := uint64(hiddenSize * 2) // 2 bytes per BF16 element
+
+	// Input arrives as FP16 (from embeddings). Convert to BF16 for BF16-native forward.
+	// Use preallocated conv buffers for the conversion
+	if err := bindings.CopyToDeviceRaw(e.inputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
+		return nil, nil, nil, fmt.Errorf("copy input: %w", err)
+	}
+
+	// Convert FP16 → BF16 for the forward pass
+	bf16Input, err := bindings.AllocOnDevice(bufSize, e.deviceID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("alloc bf16 input: %w", err)
+	}
+	defer bindings.FreeOnDevice(bf16Input, e.deviceID)
+
+	if err := bindings.FP16ToBF16(bf16Input, e.inputGPU, hiddenSize); err != nil {
+		return nil, nil, nil, fmt.Errorf("fp16→bf16 input: %w", err)
+	}
+
+	bf16Output, err := bindings.AllocOnDevice(bufSize, e.deviceID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("alloc bf16 output: %w", err)
+	}
+	defer bindings.FreeOnDevice(bf16Output, e.deviceID)
 
 	inputTensor := &types.Tensor{
 		Shape:  []int{1, 1, hiddenSize},
-		Dtype:  types.DtypeFP16, // BF16 is same size as FP16 (2 bytes)
+		Dtype:  types.DtypeFP16, // BF16 is same size
 		Device: e.deviceID,
-		Data:   e.inputGPU,
-	}
-
-	if err := bindings.CopyToDeviceRaw(e.inputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
-		return nil, nil, nil, fmt.Errorf("copy input: %w", err)
+		Data:   bf16Input,
 	}
 
 	outputTensor := &types.Tensor{
 		Shape:  []int{1, 1, hiddenSize},
 		Dtype:  types.DtypeFP16,
 		Device: e.deviceID,
-		Data:   e.outputGPU,
+		Data:   bf16Output,
 	}
 
 	positions := []int32{int32(position)}
@@ -847,6 +867,11 @@ func (e *CUDALayerExecutor) forwardBF16(ctx context.Context, layerID int, hidden
 		} else {
 			return nil, nil, nil, fmt.Errorf("BF16 workspace not initialized")
 		}
+	}
+
+	// Convert BF16 output → FP16 for the rest of the pipeline
+	if err := bindings.BF16ToFP16(e.outputGPU, bf16Output, hiddenSize); err != nil {
+		return nil, nil, nil, fmt.Errorf("bf16→fp16 output: %w", err)
 	}
 
 	output := make([]byte, len(hidden))

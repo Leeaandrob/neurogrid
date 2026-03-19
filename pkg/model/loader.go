@@ -525,6 +525,63 @@ func (l *WeightLoader) LoadAttentionLayerWeightsLFM2(layerID int) (*LayerWeights
 	return weights, qLayerNorm, kLayerNorm, nil
 }
 
+// LoadAttentionLayerWeightsLFM2Native loads LFM2 attention weights as raw BF16 (no conversion).
+// Used for BF16-native compute pipeline.
+func (l *WeightLoader) LoadAttentionLayerWeightsLFM2Native(layerID int) (*LayerWeights, []byte, []byte, error) {
+	prefix := fmt.Sprintf("model.layers.%d.", layerID)
+	weights := &LayerWeights{LayerID: layerID}
+	var err error
+
+	weights.QWeight, _, err = l.LoadTensorNative(prefix + "self_attn.q_proj.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load Q weight layer %d: %w", layerID, err)
+	}
+	weights.KWeight, _, err = l.LoadTensorNative(prefix + "self_attn.k_proj.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load K weight layer %d: %w", layerID, err)
+	}
+	weights.VWeight, _, err = l.LoadTensorNative(prefix + "self_attn.v_proj.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load V weight layer %d: %w", layerID, err)
+	}
+	weights.OWeight, _, err = l.LoadTensorNative(prefix + "self_attn.out_proj.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load O weight layer %d: %w", layerID, err)
+	}
+
+	qLayerNorm, _, err := l.LoadTensorNative(prefix + "self_attn.q_layernorm.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load q_layernorm layer %d: %w", layerID, err)
+	}
+	kLayerNorm, _, err := l.LoadTensorNative(prefix + "self_attn.k_layernorm.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load k_layernorm layer %d: %w", layerID, err)
+	}
+
+	weights.AttnNorm, _, err = l.LoadTensorNative(prefix + "operator_norm.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load operator_norm layer %d: %w", layerID, err)
+	}
+	weights.FFNNorm, _, err = l.LoadTensorNative(prefix + "ffn_norm.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load ffn_norm layer %d: %w", layerID, err)
+	}
+	weights.GateWeight, _, err = l.LoadTensorNative(prefix + "feed_forward.w1.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load gate weight layer %d: %w", layerID, err)
+	}
+	weights.UpWeight, _, err = l.LoadTensorNative(prefix + "feed_forward.w3.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load up weight layer %d: %w", layerID, err)
+	}
+	weights.DownWeight, _, err = l.LoadTensorNative(prefix + "feed_forward.w2.weight")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load down weight layer %d: %w", layerID, err)
+	}
+
+	return weights, qLayerNorm, kLayerNorm, nil
+}
+
 // LoadEmbeddings loads the token embedding matrix.
 func (l *WeightLoader) LoadEmbeddings() ([]byte, *TensorInfo, error) {
 	return l.LoadTensor("model.embed_tokens.weight")
