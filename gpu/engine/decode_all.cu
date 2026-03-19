@@ -88,7 +88,8 @@ struct DecodeContext {
     cudaGraphExec_t graph_exec;
     cudaStream_t stream;
     bool graph_captured;
-    int warmup_count;         // Number of warmup steps before capture
+    int warmup_count;         // Number of warmup steps before capture (cuda_decode_step)
+    int warmup_count_gpu;     // Separate counter for GPU-resident path (cuda_decode_step_gpu)
 };
 
 extern "C" int cuda_create_decode_context(
@@ -424,10 +425,10 @@ extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
         } else {
             CUDA_CHECK(cudaDeviceSynchronize());
         }
-    } else if (ctx->warmup_count == 2 && !ctx->graph_captured) {
+    } else if (ctx->warmup_count_gpu == 2 && !ctx->graph_captured) {
         // CAPTURE on step 2
         fprintf(stderr, "[NeuroGrid] Capturing CUDA graph (GPU-resident path)...\n");
-        ctx->warmup_count = 3;
+        ctx->warmup_count_gpu = 3;
         cudaGetLastError(); // Clear stale errors
 
         cudaError_t err = cudaStreamBeginCapture((cudaStream_t)0, cudaStreamCaptureModeRelaxed);
@@ -468,7 +469,7 @@ extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
         // Warmup or post-failed-capture: run normally
         int res = run_all_layers(ctx, nullptr);
         if (res != 0) return res;
-        ctx->warmup_count++;
+        ctx->warmup_count_gpu++;
     }
 
     // Swap buffers for next call
