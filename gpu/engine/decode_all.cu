@@ -281,6 +281,16 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
         __nv_bfloat16* current = ctx->bf16_hidden_a;
         __nv_bfloat16* next = ctx->bf16_hidden_b;
 
+        // Debug: print first values of BF16 input on first call
+        static int bf16_debug_count = 0;
+        if (bf16_debug_count < 2) {
+            __nv_bfloat16 h_val[4];
+            cudaMemcpy(h_val, current, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[BF16-DBG] run_all_layers input: [%f, %f, %f, %f]\n",
+                __bfloat162float(h_val[0]), __bfloat162float(h_val[1]),
+                __bfloat162float(h_val[2]), __bfloat162float(h_val[3]));
+        }
+
         for (int i = 0; i < ctx->num_layers; i++) {
             int result;
 
@@ -322,11 +332,22 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
                 if (result != 0) return result;
             }
 
+            // Debug: print output after each layer
+            if (bf16_debug_count < 2) {
+                __nv_bfloat16 h_val[4];
+                cudaMemcpy(h_val, next, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[BF16-DBG] layer %d (%s) output: [%f, %f, %f, %f] rc=%d\n",
+                    i, ctx->layer_types[i] == 0 ? "conv" : "attn",
+                    __bfloat162float(h_val[0]), __bfloat162float(h_val[1]),
+                    __bfloat162float(h_val[2]), __bfloat162float(h_val[3]), result);
+            }
+
             // Ping-pong (BF16)
             __nv_bfloat16* tmp = current;
             current = next;
             next = tmp;
         }
+        if (bf16_debug_count < 2) bf16_debug_count++;
         return 0;
     }
 
