@@ -408,18 +408,24 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	stopReason := "max_tokens"
 
 	// Try GPU-resident decode path (hidden stays on GPU, eliminates copies)
+	// Disabled when paged cache is active (decode context uses contiguous KV)
 	gpuDecoder, hasGPUDecoder := e.layerExecutor.(GPUResidentDecoder)
-	gpuInf := e.gpuInference // for embedding lookup + LM head on GPU
+	gpuInf := e.gpuInference
+	if _, isPaged := e.layerExecutor.(PagedCacheAllocator); isPaged {
+		// Check if paged cache is actually in use
+		if pagedExec, ok := e.layerExecutor.(interface{ HasPagedCache() bool }); ok && pagedExec.HasPagedCache() {
+			hasGPUDecoder = false // Force per-layer path for paged attention
+		}
+	}
 
 	if hasGPUDecoder && gpuInf != nil {
-		// GPU-RESIDENT FAST PATH
 		log.Printf("[Generate] Using GPU-resident decode path")
 		if err := gpuDecoder.SetHiddenGPU(hidden); err != nil {
 			log.Printf("[Generate] GPU-resident init failed: %v, falling back", err)
-			hasGPUDecoder = false // fall back
+			hasGPUDecoder = false
 		}
 	} else {
-		log.Printf("[Generate] Using standard decode path (gpuDecoder=%v, gpuInf=%v)", hasGPUDecoder, gpuInf != nil)
+		log.Printf("[Generate] Using per-layer decode path (paged=%v)", !hasGPUDecoder)
 	}
 
 	for i := 0; i < req.MaxTokens; i++ {
