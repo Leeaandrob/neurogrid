@@ -5,6 +5,34 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-03-19
+
+### CUDA Graphs — Full Kernel Launch Replay
+
+Captures all 298 kernel launches as a CUDA graph during warmup,
+then replays the entire decode step in ~50μs instead of individual launches.
+
+#### What Changed
+- **Global stream routing** (`ng_get_stream()`): all 71 kernels use configurable stream
+- **Zero D2H copies**: all dynamic params (position, seq_len, kv_len) via GPU buffers
+- **Graph-safe kernels**: `add_one_kernel` computes kv_len on GPU; `cudaMemcpyAsync` for D2D
+- **Conv workspace**: pre-allocated BF16 buffers (no cudaMalloc during capture)
+- **Per-layer paged caches**: properly set on decode context for graph compatibility
+
+#### Benchmark (LFM2.5-1.2B, RTX 4090, 128 tokens)
+| Engine | tok/s | vs vLLM |
+|--------|-------|---------|
+| HuggingFace 5.3 | 184 | 53% |
+| NeuroGrid v0.7 (paged) | 216 | 62% |
+| **NeuroGrid v0.8 (graphs)** | **225** | **64%** |
+| vLLM 0.17.1 | 350 | 100% |
+
+CUDA Graph: 298 nodes captured + replaying.
+Golden Test: PASS — `<think>` (token 64400).
+22% faster than HuggingFace transformers.
+
+---
+
 ## [0.7.0] - 2026-03-19
 
 ### Paged KV Cache (PagedAttention)
