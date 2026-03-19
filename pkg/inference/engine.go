@@ -413,20 +413,13 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	outputTokens := make([]int, 0, req.MaxTokens)
 	stopReason := "max_tokens"
 
-	// Try GPU-resident decode path (hidden stays on GPU, eliminates copies)
-	// Now works with paged cache too — block table updated before each step
-	gpuDecoder, hasGPUDecoder := e.layerExecutor.(GPUResidentDecoder)
+	// DISABLED: GPU-resident decode path (debugging layer forward issue)
+	// Use host path (cuda_decode_step via DecodeAll) for all tokens
+	var gpuDecoder GPUResidentDecoder
+	hasGPUDecoder := false
 	gpuInf := e.gpuInference
-
-	if hasGPUDecoder && gpuInf != nil {
-		log.Printf("[Generate] Using GPU-resident decode path")
-		if err := gpuDecoder.SetHiddenGPU(hidden); err != nil {
-			log.Printf("[Generate] GPU-resident init failed: %v, falling back", err)
-			hasGPUDecoder = false
-		}
-	} else {
-		log.Printf("[Generate] Using per-layer decode path")
-	}
+	_ = gpuDecoder
+	log.Printf("[Generate] Using per-layer decode path (GPU-resident disabled for debug)")
 
 	for i := 0; i < req.MaxTokens; i++ {
 		select {
