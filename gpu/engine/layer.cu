@@ -785,7 +785,7 @@ extern "C" int cuda_layer_forward_fp16(
     int result;
 
     // Save residual
-    CUDA_CHECK(cudaMemcpy(residual, input, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(residual, input, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice, ng_get_stream()));
 
     // 1. Attention RMSNorm
     result = cuda_rmsnorm(normed, input, w->attn_norm, num_tokens, hidden_size, rms_norm_eps);
@@ -843,7 +843,7 @@ extern "C" int cuda_layer_forward_fp16(
     if (result != 0) goto cleanup;
 
     // Save new residual
-    CUDA_CHECK(cudaMemcpy(residual, normed, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(residual, normed, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice, ng_get_stream()));
 
     // 7. FFN RMSNorm
     result = cuda_rmsnorm(normed, normed, w->ffn_norm, num_tokens, hidden_size, rms_norm_eps);
@@ -976,7 +976,7 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
     int result;
 
     // Save residual
-    CUDA_CHECK(cudaMemcpy(residual, input, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(residual, input, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice, ng_get_stream()));
 
     // 1. Attention RMSNorm
     result = cuda_rmsnorm(normed, input, w->attn_norm, num_tokens, hidden_size, rms_norm_eps);
@@ -1087,7 +1087,7 @@ extern "C" int cuda_layer_forward_fp16_paged(
     int result;
 
     // Save residual
-    CUDA_CHECK(cudaMemcpy(residual, input, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(residual, input, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice, ng_get_stream()));
 
     // 1. Attention RMSNorm
     result = cuda_rmsnorm(normed, input, w->attn_norm, num_tokens, hidden_size, rms_norm_eps);
