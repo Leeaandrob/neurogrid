@@ -259,70 +259,9 @@ extern "C" int cuda_decode_step(
     // Determine output buffer: if num_layers is odd, result is in hidden_b; if even, hidden_a
     half* result_buf = (ctx->num_layers % 2 == 0) ? ctx->hidden_a : ctx->hidden_b;
 
-    if (ctx->graph_captured && ctx->graph_exec) {
-        // Fast path: replay captured CUDA graph
-        cudaError_t err = cudaGraphLaunch(ctx->graph_exec, ctx->stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA graph launch failed: %s, falling back\n", cudaGetErrorString(err));
-            ctx->graph_captured = false;
-            int res = run_all_layers(ctx, nullptr);
-            if (res != 0) return res;
-        } else {
-            CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
-        }
-    } else if (ctx->warmup_count >= 2 && !ctx->graph_captured) {
-        // Capture CUDA graph on the dedicated stream
-        // Must redirect cuBLAS to this stream for capture to work
-        fprintf(stderr, "[NeuroGrid] Capturing CUDA graph for decode step...\n");
-
-        // Set cuBLAS to use our capture stream
-        cublas_set_stream(ctx->stream);
-
-        cudaError_t err = cudaStreamBeginCapture(ctx->stream, cudaStreamCaptureModeGlobal);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "[NeuroGrid] Graph capture failed to start: %s, running normally\n",
-                    cudaGetErrorString(err));
-            cublas_set_stream(nullptr);  // Reset to default stream
-            int res = run_all_layers(ctx, nullptr);
-            if (res != 0) return res;
-        } else {
-            int res = run_all_layers(ctx, ctx->stream);
-
-            cudaGraph_t graph = nullptr;
-            err = cudaStreamEndCapture(ctx->stream, &graph);
-
-            // Reset cuBLAS to default stream
-            cublas_set_stream(nullptr);
-
-            if (err != cudaSuccess || graph == nullptr || res != 0) {
-                fprintf(stderr, "[NeuroGrid] Graph capture failed: %s\n",
-                        err != cudaSuccess ? cudaGetErrorString(err) : "run_all_layers failed");
-                if (graph) cudaGraphDestroy(graph);
-                // Run normally since capture may have consumed the kernels
-                res = run_all_layers(ctx, nullptr);
-                if (res != 0) return res;
-            } else {
-                cudaGraphExec_t exec = nullptr;
-                err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
-                if (err != cudaSuccess) {
-                    fprintf(stderr, "[NeuroGrid] Graph instantiate failed: %s\n", cudaGetErrorString(err));
-                    cudaGraphDestroy(graph);
-                } else {
-                    ctx->graph = graph;
-                    ctx->graph_exec = exec;
-                    ctx->graph_captured = true;
-                    fprintf(stderr, "[NeuroGrid] CUDA graph captured! (%d layers, replaying for future tokens)\n",
-                            ctx->num_layers);
-                }
-            }
-        }
-        ctx->warmup_count++;
-    } else {
-        // Warmup: run normally
-        int res = run_all_layers(ctx, nullptr);
-        if (res != 0) return res;
-        ctx->warmup_count++;
-    }
+    // Run all layers directly (CUDA Graph capture removed — causes stream corruption)
+    int res = run_all_layers(ctx, nullptr);
+    if (res != 0) return res;
 
     // Copy result back to host
     CUDA_CHECK(cudaMemcpy(h_output, result_buf, hs, cudaMemcpyDeviceToHost));
