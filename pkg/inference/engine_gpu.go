@@ -253,15 +253,13 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 		log.Printf("Warning: Could not build decode context (will use per-layer path): %v", err)
 	} else {
 		log.Printf("Full-model decode context built (all layers in single CUDA call)")
-		// If paged cache is available, set it on the decode context
+		// Note: paged cache is per-layer, so we DON'T set it on the decode context.
+		// The decode context uses contiguous KV caches. The per-layer forwardFP16
+		// path handles paged attention when called individually.
+		// To use paged attention with decode context, would need per-layer cache
+		// array in the C struct — future optimization.
 		if gpu.LayerExecutor.HasPagedCache() {
-			bindings.SetDecodePagedCache(
-				gpu.LayerExecutor.decodeCtx,
-				gpu.LayerExecutor.pagedCache,
-				gpu.LayerExecutor.blockTableGPU,
-				gpu.LayerExecutor.maxBlocksPerSeq,
-			)
-			log.Printf("Paged KV cache set on decode context")
+			log.Printf("Paged KV cache available (per-layer, using per-layer forward path)")
 		}
 	}
 

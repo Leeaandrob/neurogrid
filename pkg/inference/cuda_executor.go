@@ -51,11 +51,12 @@ type CUDALayerExecutor struct {
 	// Eliminates ~200 cudaMalloc/cudaFree calls per token across 16 layers (~2-3ms saved).
 	fp16Workspace *bindings.LayerWorkspaceFP16
 
-	// Paged KV Cache (replaces contiguous kvCaches for LFM2)
-	pagedCache      *bindings.PagedKVCache
+	// Paged KV Cache — one cache per attention layer (replaces contiguous kvCaches for LFM2)
+	pagedCaches     map[int]*bindings.PagedKVCache // layerID -> paged cache
 	pagedManager    *PagedKVCacheManager
 	blockTableGPU   unsafe.Pointer // GPU buffer for block table
 	maxBlocksPerSeq int
+	usePagedCache   bool
 
 	// Preallocated conv layer buffers — avoids 4 cudaMalloc/cudaFree per ForwardConv call.
 	convInputFP16  unsafe.Pointer // GPU buffer for FP16 input
@@ -173,21 +174,50 @@ func (e *CUDALayerExecutor) GetBufferSize() uint64 {
 // InitPagedKVCache initializes the paged KV cache for block-based attention.
 // numBlocks is the total number of KV cache blocks to allocate on GPU.
 func (e *CUDALayerExecutor) InitPagedKVCache(numBlocks, numKVHeads, headDim int) error {
-	cache, err := bindings.CreatePagedKVCache(numBlocks, numKVHeads, headDim, BlockSize)
-	if err != nil {
-		return fmt.Errorf("create paged KV cache: %w", err)
+	// Count attention layers
+	numAttnLayers := 0
+	for i := 0; i < e.config.NumLayers; i++ {
+		if !e.config.IsConvLayer(i) {
+			numAttnLayers++
+		}
 	}
-	e.pagedCache = cache
-	e.pagedManager = NewPagedKVCacheManager(numBlocks, e.config.NumLayers, numKVHeads, headDim)
+	if numAttnLayers == 0 {
+		return nil
+	}
 
-	// Pre-allocate GPU block table buffer (max 256 blocks per sequence)
+	// Divide blocks among attention layers
+	blocksPerLayer := numBlocks / numAttnLayers
+	if blocksPerLayer < 16 {
+		return fmt.Errorf("not enough blocks: %d for %d layers", numBlocks, numAttnLayers)
+	}
+
+	e.pagedCaches = make(map[int]*bindings.PagedKVCache)
+
+	// Create one paged cache per attention layer
+	for i := 0; i < e.config.NumLayers; i++ {
+		if e.config.IsConvLayer(i) {
+			continue
+		}
+		cache, err := bindings.CreatePagedKVCache(blocksPerLayer, numKVHeads, headDim, BlockSize)
+		if err != nil {
+			// Cleanup already created caches
+			for _, c := range e.pagedCaches {
+				bindings.FreePagedKVCache(c)
+			}
+			e.pagedCaches = nil
+			return fmt.Errorf("create paged cache for layer %d: %w", i, err)
+		}
+		e.pagedCaches[i] = cache
+	}
+
+	e.pagedManager = NewPagedKVCacheManager(blocksPerLayer, 1, numKVHeads, headDim) // 1 layer per manager (blocks shared per layer)
+	e.usePagedCache = true
+
+	// Pre-allocate GPU block table buffer
 	e.maxBlocksPerSeq = 256
-	tableSize := uint64(e.maxBlocksPerSeq * 4) // int32
+	tableSize := uint64(e.maxBlocksPerSeq * 4)
 	ptr, err := bindings.AllocOnDevice(tableSize, e.deviceID)
 	if err != nil {
-		bindings.FreePagedKVCache(cache)
-		e.pagedCache = nil
-		e.pagedManager = nil
 		return fmt.Errorf("alloc block table GPU buffer: %w", err)
 	}
 	e.blockTableGPU = ptr
@@ -196,7 +226,7 @@ func (e *CUDALayerExecutor) InitPagedKVCache(numBlocks, numKVHeads, headDim int)
 
 // HasPagedCache returns whether paged KV cache is initialized.
 func (e *CUDALayerExecutor) HasPagedCache() bool {
-	return e.pagedCache != nil
+	return e.usePagedCache && len(e.pagedCaches) > 0
 }
 
 // PagedManager returns the paged KV cache manager.
@@ -533,6 +563,11 @@ func (e *CUDALayerExecutor) DecodeAll(hidden []byte, position int) ([]byte, erro
 	if e.decodeCtx == nil {
 		return nil, fmt.Errorf("decode context not initialized")
 	}
+	// When paged cache is active, don't use DecodeAll (decode context uses contiguous KV).
+	// Fall through to per-layer path which handles paged attention.
+	if e.usePagedCache {
+		return nil, fmt.Errorf("paged cache active, use per-layer path")
+	}
 
 	output := make([]byte, len(hidden))
 	if err := bindings.DecodeStep(e.decodeCtx, output, hidden, position); err != nil {
@@ -610,28 +645,29 @@ func (e *CUDALayerExecutor) forwardFP16(ctx context.Context, layerID int, hidden
 	// Use interleaved RoPE for LFM2
 	ropeStyle := 1 // RoPEStyleInterleaved
 
-	// Choose attention path: paged or contiguous
+	// Choose attention path: paged (per-layer) or contiguous
 	usedPaged := false
-	if e.pagedCache != nil && e.pagedManager != nil && e.fp16Workspace != nil {
-		// Get block table from paged manager. Find the first active sequence.
-		activeSeqID := e.pagedManager.FirstActiveSequenceID()
-		blockTable, _, btErr := e.pagedManager.GetBlockTable(activeSeqID, e.maxBlocksPerSeq)
-		if btErr == nil {
-			// Copy block table to GPU
-			tableBytes := uint64(len(blockTable) * 4)
-			if cpErr := bindings.CopyToDeviceRaw(e.blockTableGPU, unsafe.Pointer(&blockTable[0]), tableBytes); cpErr != nil {
-				return nil, nil, nil, fmt.Errorf("copy block table to GPU: %w", cpErr)
-			}
+	if e.usePagedCache && e.pagedManager != nil && e.fp16Workspace != nil {
+		// Get per-layer paged cache
+		layerCache, hasLayerCache := e.pagedCaches[layerID]
+		if hasLayerCache {
+			// Get block table from paged manager
+			activeSeqID := e.pagedManager.FirstActiveSequenceID()
+			blockTable, _, btErr := e.pagedManager.GetBlockTable(activeSeqID, e.maxBlocksPerSeq)
+			if btErr == nil {
+				tableBytes := uint64(len(blockTable) * 4)
+				if cpErr := bindings.CopyToDeviceRaw(e.blockTableGPU, unsafe.Pointer(&blockTable[0]), tableBytes); cpErr != nil {
+					return nil, nil, nil, fmt.Errorf("copy block table to GPU: %w", cpErr)
+				}
 
-			// Call paged layer forward
-			if fwdErr := bindings.LayerForwardFP16Paged(outputTensor, inputTensor, weights,
-				e.pagedCache, e.blockTableGPU,
-				positions, e.config, ropeStyle, e.fp16Workspace); fwdErr != nil {
-				return nil, nil, nil, fmt.Errorf("FP16 paged layer forward failed: %w", fwdErr)
+				if fwdErr := bindings.LayerForwardFP16Paged(outputTensor, inputTensor, weights,
+					layerCache, e.blockTableGPU,
+					positions, e.config, ropeStyle, e.fp16Workspace); fwdErr != nil {
+					return nil, nil, nil, fmt.Errorf("FP16 paged layer forward failed: %w", fwdErr)
+				}
+				usedPaged = true
 			}
-			usedPaged = true
 		}
-		// If GetBlockTable failed, fall through to contiguous path
 	}
 
 	if !usedPaged {
@@ -807,9 +843,9 @@ func (e *CUDALayerExecutor) Close() error {
 	}
 
 	// Free paged KV cache resources
-	if e.pagedCache != nil {
-		bindings.FreePagedKVCache(e.pagedCache)
-		e.pagedCache = nil
+	for id, cache := range e.pagedCaches {
+		bindings.FreePagedKVCache(cache)
+		delete(e.pagedCaches, id)
 	}
 	if e.blockTableGPU != nil {
 		bindings.FreeOnDevice(e.blockTableGPU, e.deviceID)
