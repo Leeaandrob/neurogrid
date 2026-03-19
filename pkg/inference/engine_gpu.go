@@ -271,6 +271,13 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 			}
 			log.Printf("Per-layer paged KV caches set on decode context (%d layers)", len(gpu.LayerExecutor.pagedCaches))
 		}
+
+		// Create conv workspace for CUDA Graph safe conv layer forward
+		convWS, cwErr := bindings.CreateConvWorkspace(e.config.HiddenSize, e.config.IntermediateSize)
+		if cwErr == nil {
+			bindings.SetDecodeConvWorkspace(gpu.LayerExecutor.decodeCtx, convWS)
+			log.Printf("Conv workspace created for CUDA Graph safe decode")
+		}
 	}
 
 	// Report GPU memory usage

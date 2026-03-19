@@ -1094,6 +1094,36 @@ func SetDecodeWorkspace(ctx *DecodeContext, workspace *LayerWorkspaceFP16) {
 	}
 }
 
+// ConvWorkspace holds pre-allocated buffers for conv layer forward (CUDA Graph safe).
+type ConvWorkspace struct {
+	ptr unsafe.Pointer
+}
+
+// CreateConvWorkspace creates a pre-allocated workspace for conv layer decode.
+func CreateConvWorkspace(hiddenSize, intermediateSize int) (*ConvWorkspace, error) {
+	var ptr unsafe.Pointer
+	result := C.cuda_create_conv_workspace(&ptr, C.int(hiddenSize), C.int(intermediateSize))
+	if result != 0 {
+		return nil, fmt.Errorf("create conv workspace failed: %d", result)
+	}
+	return &ConvWorkspace{ptr: ptr}, nil
+}
+
+// FreeConvWorkspace releases the conv workspace.
+func FreeConvWorkspace(ws *ConvWorkspace) {
+	if ws != nil && ws.ptr != nil {
+		C.cuda_free_conv_workspace(ws.ptr)
+		ws.ptr = nil
+	}
+}
+
+// SetDecodeConvWorkspace sets the conv workspace on the decode context.
+func SetDecodeConvWorkspace(ctx *DecodeContext, ws *ConvWorkspace) {
+	if ws != nil {
+		C.cuda_set_decode_conv_workspace(ctx.ptr, ws.ptr)
+	}
+}
+
 // SetDecodePagedCache sets the paged KV cache on the decode context.
 func SetDecodePagedCache(ctx *DecodeContext, pagedCache *PagedKVCache, dBlockTable unsafe.Pointer, maxBlocksPerSeq int) {
 	if pagedCache != nil {

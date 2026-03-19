@@ -670,6 +670,14 @@ func CreateDecodeContext(config *types.LlamaConfig) (*DecodeContext, error) {
 }
 func SetDecodeLayer(ctx *DecodeContext, layerID, layerType int, weights, cache unsafe.Pointer) {}
 func SetDecodeWorkspace(ctx *DecodeContext, workspace *LayerWorkspaceFP16) {}
+
+type ConvWorkspace struct{ ptr unsafe.Pointer }
+
+func CreateConvWorkspace(hiddenSize, intermediateSize int) (*ConvWorkspace, error) {
+	return nil, ErrNotImplemented
+}
+func FreeConvWorkspace(ws *ConvWorkspace) {}
+func SetDecodeConvWorkspace(ctx *DecodeContext, ws *ConvWorkspace) {}
 func SetDecodePagedCache(ctx *DecodeContext, pagedCache *PagedKVCache, dBlockTable unsafe.Pointer, maxBlocksPerSeq int) {}
 func SetDecodePagedLayer(ctx *DecodeContext, layerID int, pagedCache *PagedKVCache) {}
 func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {

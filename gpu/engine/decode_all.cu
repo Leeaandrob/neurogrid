@@ -13,6 +13,7 @@
 
 // Forward declarations from other translation units
 extern "C" int cuda_conv_layer_forward_bf16(void*, const void*, const void*, void*, int, int, int);
+extern "C" int cuda_conv_layer_forward_bf16_ws(void*, const void*, const void*, void*, int, int, int, void*);
 extern "C" int cuda_layer_forward_fp16_with_workspace(
     void*, const void*, const void*, void*, const int*, int, int,
     int, int, int, int, int, float, float, int, void*);
@@ -60,6 +61,7 @@ struct DecodeContext {
 
     // Shared workspace (attention layers)
     void* attn_workspace;       // LayerWorkspaceFP16*
+    void* conv_workspace;       // ConvWorkspace* (for CUDA Graph safe conv forward)
 
     // Shared buffers for FP16↔BF16 conversion (conv layers)
     half* conv_fp16_buf;        // [hidden_size] FP16
@@ -164,6 +166,11 @@ extern "C" void cuda_set_decode_workspace(void* ctx_ptr, void* workspace) {
     ctx->attn_workspace = workspace;
 }
 
+extern "C" void cuda_set_decode_conv_workspace(void* ctx_ptr, void* workspace) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    ctx->conv_workspace = workspace;
+}
+
 extern "C" void cuda_set_decode_paged_cache(void* ctx_ptr, void* paged_cache,
     int* d_block_table, int max_blocks_per_seq) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
@@ -201,10 +208,18 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
             result = cuda_fp16_to_bf16(ctx->conv_bf16_in, current, H);
             if (result != 0) return result;
 
-            result = cuda_conv_layer_forward_bf16(
-                ctx->conv_bf16_out, ctx->conv_bf16_in,
-                ctx->layer_weights[i], ctx->layer_caches[i],
-                1, 1, 0);  // position not used by conv decode kernel (uses state)
+            if (ctx->conv_workspace) {
+                // CUDA Graph safe: no cudaMalloc inside
+                result = cuda_conv_layer_forward_bf16_ws(
+                    ctx->conv_bf16_out, ctx->conv_bf16_in,
+                    ctx->layer_weights[i], ctx->layer_caches[i],
+                    1, 1, 0, ctx->conv_workspace);
+            } else {
+                result = cuda_conv_layer_forward_bf16(
+                    ctx->conv_bf16_out, ctx->conv_bf16_in,
+                    ctx->layer_weights[i], ctx->layer_caches[i],
+                    1, 1, 0);
+            }
             if (result != 0) return result;
 
             result = cuda_bf16_to_fp16(next, ctx->conv_bf16_out, H);
