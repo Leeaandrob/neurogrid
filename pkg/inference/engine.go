@@ -438,11 +438,16 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		var logits []float32
 
 		if hasGPUDecoder && gpuInf != nil {
-			// GPU-resident: layers run on GPU, LM head reads from GPU pointer
-			if err := gpuDecoder.DecodeStepGPUResident(len(inputTokens) + i); err != nil {
-				return nil, fmt.Errorf("GPU decode step %d failed: %w", i, err)
+			if i == 0 {
+				// First decode step: the prefill output is already in hidden_a via SetHiddenGPU.
+				// Apply LM head directly — do NOT run layers again on already-processed data.
+			} else {
+				// Subsequent steps: hidden_a has the embedding, run through layers
+				if err := gpuDecoder.DecodeStepGPUResident(len(inputTokens) + i - 1); err != nil {
+					return nil, fmt.Errorf("GPU decode step %d failed: %w", i, err)
+				}
 			}
-			// Apply LM head directly from GPU hidden state
+			// Apply LM head from GPU hidden state
 			hiddenGPUPtr := gpuDecoder.GetHiddenGPUPtr()
 			if lmForwarder, ok := gpuInf.(GPULMHeadForwarder); ok {
 				logits, err = lmForwarder.ApplyLMHeadFromGPU(hiddenGPUPtr)
@@ -459,16 +464,27 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 			}
 		} else {
 			// Standard path: forward all layers + LM head (with host copies)
-			logits, err = e.forwardAllLayers(ctx, hidden, len(inputTokens)+i, seqID)
-			if err != nil {
-				return nil, fmt.Errorf("forward pass failed at step %d: %w", i, err)
+			if i == 0 {
+				// First token: hidden is the prefill output (already layer-processed)
+				// Just apply LM head, don't run layers again
+				logits, err = e.applyLMHead(hidden)
+				if err != nil {
+					return nil, fmt.Errorf("LM head failed at step %d: %w", i, err)
+				}
+			} else {
+				logits, err = e.forwardAllLayers(ctx, hidden, len(inputTokens)+i-1, seqID)
+				if err != nil {
+					return nil, fmt.Errorf("forward pass failed at step %d: %w", i, err)
+				}
 			}
 		}
 
-		// Append token to paged KV cache
-		if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
-			if err := pagedAlloc.AppendToken(seqID); err != nil {
-				log.Printf("[Generate] Warning: paged cache append failed at decode step %d: %v", i, err)
+		// Append token to paged KV cache (skip for i=0: no layer forward, just LM head)
+		if i > 0 {
+			if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
+				if err := pagedAlloc.AppendToken(seqID); err != nil {
+					log.Printf("[Generate] Warning: paged cache append failed at decode step %d: %v", i, err)
+				}
 			}
 		}
 
