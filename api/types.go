@@ -30,7 +30,7 @@ type ChatCompletionRequest struct {
 // SetDefaults applies default values to the request.
 func (r *ChatCompletionRequest) SetDefaults() {
 	if r.MaxTokens == 0 {
-		r.MaxTokens = 256
+		r.MaxTokens = 2048
 	}
 	if r.Temperature == 0 {
 		r.Temperature = 0.7

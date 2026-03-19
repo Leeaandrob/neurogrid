@@ -424,17 +424,41 @@ func (s *Server) handleChatCompletionsStream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Stream tokens as they are generated
+	// Stream tokens — buffer thinking tokens, send only after </think>
 	var lastStopReason string
+	isThinkingModel := strings.Contains(strings.ToLower(s.config.ModelName), "lfm")
+	inThinkBlock := false
+	thinkDone := false
+
 	err = s.engine.GenerateStream(ctx, genReq, func(token inference.StreamToken) error {
-		// Send content chunk for each token
 		if token.Text != "" {
-			if err := sse.WriteEvent(streamState.CreateContentChunk(token.Text)); err != nil {
-				return err
+			if isThinkingModel && !thinkDone {
+				// Buffer thinking tokens
+				if strings.Contains(token.Text, "<think>") {
+					inThinkBlock = true
+					return nil // Don't send <think>
+				}
+				if inThinkBlock {
+					if strings.Contains(token.Text, "</think>") {
+						thinkDone = true
+						return nil // Don't send </think>
+					}
+					return nil // Buffer thinking content
+				}
+			}
+
+			// Send visible content
+			text := token.Text
+			// Clean any residual markers
+			text = strings.ReplaceAll(text, "<|im_end|>", "")
+			text = strings.ReplaceAll(text, "<|im_start|>", "")
+			if text != "" {
+				if err := sse.WriteEvent(streamState.CreateContentChunk(text)); err != nil {
+					return err
+				}
 			}
 		}
 
-		// Track stop reason for final chunk
 		if token.IsFinal {
 			lastStopReason = token.StopReason
 		}
@@ -488,21 +512,30 @@ func buildLlamaPrompt(messages []Message) string {
 // getStopStringsForModel returns stop strings that prevent the model from generating new turns.
 // Different chat templates use different markers for role changes.
 func getStopStringsForModel(modelName string) []string {
-	// Return empty - we'll clean up the output instead of stopping early
-	// This prevents issues with models that generate template tokens at the start
+	lower := strings.ToLower(modelName)
+	if strings.Contains(lower, "lfm") {
+		// LFM2 thinking models: stop after </think> + answer, or at turn boundary
+		return []string{"<|im_end|>", "<|im_start|>"}
+	}
 	return []string{}
 }
 
-// cleanModelOutput removes leaked template tokens from model output.
-// Some models (especially smaller ones like TinyLlama) may generate template markers
-// as part of their response. This function strips them out.
+// cleanModelOutput removes leaked template tokens and thinking blocks from model output.
 func cleanModelOutput(text string, modelName string) string {
 	lower := strings.ToLower(modelName)
+
+	// Strip <think>...</think> blocks for thinking models (LFM2, etc.)
+	if strings.Contains(lower, "lfm") || strings.Contains(text, "<think>") {
+		text = model.StripThinkingTokens(text)
+		text = strings.TrimSpace(text)
+	}
 
 	// Define markers to remove based on model type
 	var markers []string
 
-	if strings.Contains(lower, "tinyllama") {
+	if strings.Contains(lower, "lfm") {
+		markers = []string{"<|im_start|>", "<|im_end|>", "<|startoftext|>", "<|endoftext|>"}
+	} else if strings.Contains(lower, "tinyllama") {
 		markers = []string{"<|system|>", "<|user|>", "<|assistant|>", "</s>"}
 	} else if strings.Contains(lower, "llama-3") || strings.Contains(lower, "llama3") {
 		markers = []string{"<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>", "<|begin_of_text|>"}
