@@ -922,6 +922,47 @@ func LayerForwardFP16WithWorkspace(output, input *types.Tensor, weights *LayerWe
 }
 
 // =============================================================================
+// Paged KV Cache (PagedAttention)
+// =============================================================================
+
+// PagedKVCache holds a block-based KV cache on GPU.
+type PagedKVCache struct {
+	ptr unsafe.Pointer
+}
+
+// CreatePagedKVCache creates a paged KV cache with the given number of blocks.
+func CreatePagedKVCache(numBlocks, numKVHeads, headDim, blockSize int) (*PagedKVCache, error) {
+	var ptr unsafe.Pointer
+	result := C.cuda_paged_kvcache_create(&ptr, C.int(numBlocks), C.int(numKVHeads), C.int(headDim), C.int(blockSize))
+	if result != 0 {
+		return nil, fmt.Errorf("failed to create paged KV cache: %d", result)
+	}
+	return &PagedKVCache{ptr: ptr}, nil
+}
+
+// FreePagedKVCache releases the paged KV cache.
+func FreePagedKVCache(cache *PagedKVCache) {
+	if cache != nil && cache.ptr != nil {
+		C.cuda_paged_kvcache_free(cache.ptr)
+		cache.ptr = nil
+	}
+}
+
+// PagedAttention runs paged attention with KV cache update.
+func PagedAttention(output, query, newKey, newValue unsafe.Pointer, cache *PagedKVCache,
+	dBlockTable unsafe.Pointer, numHeads, numKVHeads, headDim, position int) error {
+	result := C.cuda_paged_attention(output, query, newKey, newValue, cache.ptr,
+		(*C.int)(dBlockTable), C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(position))
+	if result != 0 {
+		return fmt.Errorf("paged attention failed: %d", result)
+	}
+	return nil
+}
+
+// Ptr returns the underlying cache pointer.
+func (c *PagedKVCache) Ptr() unsafe.Pointer { return c.ptr }
+
+// =============================================================================
 // Full Decode Context — all layers in a single CUDA call
 // =============================================================================
 

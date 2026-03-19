@@ -407,6 +407,18 @@ int cuda_decode_step_gpu(void* ctx, int position);
 void* cuda_decode_get_hidden_gpu_ptr(void* ctx);
 void cuda_free_decode_context(void* ctx);
 
+// ============================================================================
+// Paged KV Cache (PagedAttention)
+// ============================================================================
+
+int cuda_paged_kvcache_create(void** cache, int num_blocks, int num_kv_heads, int head_dim, int block_size);
+void cuda_paged_kvcache_free(void* cache);
+int cuda_paged_kvcache_update(void* cache, const void* new_key, const void* new_value,
+    const int* d_block_table, int position);
+int cuda_paged_attention(void* output, const void* query, const void* new_key, const void* new_value,
+    void* cache, const int* d_block_table,
+    int num_heads, int num_kv_heads, int head_dim, int position);
+
 // FP16 layer workspace — pre-allocated buffers for zero-alloc forward passes
 int cuda_create_layer_workspace_fp16(
     void** workspace,

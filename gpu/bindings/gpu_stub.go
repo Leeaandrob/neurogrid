@@ -636,6 +636,22 @@ func LayerForwardFP16WithWorkspace(output, input *types.Tensor, weights *LayerWe
 }
 
 // =============================================================================
+// Paged KV Cache (Stubs)
+// =============================================================================
+
+type PagedKVCache struct{ ptr unsafe.Pointer }
+
+func CreatePagedKVCache(numBlocks, numKVHeads, headDim, blockSize int) (*PagedKVCache, error) {
+	return nil, ErrNotImplemented
+}
+func FreePagedKVCache(cache *PagedKVCache) {}
+func PagedAttention(output, query, newKey, newValue unsafe.Pointer, cache *PagedKVCache,
+	dBlockTable unsafe.Pointer, numHeads, numKVHeads, headDim, position int) error {
+	return ErrNotImplemented
+}
+func (c *PagedKVCache) Ptr() unsafe.Pointer { return nil }
+
+// =============================================================================
 // Full Decode Context (Stubs)
 // =============================================================================
 
