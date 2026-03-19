@@ -563,10 +563,21 @@ func (e *CUDALayerExecutor) DecodeAll(hidden []byte, position int) ([]byte, erro
 	if e.decodeCtx == nil {
 		return nil, fmt.Errorf("decode context not initialized")
 	}
-	// When paged cache is active, don't use DecodeAll (decode context uses contiguous KV).
-	// Fall through to per-layer path which handles paged attention.
-	if e.usePagedCache {
-		return nil, fmt.Errorf("paged cache active, use per-layer path")
+	// When paged cache is active, update the block table on GPU before decode.
+	// The decode context's paged attention reads from the same persistent block table buffer.
+	if e.usePagedCache && e.pagedManager != nil {
+		activeSeqID := e.pagedManager.FirstActiveSequenceID()
+		if activeSeqID == 0 {
+			return nil, fmt.Errorf("no active sequence for paged decode")
+		}
+		blockTable, _, err := e.pagedManager.GetBlockTable(activeSeqID, e.maxBlocksPerSeq)
+		if err != nil {
+			return nil, fmt.Errorf("get block table: %w", err)
+		}
+		tableBytes := uint64(len(blockTable) * 4)
+		if err := bindings.CopyToDeviceRaw(e.blockTableGPU, getBytePointer(blockTableToBytes(blockTable)), tableBytes); err != nil {
+			return nil, fmt.Errorf("copy block table: %w", err)
+		}
 	}
 
 	output := make([]byte, len(hidden))
@@ -582,10 +593,16 @@ func (e *CUDALayerExecutor) DecodeStepGPUResident(position int) error {
 	if e.decodeCtx == nil {
 		return fmt.Errorf("decode context not initialized")
 	}
-	// When paged cache is active, decode context uses contiguous KV which isn't updated.
-	// Fall back to per-layer path.
-	if e.usePagedCache {
-		return fmt.Errorf("paged cache active, use per-layer path")
+	// When paged cache is active, update block table before decode
+	if e.usePagedCache && e.pagedManager != nil {
+		activeSeqID := e.pagedManager.FirstActiveSequenceID()
+		if activeSeqID > 0 {
+			blockTable, _, err := e.pagedManager.GetBlockTable(activeSeqID, e.maxBlocksPerSeq)
+			if err == nil {
+				tableBytes := uint64(len(blockTable) * 4)
+				bindings.CopyToDeviceRaw(e.blockTableGPU, getBytePointer(blockTableToBytes(blockTable)), tableBytes)
+			}
+		}
 	}
 	return bindings.DecodeStepGPU(e.decodeCtx, position)
 }
@@ -951,6 +968,14 @@ func (e *CUDALayerExecutor) ResetKVCache() error {
 	}
 
 	return nil
+}
+
+// blockTableToBytes converts []int32 to []byte for GPU copy.
+func blockTableToBytes(table []int32) []byte {
+	if len(table) == 0 {
+		return nil
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(&table[0])), len(table)*4)
 }
 
 // getBytePointer returns an unsafe.Pointer to the first element of a byte slice.

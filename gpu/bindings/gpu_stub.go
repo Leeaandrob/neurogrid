@@ -671,6 +671,7 @@ func CreateDecodeContext(config *types.LlamaConfig) (*DecodeContext, error) {
 func SetDecodeLayer(ctx *DecodeContext, layerID, layerType int, weights, cache unsafe.Pointer) {}
 func SetDecodeWorkspace(ctx *DecodeContext, workspace *LayerWorkspaceFP16) {}
 func SetDecodePagedCache(ctx *DecodeContext, pagedCache *PagedKVCache, dBlockTable unsafe.Pointer, maxBlocksPerSeq int) {}
+func SetDecodePagedLayer(ctx *DecodeContext, layerID int, pagedCache *PagedKVCache) {}
 func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {
 	return ErrNotImplemented
 }

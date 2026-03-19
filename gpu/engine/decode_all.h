@@ -25,6 +25,7 @@ int cuda_decode_get_hidden(void* ctx, void* h_hidden);
 int cuda_decode_step_gpu(void* ctx, int position);
 void* cuda_decode_get_hidden_gpu_ptr(void* ctx);
 
+void cuda_set_decode_paged_layer(void* ctx, int layer_id, void* paged_cache);
 void cuda_free_decode_context(void* ctx);
 
 #ifdef __cplusplus

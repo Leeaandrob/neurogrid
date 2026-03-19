@@ -1053,6 +1053,13 @@ func SetDecodePagedCache(ctx *DecodeContext, pagedCache *PagedKVCache, dBlockTab
 	}
 }
 
+// SetDecodePagedLayer sets a per-layer paged cache on the decode context.
+func SetDecodePagedLayer(ctx *DecodeContext, layerID int, pagedCache *PagedKVCache) {
+	if pagedCache != nil {
+		C.cuda_set_decode_paged_layer(ctx.ptr, C.int(layerID), pagedCache.ptr)
+	}
+}
+
 // DecodeStep runs all layers for a single token decode step.
 // Input/output are HOST FP16 byte slices.
 func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {

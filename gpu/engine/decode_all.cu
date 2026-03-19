@@ -73,10 +73,11 @@ struct DecodeContext {
     // GPU position buffer (avoids per-step allocation)
     int* d_position;
 
-    // Paged KV Cache (replaces per-layer KVCache* for attention layers)
-    void* paged_cache;           // PagedKVCache*
-    int* d_block_table;          // GPU block table buffer
+    // Paged KV Cache — per-layer (replaces per-layer KVCache* for attention layers)
+    void** paged_caches;         // [num_layers] PagedKVCache* (NULL for conv layers)
+    int* d_block_table;          // GPU block table buffer (shared, updated before each step)
     int max_blocks_per_seq;
+    bool use_paged;
 
     // CUDA Graph for decode step replay
     cudaGraph_t graph;
@@ -163,9 +164,19 @@ extern "C" void cuda_set_decode_workspace(void* ctx_ptr, void* workspace) {
 extern "C" void cuda_set_decode_paged_cache(void* ctx_ptr, void* paged_cache,
     int* d_block_table, int max_blocks_per_seq) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
-    ctx->paged_cache = paged_cache;
     ctx->d_block_table = d_block_table;
     ctx->max_blocks_per_seq = max_blocks_per_seq;
+    ctx->use_paged = true;
+    // Note: per-layer caches set via cuda_set_decode_paged_layer
+}
+
+// Set per-layer paged cache (call once per attention layer during init)
+extern "C" void cuda_set_decode_paged_layer(void* ctx_ptr, int layer_id, void* paged_cache) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    if (!ctx->paged_caches) {
+        ctx->paged_caches = (void**)calloc(ctx->num_layers, sizeof(void*));
+    }
+    ctx->paged_caches[layer_id] = paged_cache;
 }
 
 // ============================================================================
@@ -194,11 +205,11 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
             if (result != 0) return result;
         } else {
             // Attention layer: FP16 forward
-            if (ctx->paged_cache && ctx->attn_workspace) {
-                // Paged attention path: use block-based KV cache
+            if (ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i] && ctx->attn_workspace) {
+                // Paged attention path: per-layer block-based KV cache
                 result = cuda_layer_forward_fp16_paged(
                     next, current, ctx->layer_weights[i],
-                    ctx->paged_cache, ctx->d_block_table,
+                    ctx->paged_caches[i], ctx->d_block_table,
                     ctx->d_position, 1, 1,
                     H, ctx->intermediate_size, ctx->num_heads,
                     ctx->num_kv_heads, ctx->head_dim,
@@ -410,5 +421,6 @@ extern "C" void cuda_free_decode_context(void* ctx_ptr) {
     if (ctx->layer_types) free(ctx->layer_types);
     if (ctx->layer_weights) free(ctx->layer_weights);
     if (ctx->layer_caches) free(ctx->layer_caches);
+    if (ctx->paged_caches) free(ctx->paged_caches);
     free(ctx);
 }
