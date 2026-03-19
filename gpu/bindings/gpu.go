@@ -962,6 +962,51 @@ func PagedAttention(output, query, newKey, newValue unsafe.Pointer, cache *Paged
 // Ptr returns the underlying cache pointer.
 func (c *PagedKVCache) Ptr() unsafe.Pointer { return c.ptr }
 
+// LayerForwardFP16Paged executes FP16 layer forward with paged attention (block-based KV cache).
+func LayerForwardFP16Paged(output, input *types.Tensor, weights *LayerWeightsFP16,
+	pagedCache *PagedKVCache, dBlockTable unsafe.Pointer,
+	positions []int32, config *types.LlamaConfig, ropeStyle int,
+	workspace *LayerWorkspaceFP16) error {
+	if output == nil || input == nil || weights == nil || pagedCache == nil || workspace == nil {
+		return errors.New("nil argument to LayerForwardFP16Paged")
+	}
+
+	batch := input.Shape[0]
+	seqLen := input.Shape[1]
+
+	var dPositions unsafe.Pointer
+	posSize := C.size_t(len(positions) * 4)
+	if C.cuda_malloc(&dPositions, posSize) != 0 {
+		return errors.New("failed to allocate positions on GPU")
+	}
+	defer C.cuda_free(dPositions)
+
+	if C.cudaMemcpy(dPositions, unsafe.Pointer(&positions[0]), posSize, C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy positions to GPU")
+	}
+
+	ropeTheta := config.RopeTheta
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0
+	}
+
+	result := C.cuda_layer_forward_fp16_paged(
+		output.Data, input.Data, weights.ptr,
+		pagedCache.ptr,
+		(*C.int)(dBlockTable),
+		(*C.int)(dPositions),
+		C.int(batch), C.int(seqLen),
+		C.int(config.HiddenSize), C.int(config.IntermediateSize),
+		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
+		C.float(config.RMSNormEps), C.float(ropeTheta), C.int(ropeStyle),
+		workspace.ptr,
+	)
+	if result != 0 {
+		return fmt.Errorf("FP16 paged layer forward failed: %d", result)
+	}
+	return nil
+}
+
 // =============================================================================
 // Full Decode Context — all layers in a single CUDA call
 // =============================================================================
@@ -998,6 +1043,13 @@ func SetDecodeLayer(ctx *DecodeContext, layerID, layerType int, weights, cache u
 func SetDecodeWorkspace(ctx *DecodeContext, workspace *LayerWorkspaceFP16) {
 	if workspace != nil {
 		C.cuda_set_decode_workspace(ctx.ptr, workspace.ptr)
+	}
+}
+
+// SetDecodePagedCache sets the paged KV cache on the decode context.
+func SetDecodePagedCache(ctx *DecodeContext, pagedCache *PagedKVCache, dBlockTable unsafe.Pointer, maxBlocksPerSeq int) {
+	if pagedCache != nil {
+		C.cuda_set_decode_paged_cache(ctx.ptr, pagedCache.ptr, (*C.int)(dBlockTable), C.int(maxBlocksPerSeq))
 	}
 }
 

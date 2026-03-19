@@ -14,6 +14,7 @@ int cuda_create_decode_context(
 
 void cuda_set_decode_layer(void* ctx, int layer_id, int layer_type, void* weights, void* cache);
 void cuda_set_decode_workspace(void* ctx, void* workspace);
+void cuda_set_decode_paged_cache(void* ctx, void* paged_cache, int* d_block_table, int max_blocks_per_seq);
 
 int cuda_decode_step(void* ctx, void* h_output, const void* h_input, int position);
 

@@ -99,6 +99,17 @@ int cuda_layer_forward_fp16_with_workspace(
     void* workspace
 );
 
+// FP16 layer forward with paged attention (block-based KV cache)
+int cuda_layer_forward_fp16_paged(
+    void* output, const void* input, const void* weights,
+    void* paged_cache,           // PagedKVCache*
+    const int* d_block_table,    // GPU block table
+    const int* positions, int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+);
+
 #ifdef __cplusplus
 }
 #endif

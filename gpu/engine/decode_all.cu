@@ -19,6 +19,9 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
 extern "C" int cuda_layer_forward_fp16(
     void*, const void*, const void*, void*, const int*, int, int,
     int, int, int, int, int, float, float, int);
+extern "C" int cuda_layer_forward_fp16_paged(
+    void*, const void*, const void*, void*, const int*, const int*, int, int,
+    int, int, int, int, int, float, float, int, void*);
 extern "C" int cuda_fp16_to_bf16(void*, const void*, size_t);
 extern "C" int cuda_bf16_to_fp16(void*, const void*, size_t);
 extern "C" int cublas_set_stream(void* stream);
@@ -69,6 +72,11 @@ struct DecodeContext {
 
     // GPU position buffer (avoids per-step allocation)
     int* d_position;
+
+    // Paged KV Cache (replaces per-layer KVCache* for attention layers)
+    void* paged_cache;           // PagedKVCache*
+    int* d_block_table;          // GPU block table buffer
+    int max_blocks_per_seq;
 
     // CUDA Graph for decode step replay
     cudaGraph_t graph;
@@ -152,6 +160,14 @@ extern "C" void cuda_set_decode_workspace(void* ctx_ptr, void* workspace) {
     ctx->attn_workspace = workspace;
 }
 
+extern "C" void cuda_set_decode_paged_cache(void* ctx_ptr, void* paged_cache,
+    int* d_block_table, int max_blocks_per_seq) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    ctx->paged_cache = paged_cache;
+    ctx->d_block_table = d_block_table;
+    ctx->max_blocks_per_seq = max_blocks_per_seq;
+}
+
 // ============================================================================
 // Internal: run all layers (used for both normal and graph-captured paths)
 // ============================================================================
@@ -178,7 +194,17 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
             if (result != 0) return result;
         } else {
             // Attention layer: FP16 forward
-            if (ctx->attn_workspace) {
+            if (ctx->paged_cache && ctx->attn_workspace) {
+                // Paged attention path: use block-based KV cache
+                result = cuda_layer_forward_fp16_paged(
+                    next, current, ctx->layer_weights[i],
+                    ctx->paged_cache, ctx->d_block_table,
+                    ctx->d_position, 1, 1,
+                    H, ctx->intermediate_size, ctx->num_heads,
+                    ctx->num_kv_heads, ctx->head_dim,
+                    ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
+                    ctx->attn_workspace);
+            } else if (ctx->attn_workspace) {
                 result = cuda_layer_forward_fp16_with_workspace(
                     next, current, ctx->layer_weights[i], ctx->layer_caches[i],
                     ctx->d_position, 1, 1,

@@ -14,6 +14,9 @@
 #include "../cuda/attention.h"
 #include "../cuda/memory.h"
 
+// Forward declaration for paged attention (from paged_attention.cu)
+extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*, void*, const int*, int, int, int, int);
+
 // Enable debug output (disabled for clean testing)
 // #define DEBUG_CUDA 1
 
@@ -1041,6 +1044,116 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
     if (result != 0) return result;
 
     // Fused SiLU(gate) * up (saves 1 kernel launch + 1 memory pass)
+    result = cuda_silu_mul(gate_buf, gate_buf, up_buf, num_tokens * intermediate_size);
+    if (result != 0) return result;
+
+    // Down projection
+    result = cuda_gemm_fp16(normed, gate_buf, w->down_proj, num_tokens, intermediate_size, hidden_size, false, true);
+    if (result != 0) return result;
+
+    // 9. Final residual add
+    result = cuda_add(output, normed, residual, num_tokens * hidden_size);
+    return result;
+}
+
+// ============================================================================
+// FP16 Layer Forward with Paged Attention — uses block-based KV cache
+// ============================================================================
+
+extern "C" int cuda_layer_forward_fp16_paged(
+    void* output, const void* input, const void* weights,
+    void* paged_cache,           // PagedKVCache* instead of KVCache*
+    const int* d_block_table,    // GPU block table for this sequence
+    const int* positions, int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+) {
+    LayerWeightsFP16* w = (LayerWeightsFP16*)weights;
+    LayerWorkspaceFP16* ws = (LayerWorkspaceFP16*)workspace;
+
+    int num_tokens = batch_size * seq_len;
+    int kv_dim = num_kv_heads * head_dim;
+
+    half* normed = ws->normed;
+    half* q = ws->q;
+    half* k = ws->k;
+    half* v = ws->v;
+    half* attn_out = ws->attn_out;
+    half* residual = ws->residual;
+    half* gate_buf = ws->gate_buf;
+    half* up_buf = ws->up_buf;
+
+    int result;
+
+    // Save residual
+    CUDA_CHECK(cudaMemcpy(residual, input, num_tokens * hidden_size * sizeof(half), cudaMemcpyDeviceToDevice));
+
+    // 1. Attention RMSNorm
+    result = cuda_rmsnorm(normed, input, w->attn_norm, num_tokens, hidden_size, rms_norm_eps);
+    if (result != 0) return result;
+
+    // 2. Q, K, V projections (FP16 GEMM)
+    result = cuda_gemm_fp16(q, normed, w->q_proj, num_tokens, hidden_size, hidden_size, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_fp16(k, normed, w->k_proj, num_tokens, hidden_size, kv_dim, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_fp16(v, normed, w->v_proj, num_tokens, hidden_size, kv_dim, false, true);
+    if (result != 0) return result;
+
+    // 2b. QK LayerNorm (LFM2)
+    if (w->q_layernorm != nullptr) {
+        int block_size_qk = min(32, head_dim);
+        block_size_qk = ((block_size_qk + 31) / 32) * 32;
+        per_head_rmsnorm_kernel<<<num_tokens * num_heads, block_size_qk>>>(
+            q, q, w->q_layernorm, num_tokens, num_heads, head_dim, rms_norm_eps);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return -1;
+    }
+    if (w->k_layernorm != nullptr) {
+        int block_size_qk = min(32, head_dim);
+        block_size_qk = ((block_size_qk + 31) / 32) * 32;
+        per_head_rmsnorm_kernel<<<num_tokens * num_kv_heads, block_size_qk>>>(
+            k, k, w->k_layernorm, num_tokens, num_kv_heads, head_dim, rms_norm_eps);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return -1;
+    }
+
+    // 3. RoPE
+    result = cuda_rope_with_theta(q, q, positions, batch_size, seq_len, num_heads, head_dim, rope_style, rope_theta);
+    if (result != 0) return result;
+    result = cuda_rope_with_theta(k, k, positions, batch_size, seq_len, num_kv_heads, head_dim, rope_style, rope_theta);
+    if (result != 0) return result;
+
+    // 4. Paged Attention (replaces flash/contiguous attention)
+    if (seq_len == 1 && paged_cache != nullptr) {
+        int position;
+        CUDA_CHECK(cudaMemcpy(&position, positions, sizeof(int), cudaMemcpyDeviceToHost));
+        result = cuda_paged_attention(attn_out, q, k, v, paged_cache, d_block_table,
+            num_heads, num_kv_heads, head_dim, position);
+    } else {
+        // Prefill: use basic attention (paged cache not used during prefill)
+        result = cuda_basic_attention_gqa(attn_out, q, k, v,
+            batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
+    }
+    if (result != 0) return result;
+
+    // 5. O projection (FP16)
+    result = cuda_gemm_fp16(normed, attn_out, w->o_proj, num_tokens, hidden_size, hidden_size, false, true);
+    if (result != 0) return result;
+
+    // 6+7. Fused: Residual Add + RMSNorm
+    result = cuda_add_rmsnorm(normed, residual, normed, residual, w->ffn_norm,
+                              num_tokens, hidden_size, rms_norm_eps);
+    if (result != 0) return result;
+
+    // 8. SwiGLU FFN (FP16 GEMM)
+    result = cuda_gemm_fp16(gate_buf, normed, w->gate_proj, num_tokens, hidden_size, intermediate_size, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_fp16(up_buf, normed, w->up_proj, num_tokens, hidden_size, intermediate_size, false, true);
+    if (result != 0) return result;
+
+    // Fused SiLU(gate) * up
     result = cuda_silu_mul(gate_buf, gate_buf, up_buf, num_tokens * intermediate_size);
     if (result != 0) return result;
 

@@ -90,6 +90,14 @@ type GPUEmbeddingLookup interface {
 	EmbedTokenGPUPtr(tokenID int) (unsafe.Pointer, error)
 }
 
+// PagedCacheAllocator manages paged KV cache block allocation for sequences.
+type PagedCacheAllocator interface {
+	AllocateSequence(seqID uint64, maxTokens int) error
+	AppendToken(seqID uint64) error
+	FreeSequence(seqID uint64)
+	GetBlockTableGPU(seqID uint64) (unsafe.Pointer, int, error) // returns GPU ptr, seqLen
+}
+
 // EngineConfig holds configuration for the inference engine.
 type EngineConfig struct {
 	ModelConfig      *types.LlamaConfig
@@ -379,6 +387,16 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	// Clear KV caches for new sequence
 	e.kvCaches.ClearAll()
 
+	// Allocate paged KV cache blocks for this sequence if available
+	if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
+		maxTokens := len(inputTokens) + req.MaxTokens
+		if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
+			log.Printf("[Generate] Paged cache allocation failed: %v (using contiguous fallback)", err)
+		} else {
+			defer pagedAlloc.FreeSequence(seqID)
+		}
+	}
+
 	// Prefill phase - process all input tokens
 	hidden, err := e.prefill(ctx, inputTokens, seqID)
 	if err != nil {
@@ -438,6 +456,13 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 			logits, err = e.forwardAllLayers(ctx, hidden, len(inputTokens)+i, seqID)
 			if err != nil {
 				return nil, fmt.Errorf("forward pass failed at step %d: %w", i, err)
+			}
+		}
+
+		// Append token to paged KV cache
+		if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
+			if err := pagedAlloc.AppendToken(seqID); err != nil {
+				log.Printf("[Generate] Warning: paged cache append failed at decode step %d: %v", i, err)
 			}
 		}
 
@@ -552,6 +577,16 @@ func (e *Engine) GenerateStream(ctx context.Context, req *GenerateRequest, callb
 	// Clear KV caches for new sequence
 	e.kvCaches.ClearAll()
 
+	// Allocate paged KV cache blocks for this sequence if available
+	if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
+		maxTokens := len(inputTokens) + req.MaxTokens
+		if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
+			log.Printf("[GenerateStream] Paged cache allocation failed: %v (using contiguous fallback)", err)
+		} else {
+			defer pagedAlloc.FreeSequence(seqID)
+		}
+	}
+
 	// Prefill phase - process all input tokens
 	hidden, err := e.prefill(ctx, inputTokens, seqID)
 	if err != nil {
@@ -573,6 +608,13 @@ func (e *Engine) GenerateStream(ctx context.Context, req *GenerateRequest, callb
 		logits, err := e.forwardAllLayers(ctx, hidden, len(inputTokens)+i, seqID)
 		if err != nil {
 			return fmt.Errorf("forward pass failed at step %d: %w", i, err)
+		}
+
+		// Append token to paged KV cache
+		if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
+			if err := pagedAlloc.AppendToken(seqID); err != nil {
+				log.Printf("[GenerateStream] Warning: paged cache append failed at step %d: %v", i, err)
+			}
 		}
 
 		// Sample next token
@@ -670,6 +712,8 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
+	pagedAlloc, hasPaged := e.layerExecutor.(PagedCacheAllocator)
+
 	// Get embeddings for all input tokens
 	var hidden []byte
 	for i, token := range tokens {
@@ -689,6 +733,13 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		hidden, err = e.forwardAllLayersHidden(ctx, tokenHidden, i, seqID)
 		if err != nil {
 			return nil, fmt.Errorf("forward at position %d failed: %w", i, err)
+		}
+
+		// Append token to paged KV cache
+		if hasPaged {
+			if err := pagedAlloc.AppendToken(seqID); err != nil {
+				log.Printf("[prefill] Warning: paged cache append failed at pos %d: %v", i, err)
+			}
 		}
 	}
 

@@ -219,12 +219,50 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 	}
 	log.Printf("All %d layers loaded to GPU", e.config.NumLayers)
 
+	// Initialize paged KV cache if model uses attention layers
+	numAttnLayers := 0
+	for i := 0; i < e.config.NumLayers; i++ {
+		if !e.config.IsConvLayer(i) {
+			numAttnLayers++
+		}
+	}
+	if numAttnLayers > 0 && e.config.NumKVHeads > 0 && e.config.HeadDim > 0 {
+		// Calculate num_blocks based on available VRAM: use 25% of remaining VRAM for KV cache
+		usedVRAM, _ := bindings.GetMemoryUsed()
+		availableVRAM := uint64(0)
+		if info != nil && info.TotalMemory > usedVRAM {
+			availableVRAM = (info.TotalMemory - usedVRAM) / 4 // 25% of remaining
+		}
+		if availableVRAM < 64*1024*1024 {
+			availableVRAM = 64 * 1024 * 1024 // Minimum 64MB
+		}
+		numBlocks := CalculateNumBlocks(availableVRAM, numAttnLayers, e.config.NumKVHeads, e.config.HeadDim)
+		if numBlocks > 0 {
+			if err := gpu.LayerExecutor.InitPagedKVCache(numBlocks, e.config.NumKVHeads, e.config.HeadDim); err != nil {
+				log.Printf("Warning: Could not init paged KV cache: %v (falling back to contiguous)", err)
+			} else {
+				log.Printf("Paged KV cache initialized: %d blocks (block_size=%d, ~%d max tokens)",
+					numBlocks, BlockSize, numBlocks*BlockSize)
+			}
+		}
+	}
+
 	// Build full-model decode context for fast single-call inference
 	log.Printf("Building decode context (ModelType=%q, NumLayers=%d)", e.config.ModelType, e.config.NumLayers)
 	if err := gpu.LayerExecutor.BuildDecodeContext(); err != nil {
 		log.Printf("Warning: Could not build decode context (will use per-layer path): %v", err)
 	} else {
 		log.Printf("Full-model decode context built (all layers in single CUDA call)")
+		// If paged cache is available, set it on the decode context
+		if gpu.LayerExecutor.HasPagedCache() {
+			bindings.SetDecodePagedCache(
+				gpu.LayerExecutor.decodeCtx,
+				gpu.LayerExecutor.pagedCache,
+				gpu.LayerExecutor.blockTableGPU,
+				gpu.LayerExecutor.maxBlocksPerSeq,
+			)
+			log.Printf("Paged KV cache set on decode context")
+		}
 	}
 
 	// Report GPU memory usage

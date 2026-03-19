@@ -263,6 +263,17 @@ func (m *PagedKVCacheManager) FreeAll() {
 	}
 }
 
+// FirstActiveSequenceID returns the ID of the first active sequence, or 0 if none.
+func (m *PagedKVCacheManager) FirstActiveSequenceID() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for seqID := range m.sequences {
+		return seqID
+	}
+	return 0
+}
+
 // Stats returns current usage statistics.
 func (m *PagedKVCacheManager) Stats() (totalBlocks, freeBlocks, activeSequences int) {
 	m.mu.RLock()

@@ -651,6 +651,14 @@ func PagedAttention(output, query, newKey, newValue unsafe.Pointer, cache *Paged
 }
 func (c *PagedKVCache) Ptr() unsafe.Pointer { return nil }
 
+// LayerForwardFP16Paged executes FP16 layer forward with paged attention (stub).
+func LayerForwardFP16Paged(output, input *types.Tensor, weights *LayerWeightsFP16,
+	pagedCache *PagedKVCache, dBlockTable unsafe.Pointer,
+	positions []int32, config *types.LlamaConfig, ropeStyle int,
+	workspace *LayerWorkspaceFP16) error {
+	return ErrNotImplemented
+}
+
 // =============================================================================
 // Full Decode Context (Stubs)
 // =============================================================================
@@ -662,6 +670,7 @@ func CreateDecodeContext(config *types.LlamaConfig) (*DecodeContext, error) {
 }
 func SetDecodeLayer(ctx *DecodeContext, layerID, layerType int, weights, cache unsafe.Pointer) {}
 func SetDecodeWorkspace(ctx *DecodeContext, workspace *LayerWorkspaceFP16) {}
+func SetDecodePagedCache(ctx *DecodeContext, pagedCache *PagedKVCache, dBlockTable unsafe.Pointer, maxBlocksPerSeq int) {}
 func DecodeStep(ctx *DecodeContext, output, input []byte, position int) error {
 	return ErrNotImplemented
 }

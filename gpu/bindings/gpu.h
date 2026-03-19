@@ -399,6 +399,7 @@ int cuda_create_decode_context(void** ctx_out,
     float norm_eps, float rope_theta, int rope_style, int conv_kernel_size);
 void cuda_set_decode_layer(void* ctx, int layer_id, int layer_type, void* weights, void* cache);
 void cuda_set_decode_workspace(void* ctx, void* workspace);
+void cuda_set_decode_paged_cache(void* ctx, void* paged_cache, int* d_block_table, int max_blocks_per_seq);
 int cuda_decode_step(void* ctx, void* h_output, const void* h_input, int position);
 int cuda_decode_set_hidden(void* ctx, const void* h_hidden);
 int cuda_decode_set_hidden_from_gpu(void* ctx, const void* d_hidden);
@@ -433,6 +434,17 @@ void cuda_free_layer_workspace_fp16(void* workspace);
 
 int cuda_layer_forward_fp16_with_workspace(
     void* output, const void* input, const void* weights, void* kv_cache,
+    const int* positions, int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+);
+
+// FP16 layer forward with paged attention (block-based KV cache)
+int cuda_layer_forward_fp16_paged(
+    void* output, const void* input, const void* weights,
+    void* paged_cache,           // PagedKVCache*
+    const int* d_block_table,    // GPU block table
     const int* positions, int batch_size, int seq_len,
     int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
     float rms_norm_eps, float rope_theta, int rope_style,
