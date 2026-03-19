@@ -380,7 +380,7 @@ extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
         ctx->warmup_count_gpu = 3;
         cudaGetLastError(); // Clear stale errors
 
-        cudaError_t err = cudaStreamBeginCapture((cudaStream_t)0, cudaStreamCaptureModeRelaxed);
+        cudaError_t err = cudaStreamBeginCapture((cudaStream_t)0, cudaStreamCaptureModeThreadLocal);
         if (err != cudaSuccess) {
             fprintf(stderr, "[NeuroGrid] Graph capture failed: %s (running without graphs)\n", cudaGetErrorString(err));
             int res = run_all_layers(ctx, nullptr);
