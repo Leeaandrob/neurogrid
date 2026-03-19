@@ -7,9 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "stream.h"
 #include "memory.h"
 #include "matmul.h"
 
+#include "stream.h"
 // Error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -159,7 +161,7 @@ extern "C" int cuda_copy_to_device(void* dst, const void* src, size_t num_elemen
         // Convert FP32 to FP16 on device
         int block_size = 256;
         int num_blocks = (num_elements + block_size - 1) / block_size;
-        fp32_to_fp16_kernel<<<num_blocks, block_size>>>((half*)dst, d_temp, num_elements);
+        fp32_to_fp16_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>((half*)dst, d_temp, num_elements);
 
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaFree(d_temp));
@@ -191,7 +193,7 @@ extern "C" int cuda_copy_to_host(void* dst, const void* src, size_t num_elements
         // Convert FP16 to FP32 on device
         int block_size = 256;
         int num_blocks = (num_elements + block_size - 1) / block_size;
-        fp16_to_fp32_kernel<<<num_blocks, block_size>>>(d_temp, (const half*)src, num_elements);
+        fp16_to_fp32_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(d_temp, (const half*)src, num_elements);
 
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpy(dst, d_temp, num_elements * sizeof(float),

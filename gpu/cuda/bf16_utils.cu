@@ -8,8 +8,10 @@
 #include <math.h>
 #include <stdio.h>
 
+#include "stream.h"
 #include "bf16_utils.h"
 
+#include "stream.h"
 // Error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -101,7 +103,7 @@ extern "C" int cuda_bf16_rmsnorm(
     int block_size = min(1024, hidden_dim);
     block_size = ((block_size + 31) / 32) * 32;
 
-    bf16_rmsnorm_kernel<<<num_tokens, block_size>>>(
+    bf16_rmsnorm_kernel<<<num_tokens, block_size, 0, ng_get_stream()>>>(
         (__nv_bfloat16*)output,
         (const __nv_bfloat16*)input,
         (const __nv_bfloat16*)weight,
@@ -134,7 +136,7 @@ extern "C" int cuda_bf16_silu(void* output, const void* input, size_t num_elemen
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    bf16_silu_kernel<<<num_blocks, block_size>>>(
+    bf16_silu_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (__nv_bfloat16*)output,
         (const __nv_bfloat16*)input,
         num_elements
@@ -166,7 +168,7 @@ extern "C" int cuda_bf16_add(void* c, const void* a, const void* b, size_t num_e
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    bf16_add_kernel<<<num_blocks, block_size>>>(
+    bf16_add_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (__nv_bfloat16*)c,
         (const __nv_bfloat16*)a,
         (const __nv_bfloat16*)b,
@@ -199,7 +201,7 @@ extern "C" int cuda_bf16_mul(void* c, const void* a, const void* b, size_t num_e
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    bf16_mul_kernel<<<num_blocks, block_size>>>(
+    bf16_mul_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (__nv_bfloat16*)c,
         (const __nv_bfloat16*)a,
         (const __nv_bfloat16*)b,
@@ -229,7 +231,7 @@ extern "C" int cuda_bf16_to_fp32(void* output, const void* input, size_t num_ele
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    bf16_to_fp32_kernel<<<num_blocks, block_size>>>(
+    bf16_to_fp32_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (float*)output,
         (const __nv_bfloat16*)input,
         num_elements
@@ -254,7 +256,7 @@ extern "C" int cuda_fp32_to_bf16(void* output, const void* input, size_t num_ele
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    fp32_to_bf16_kernel<<<num_blocks, block_size>>>(
+    fp32_to_bf16_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (__nv_bfloat16*)output,
         (const float*)input,
         num_elements
@@ -283,7 +285,7 @@ extern "C" int cuda_fp16_to_bf16(void* output, const void* input, size_t num_ele
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    fp16_to_bf16_kernel<<<num_blocks, block_size>>>(
+    fp16_to_bf16_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (__nv_bfloat16*)output,
         (const half*)input,
         num_elements
@@ -308,7 +310,7 @@ extern "C" int cuda_bf16_to_fp16(void* output, const void* input, size_t num_ele
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    bf16_to_fp16_kernel<<<num_blocks, block_size>>>(
+    bf16_to_fp16_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const __nv_bfloat16*)input,
         num_elements
@@ -390,7 +392,7 @@ extern "C" int cuda_bf16_rope_with_theta(
     int block_size = head_dim / 2;
     if (block_size > 1024) block_size = 1024;
 
-    bf16_rope_kernel_with_theta<<<num_blocks, block_size>>>(
+    bf16_rope_kernel_with_theta<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (__nv_bfloat16*)output,
         (const __nv_bfloat16*)input,
         positions,

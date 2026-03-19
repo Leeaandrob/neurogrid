@@ -6,8 +6,10 @@
 #include <cuda_bf16.h>
 #include <stdio.h>
 
+#include "stream.h"
 #include "conv.h"
 
+#include "stream.h"
 // Error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -90,7 +92,7 @@ extern "C" int cuda_causal_conv1d_fwd_bf16(
     dim3 grid(batch, dim);
     int block_size = min(seqlen, 128);
 
-    causal_conv1d_fwd_bf16_kernel<<<grid, block_size>>>(
+    causal_conv1d_fwd_bf16_kernel<<<grid, block_size, 0, ng_get_stream()>>>(
         (const __nv_bfloat16*)x,
         (const __nv_bfloat16*)weight,
         (__nv_bfloat16*)out,
@@ -159,7 +161,7 @@ extern "C" int cuda_causal_conv1d_update_bf16(
     dim3 grid(batch, (dim + 63) / 64);
     int block_size = 64;
 
-    causal_conv1d_update_bf16_kernel<<<grid, block_size>>>(
+    causal_conv1d_update_bf16_kernel<<<grid, block_size, 0, ng_get_stream()>>>(
         (const __nv_bfloat16*)x,
         (__nv_bfloat16*)out,
         (float*)conv_state,

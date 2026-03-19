@@ -15,8 +15,10 @@
 #include <cfloat>
 #include <stdio.h>
 
+#include "stream.h"
 #include "attention.h"
 
+#include "stream.h"
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
@@ -220,7 +222,7 @@ extern "C" int cuda_flash_attention_with_kvcache(
     // Shared memory: tile_scores[TILE] + thread_max[block] + thread_sum[block]
     int shared_size = (FLASH_TILE_SIZE + 2 * block_size) * sizeof(float);
 
-    flash_decode_gqa_kernel<<<total_query_heads, block_size, shared_size>>>(
+    flash_decode_gqa_kernel<<<total_query_heads, block_size, shared_size, ng_get_stream()>>>(
         (half*)output,
         (const half*)query,
         (const half*)kv->k_cache,

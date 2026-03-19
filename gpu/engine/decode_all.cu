@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "decode_all.h"
+#include "../cuda/stream.h"
 
 // Forward declarations from other translation units
 extern "C" int cuda_conv_layer_forward_bf16(void*, const void*, const void*, void*, int, int, int);
@@ -376,19 +377,27 @@ extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
         }
     } else if (ctx->warmup_count_gpu == 2 && !ctx->graph_captured) {
         // CAPTURE on step 2
-        fprintf(stderr, "[NeuroGrid] Capturing CUDA graph (GPU-resident path)...\n");
+        fprintf(stderr, "[NeuroGrid] Capturing CUDA graph on dedicated stream...\n");
         ctx->warmup_count_gpu = 3;
-        cudaGetLastError(); // Clear stale errors
+        cudaGetLastError();
 
-        cudaError_t err = cudaStreamBeginCapture((cudaStream_t)0, cudaStreamCaptureModeThreadLocal);
+        // Route ALL kernels to the capture stream
+        ng_set_stream(ctx->stream);
+        cublas_set_stream(ctx->stream);
+
+        cudaError_t err = cudaStreamBeginCapture(ctx->stream, cudaStreamCaptureModeGlobal);
         if (err != cudaSuccess) {
             fprintf(stderr, "[NeuroGrid] Graph capture failed: %s (running without graphs)\n", cudaGetErrorString(err));
+            ng_set_stream(nullptr);
+            cublas_set_stream(nullptr);
             int res = run_all_layers(ctx, nullptr);
             if (res != 0) return res;
         } else {
             run_all_layers(ctx, nullptr);
             cudaGraph_t graph = nullptr;
-            err = cudaStreamEndCapture((cudaStream_t)0, &graph);
+            err = cudaStreamEndCapture(ctx->stream, &graph);
+            ng_set_stream(nullptr);
+            cublas_set_stream(nullptr);
             if (err == cudaSuccess && graph != nullptr) {
                 cudaGraphExec_t exec = nullptr;
                 err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);

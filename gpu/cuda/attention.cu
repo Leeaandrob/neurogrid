@@ -8,10 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "stream.h"
 #include "attention.h"
 #include "matmul.h"
 #include "kernels.h"
 
+#include "stream.h"
 // Error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -209,7 +211,7 @@ extern "C" int cuda_basic_attention(
                   (seq_len + block.x - 1) / block.x,
                   (seq_len + block.y - 1) / block.y);
 
-        apply_causal_mask_kernel<<<grid, block>>>(
+        apply_causal_mask_kernel<<<grid, block, 0, ng_get_stream()>>>(
             scores,
             seq_len,
             seq_len
@@ -223,7 +225,7 @@ extern "C" int cuda_basic_attention(
     block_size = ((block_size + 31) / 32) * 32;
     int shared_size = (block_size / 32) * sizeof(float);
 
-    softmax_rows_kernel<<<num_rows, block_size, shared_size>>>(
+    softmax_rows_kernel<<<num_rows, block_size, shared_size, ng_get_stream()>>>(
         scores,
         scores,
         num_rows,
@@ -334,13 +336,13 @@ extern "C" int cuda_basic_attention_gqa(
     int block_size = 256;
     int num_blocks = (total_elements + block_size - 1) / block_size;
 
-    expand_kv_for_gqa_kernel<<<num_blocks, block_size>>>(
+    expand_kv_for_gqa_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         k_expanded, (const half*)key,
         batch_size, num_heads, num_kv_heads, seq_len, head_dim
     );
     CUDA_CHECK(cudaGetLastError());
 
-    expand_kv_for_gqa_kernel<<<num_blocks, block_size>>>(
+    expand_kv_for_gqa_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         v_expanded, (const half*)value,
         batch_size, num_heads, num_kv_heads, seq_len, head_dim
     );
@@ -385,7 +387,7 @@ extern "C" int cuda_basic_attention_gqa(
                   (seq_len + block.x - 1) / block.x,
                   (seq_len + block.y - 1) / block.y);
 
-        apply_causal_mask_kernel<<<grid, block>>>(
+        apply_causal_mask_kernel<<<grid, block, 0, ng_get_stream()>>>(
             scores,
             seq_len,
             seq_len
@@ -399,7 +401,7 @@ extern "C" int cuda_basic_attention_gqa(
     softmax_block_size = ((softmax_block_size + 31) / 32) * 32;
     int shared_size = (softmax_block_size / 32) * sizeof(float);
 
-    softmax_rows_kernel<<<num_rows, softmax_block_size, shared_size>>>(
+    softmax_rows_kernel<<<num_rows, softmax_block_size, shared_size, ng_get_stream()>>>(
         scores,
         scores,
         num_rows,
@@ -526,7 +528,7 @@ extern "C" int cuda_kvcache_update(
     int block_size = 256;
     int num_blocks = (total + block_size - 1) / block_size;
 
-    update_cache_kernel<<<num_blocks, block_size>>>(
+    update_cache_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         ((half*)kv->k_cache),
         (const half*)k,
         kv->batch_size,
@@ -537,7 +539,7 @@ extern "C" int cuda_kvcache_update(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    update_cache_kernel<<<num_blocks, block_size>>>(
+    update_cache_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         ((half*)kv->v_cache),
         (const half*)v,
         kv->batch_size,
@@ -705,7 +707,7 @@ extern "C" int cuda_attention_with_kvcache(
     CUDA_CHECK(cudaMalloc(&d_kv_len, sizeof(int)));
     CUDA_CHECK(cudaMemcpy(d_kv_len, &kv_len, sizeof(int), cudaMemcpyHostToDevice));
 
-    gqa_attention_kernel<<<total_query_heads, block_size, shared_size>>>(
+    gqa_attention_kernel<<<total_query_heads, block_size, shared_size, ng_get_stream()>>>(
         (half*)output,
         (const half*)query,
         ((half*)kv->k_cache),

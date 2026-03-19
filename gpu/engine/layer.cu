@@ -8,12 +8,14 @@
 #include <string.h>
 #include <math.h>
 
+#include "../cuda/stream.h"
 #include "layer.h"
 #include "../cuda/kernels.h"
 #include "../cuda/matmul.h"
 #include "../cuda/attention.h"
 #include "../cuda/memory.h"
 
+#include "../cuda/stream.h"
 // Forward declaration for paged attention (from paged_attention.cu)
 // Signature: output, query, new_key, new_value, cache, d_block_table, d_seq_lens, d_position, num_heads, num_kv_heads, head_dim
 extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*, void*, const int*, const int*, const int*, int, int, int);
@@ -312,8 +314,8 @@ extern "C" int cuda_create_random_layer_weights(
     __global__ void init_ones_fp16(half* data, int n);
     // Use constant init
     int num_blocks = (hidden_size + block_size - 1) / block_size;
-    init_random_fp16<<<num_blocks, block_size>>>(w->attn_norm, hidden_size, 42);
-    init_random_fp16<<<num_blocks, block_size>>>(w->ffn_norm, hidden_size, 43);
+    init_random_fp16<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->attn_norm, hidden_size, 42);
+    init_random_fp16<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->ffn_norm, hidden_size, 43);
 
     // Allocate attention weights (INT8)
     CUDA_CHECK(cudaMalloc(&w->q_proj, hidden_size * hidden_size * sizeof(int8_t)));
@@ -323,12 +325,12 @@ extern "C" int cuda_create_random_layer_weights(
 
     // Initialize attention weights
     num_blocks = (hidden_size * hidden_size + block_size - 1) / block_size;
-    init_random_int8<<<num_blocks, block_size>>>(w->q_proj, hidden_size * hidden_size, 100);
-    init_random_int8<<<num_blocks, block_size>>>(w->o_proj, hidden_size * hidden_size, 103);
+    init_random_int8<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->q_proj, hidden_size * hidden_size, 100);
+    init_random_int8<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->o_proj, hidden_size * hidden_size, 103);
 
     num_blocks = (hidden_size * kv_dim + block_size - 1) / block_size;
-    init_random_int8<<<num_blocks, block_size>>>(w->k_proj, hidden_size * kv_dim, 101);
-    init_random_int8<<<num_blocks, block_size>>>(w->v_proj, hidden_size * kv_dim, 102);
+    init_random_int8<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->k_proj, hidden_size * kv_dim, 101);
+    init_random_int8<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->v_proj, hidden_size * kv_dim, 102);
 
     // Allocate attention scales
     CUDA_CHECK(cudaMalloc(&w->q_scale, hidden_size * sizeof(float)));
@@ -338,12 +340,12 @@ extern "C" int cuda_create_random_layer_weights(
 
     // Initialize scales to 0.01 (typical quantization scale)
     num_blocks = (hidden_size + block_size - 1) / block_size;
-    init_constant_fp32<<<num_blocks, block_size>>>(w->q_scale, hidden_size, 0.01f);
-    init_constant_fp32<<<num_blocks, block_size>>>(w->o_scale, hidden_size, 0.01f);
+    init_constant_fp32<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->q_scale, hidden_size, 0.01f);
+    init_constant_fp32<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->o_scale, hidden_size, 0.01f);
 
     num_blocks = (kv_dim + block_size - 1) / block_size;
-    init_constant_fp32<<<num_blocks, block_size>>>(w->k_scale, kv_dim, 0.01f);
-    init_constant_fp32<<<num_blocks, block_size>>>(w->v_scale, kv_dim, 0.01f);
+    init_constant_fp32<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->k_scale, kv_dim, 0.01f);
+    init_constant_fp32<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->v_scale, kv_dim, 0.01f);
 
     // Allocate FFN weights (INT8)
     CUDA_CHECK(cudaMalloc(&w->gate_proj, hidden_size * intermediate_size * sizeof(int8_t)));
@@ -351,11 +353,11 @@ extern "C" int cuda_create_random_layer_weights(
     CUDA_CHECK(cudaMalloc(&w->down_proj, intermediate_size * hidden_size * sizeof(int8_t)));
 
     num_blocks = (hidden_size * intermediate_size + block_size - 1) / block_size;
-    init_random_int8<<<num_blocks, block_size>>>(w->gate_proj, hidden_size * intermediate_size, 200);
-    init_random_int8<<<num_blocks, block_size>>>(w->up_proj, hidden_size * intermediate_size, 201);
+    init_random_int8<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->gate_proj, hidden_size * intermediate_size, 200);
+    init_random_int8<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->up_proj, hidden_size * intermediate_size, 201);
 
     num_blocks = (intermediate_size * hidden_size + block_size - 1) / block_size;
-    init_random_int8<<<num_blocks, block_size>>>(w->down_proj, intermediate_size * hidden_size, 202);
+    init_random_int8<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->down_proj, intermediate_size * hidden_size, 202);
 
     // Allocate FFN scales
     CUDA_CHECK(cudaMalloc(&w->gate_scale, intermediate_size * sizeof(float)));
@@ -363,11 +365,11 @@ extern "C" int cuda_create_random_layer_weights(
     CUDA_CHECK(cudaMalloc(&w->down_scale, hidden_size * sizeof(float)));
 
     num_blocks = (intermediate_size + block_size - 1) / block_size;
-    init_constant_fp32<<<num_blocks, block_size>>>(w->gate_scale, intermediate_size, 0.01f);
-    init_constant_fp32<<<num_blocks, block_size>>>(w->up_scale, intermediate_size, 0.01f);
+    init_constant_fp32<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->gate_scale, intermediate_size, 0.01f);
+    init_constant_fp32<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->up_scale, intermediate_size, 0.01f);
 
     num_blocks = (hidden_size + block_size - 1) / block_size;
-    init_constant_fp32<<<num_blocks, block_size>>>(w->down_scale, hidden_size, 0.01f);
+    init_constant_fp32<<<num_blocks, block_size, 0, ng_get_stream()>>>(w->down_scale, hidden_size, 0.01f);
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -801,7 +803,7 @@ extern "C" int cuda_layer_forward_fp16(
     if (w->q_layernorm != nullptr) {
         int block_size_qk = min(32, head_dim); // head_dim is typically 64
         block_size_qk = ((block_size_qk + 31) / 32) * 32;
-        per_head_rmsnorm_kernel<<<num_tokens * num_heads, block_size_qk>>>(
+        per_head_rmsnorm_kernel<<<num_tokens * num_heads, block_size_qk, 0, ng_get_stream()>>>(
             q, q, w->q_layernorm, num_tokens, num_heads, head_dim, rms_norm_eps);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) { result = -1; goto cleanup; }
@@ -809,7 +811,7 @@ extern "C" int cuda_layer_forward_fp16(
     if (w->k_layernorm != nullptr) {
         int block_size_qk = min(32, head_dim);
         block_size_qk = ((block_size_qk + 31) / 32) * 32;
-        per_head_rmsnorm_kernel<<<num_tokens * num_kv_heads, block_size_qk>>>(
+        per_head_rmsnorm_kernel<<<num_tokens * num_kv_heads, block_size_qk, 0, ng_get_stream()>>>(
             k, k, w->k_layernorm, num_tokens, num_kv_heads, head_dim, rms_norm_eps);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) { result = -1; goto cleanup; }
@@ -992,7 +994,7 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
     if (w->q_layernorm != nullptr) {
         int block_size_qk = min(32, head_dim);
         block_size_qk = ((block_size_qk + 31) / 32) * 32;
-        per_head_rmsnorm_kernel<<<num_tokens * num_heads, block_size_qk>>>(
+        per_head_rmsnorm_kernel<<<num_tokens * num_heads, block_size_qk, 0, ng_get_stream()>>>(
             q, q, w->q_layernorm, num_tokens, num_heads, head_dim, rms_norm_eps);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return -1;
@@ -1000,7 +1002,7 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
     if (w->k_layernorm != nullptr) {
         int block_size_qk = min(32, head_dim);
         block_size_qk = ((block_size_qk + 31) / 32) * 32;
-        per_head_rmsnorm_kernel<<<num_tokens * num_kv_heads, block_size_qk>>>(
+        per_head_rmsnorm_kernel<<<num_tokens * num_kv_heads, block_size_qk, 0, ng_get_stream()>>>(
             k, k, w->k_layernorm, num_tokens, num_kv_heads, head_dim, rms_norm_eps);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return -1;
@@ -1103,7 +1105,7 @@ extern "C" int cuda_layer_forward_fp16_paged(
     if (w->q_layernorm != nullptr) {
         int block_size_qk = min(32, head_dim);
         block_size_qk = ((block_size_qk + 31) / 32) * 32;
-        per_head_rmsnorm_kernel<<<num_tokens * num_heads, block_size_qk>>>(
+        per_head_rmsnorm_kernel<<<num_tokens * num_heads, block_size_qk, 0, ng_get_stream()>>>(
             q, q, w->q_layernorm, num_tokens, num_heads, head_dim, rms_norm_eps);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return -1;
@@ -1111,7 +1113,7 @@ extern "C" int cuda_layer_forward_fp16_paged(
     if (w->k_layernorm != nullptr) {
         int block_size_qk = min(32, head_dim);
         block_size_qk = ((block_size_qk + 31) / 32) * 32;
-        per_head_rmsnorm_kernel<<<num_tokens * num_kv_heads, block_size_qk>>>(
+        per_head_rmsnorm_kernel<<<num_tokens * num_kv_heads, block_size_qk, 0, ng_get_stream()>>>(
             k, k, w->k_layernorm, num_tokens, num_kv_heads, head_dim, rms_norm_eps);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) return -1;

@@ -14,8 +14,10 @@
 #include <cfloat>
 #include <stdio.h>
 
+#include "stream.h"
 #include "paged_attention.h"
 
+#include "stream.h"
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
@@ -123,7 +125,7 @@ extern "C" int cuda_paged_kvcache_update(
     int block = 256;
     int grid = (total + block - 1) / block;
 
-    paged_kvcache_update_kernel<<<grid, block>>>(
+    paged_kvcache_update_kernel<<<grid, block, 0, ng_get_stream()>>>(
         cache->key_cache, cache->value_cache,
         (const half*)new_key, (const half*)new_value,
         d_block_table,
@@ -285,7 +287,7 @@ extern "C" int cuda_paged_attention(
     int max_seq_for_shared = 4096;
     int shared_size = (max_seq_for_shared + num_threads) * sizeof(float);
 
-    paged_attention_v1_kernel<<<num_heads, num_threads, shared_size>>>(
+    paged_attention_v1_kernel<<<num_heads, num_threads, shared_size, ng_get_stream()>>>(
         (half*)output,
         (const half*)query,
         (const half*)cache->key_cache,

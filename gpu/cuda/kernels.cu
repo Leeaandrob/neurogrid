@@ -6,8 +6,10 @@
 #include <math.h>
 #include <stdio.h>
 
+#include "stream.h"
 #include "kernels.h"
 
+#include "stream.h"
 // Error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -104,7 +106,7 @@ extern "C" int cuda_rmsnorm(
     // Ensure block_size is multiple of 32 for warp reduction
     block_size = ((block_size + 31) / 32) * 32;
 
-    rmsnorm_kernel<<<num_tokens, block_size>>>(
+    rmsnorm_kernel<<<num_tokens, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const half*)input,
         (const half*)weight,
@@ -139,7 +141,7 @@ extern "C" int cuda_silu(void* output, const void* input, size_t num_elements) {
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    silu_kernel<<<num_blocks, block_size>>>(
+    silu_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const half*)input,
         num_elements
@@ -174,7 +176,7 @@ extern "C" int cuda_silu_mul(void* output, const void* gate, const void* up, siz
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    silu_mul_kernel<<<num_blocks, block_size>>>(
+    silu_mul_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const half*)gate,
         (const half*)up,
@@ -245,7 +247,7 @@ extern "C" int cuda_add_rmsnorm(
     int block_size = min(1024, hidden_dim);
     block_size = ((block_size + 31) / 32) * 32;
 
-    add_rmsnorm_kernel<<<num_tokens, block_size>>>(
+    add_rmsnorm_kernel<<<num_tokens, block_size, 0, ng_get_stream()>>>(
         (half*)normed_output,
         (half*)residual_output,
         (const half*)input,
@@ -300,7 +302,7 @@ extern "C" int cuda_add(void* c, const void* a, const void* b, size_t num_elemen
         size_t num_half2 = num_elements / 2;
         int num_blocks = (num_half2 + block_size - 1) / block_size;
 
-        add_kernel_half2<<<num_blocks, block_size>>>(
+        add_kernel_half2<<<num_blocks, block_size, 0, ng_get_stream()>>>(
             (half2*)c,
             (const half2*)a,
             (const half2*)b,
@@ -310,7 +312,7 @@ extern "C" int cuda_add(void* c, const void* a, const void* b, size_t num_elemen
         int block_size = 256;
         int num_blocks = (num_elements + block_size - 1) / block_size;
 
-        add_kernel<<<num_blocks, block_size>>>(
+        add_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
             (half*)c,
             (const half*)a,
             (const half*)b,
@@ -345,7 +347,7 @@ extern "C" int cuda_mul(void* c, const void* a, const void* b, size_t num_elemen
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    mul_kernel<<<num_blocks, block_size>>>(
+    mul_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (half*)c,
         (const half*)a,
         (const half*)b,
@@ -505,7 +507,7 @@ extern "C" int cuda_rope_styled(
         block_size = 1024;
     }
 
-    rope_kernel_styled<<<num_blocks, block_size>>>(
+    rope_kernel_styled<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const half*)input,
         positions,
@@ -554,7 +556,7 @@ extern "C" int cuda_rope_with_theta(
         block_size = 1024;
     }
 
-    rope_kernel_with_theta<<<num_blocks, block_size>>>(
+    rope_kernel_with_theta<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const half*)input,
         positions,
@@ -632,7 +634,7 @@ extern "C" int cuda_softmax(void* output, const void* input, int num_rows, int r
     int block_size = min(1024, row_size);
     block_size = ((block_size + 31) / 32) * 32;
 
-    softmax_kernel<<<num_rows, block_size>>>(
+    softmax_kernel<<<num_rows, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const half*)input,
         num_rows,
@@ -665,7 +667,7 @@ extern "C" int cuda_scale(void* output, const void* input, float scale, size_t n
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    scale_kernel<<<num_blocks, block_size>>>(
+    scale_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const half*)input,
         scale,

@@ -6,12 +6,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "../cuda/stream.h"
 #include "conv_workspace.h"
 #include "conv_layer.h"
 #include "../cuda/bf16_utils.h"
 #include "../cuda/conv.h"
 #include "../cuda/matmul.h"
 
+#include "../cuda/stream.h"
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \

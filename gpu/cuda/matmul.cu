@@ -8,8 +8,10 @@
 #include <cublasLt.h>
 #include <stdio.h>
 
+#include "stream.h"
 #include "matmul.h"
 
+#include "stream.h"
 // Error checking macros
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -212,7 +214,7 @@ extern "C" int cuda_gemm_int8(
 
     if (transpose_b) {
         // B is stored as [N, K], scales are per output dimension (N) = per row
-        dequantize_and_copy<<<num_blocks, block_size>>>(
+        dequantize_and_copy<<<num_blocks, block_size, 0, ng_get_stream()>>>(
             b_fp16,
             (const int8_t*)b,
             (const float*)scale,
@@ -222,7 +224,7 @@ extern "C" int cuda_gemm_int8(
         );
     } else {
         // B is stored as [K, N], scales are per output dimension (N) = per column
-        dequantize_and_copy<<<num_blocks, block_size>>>(
+        dequantize_and_copy<<<num_blocks, block_size, 0, ng_get_stream()>>>(
             b_fp16,
             (const int8_t*)b,
             (const float*)scale,

@@ -6,8 +6,10 @@
 #include <cfloat>
 #include <stdio.h>
 
+#include "stream.h"
 #include "quantize.h"
 
+#include "stream.h"
 // Error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -107,7 +109,7 @@ extern "C" int cuda_quantize_per_tensor(
     int block_size = 256;
     int num_blocks = min((int)((num_elements + block_size - 1) / block_size), 1024);
 
-    find_max_abs_kernel<<<num_blocks, block_size>>>(
+    find_max_abs_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         d_max,
         (const half*)input,
         num_elements
@@ -127,7 +129,7 @@ extern "C" int cuda_quantize_per_tensor(
 
     // Step 2: Quantize
     num_blocks = (num_elements + block_size - 1) / block_size;
-    quantize_kernel<<<num_blocks, block_size>>>(
+    quantize_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (int8_t*)output,
         (const half*)input,
         scale_val,
@@ -168,7 +170,7 @@ extern "C" int cuda_dequantize_per_tensor(
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
 
-    dequantize_kernel<<<num_blocks, block_size>>>(
+    dequantize_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (half*)output,
         (const int8_t*)input,
         scale_val,
@@ -239,7 +241,7 @@ extern "C" int cuda_quantize_weights(
     int block_size = min(256, K);
     block_size = ((block_size + 31) / 32) * 32;
 
-    find_column_max_kernel<<<N, block_size>>>(
+    find_column_max_kernel<<<N, block_size, 0, ng_get_stream()>>>(
         (float*)scales,
         (const half*)input,
         K,
@@ -252,7 +254,7 @@ extern "C" int cuda_quantize_weights(
     block_size = 256;
     int num_blocks = (total + block_size - 1) / block_size;
 
-    quantize_weights_kernel<<<num_blocks, block_size>>>(
+    quantize_weights_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (int8_t*)output,
         (const half*)input,
         (const float*)scales,
@@ -326,7 +328,7 @@ extern "C" int cuda_quantize_weights_per_row(
     int block_size = min(256, cols);
     block_size = ((block_size + 31) / 32) * 32;
 
-    find_row_max_kernel<<<rows, block_size>>>(
+    find_row_max_kernel<<<rows, block_size, 0, ng_get_stream()>>>(
         (float*)scales,
         (const half*)input,
         rows,
@@ -339,7 +341,7 @@ extern "C" int cuda_quantize_weights_per_row(
     block_size = 256;
     int num_blocks = (total + block_size - 1) / block_size;
 
-    quantize_weights_per_row_kernel<<<num_blocks, block_size>>>(
+    quantize_weights_per_row_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
         (int8_t*)output,
         (const half*)input,
         (const float*)scales,

@@ -8,11 +8,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "../cuda/stream.h"
 #include "conv_layer.h"
 #include "../cuda/bf16_utils.h"
 #include "../cuda/conv.h"
 #include "../cuda/matmul.h"
 
+#include "../cuda/stream.h"
 // Error checking macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -288,13 +290,13 @@ extern "C" int cuda_conv_layer_forward_bf16(
             if (err) { cudaFree(B_bsd); cudaFree(C_bsd_tmp); cudaFree(x_bsd); goto cleanup; }
 
             // Transpose each: [B, S, H] -> [B, H, S]
-            transpose_bsd_to_bds_bf16<<<grid, block>>>(
+            transpose_bsd_to_bds_bf16<<<grid, block, 0, ng_get_stream()>>>(
                 (__nv_bfloat16*)B_bds, (const __nv_bfloat16*)B_bsd,
                 batch, seq_len, H);
-            transpose_bsd_to_bds_bf16<<<grid, block>>>(
+            transpose_bsd_to_bds_bf16<<<grid, block, 0, ng_get_stream()>>>(
                 (__nv_bfloat16*)C_bds, (const __nv_bfloat16*)C_bsd_tmp,
                 batch, seq_len, H);
-            transpose_bsd_to_bds_bf16<<<grid, block>>>(
+            transpose_bsd_to_bds_bf16<<<grid, block, 0, ng_get_stream()>>>(
                 (__nv_bfloat16*)x_bds, (const __nv_bfloat16*)x_bsd,
                 batch, seq_len, H);
 
@@ -313,7 +315,7 @@ extern "C" int cuda_conv_layer_forward_bf16(
             KERNEL_CHECK(cuda_bf16_mul(y_bds, C_bds, conv_out, batch * H * seq_len));
 
             // 7. Transpose back: [B, H, S] -> [B, S, H]
-            transpose_bds_to_bsd_bf16<<<grid, block>>>(
+            transpose_bds_to_bsd_bf16<<<grid, block, 0, ng_get_stream()>>>(
                 (__nv_bfloat16*)y_bsd, (const __nv_bfloat16*)y_bds,
                 batch, H, seq_len);
         }
