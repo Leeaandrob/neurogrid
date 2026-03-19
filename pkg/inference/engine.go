@@ -367,9 +367,10 @@ func (e *Engine) InitializeKVCaches() error {
 }
 
 // Generate performs text generation given a prompt.
+// Uses exclusive lock to serialize requests (single GPU, shared KV cache state).
 func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	if e.tokenizer == nil {
 		return nil, fmt.Errorf("tokenizer not set")
@@ -390,7 +391,14 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	// Get sequence ID for this request
 	seqID := atomic.AddUint64(&e.seqCounter, 1)
 
-	// Clear KV caches for new sequence
+	// Reset CUDA KV caches and conv state for new request
+	if resetter, ok := e.layerExecutor.(interface{ ResetKVCache() error }); ok {
+		if err := resetter.ResetKVCache(); err != nil {
+			log.Printf("[Generate] Warning: KV cache reset failed: %v", err)
+		}
+	}
+
+	// Clear CPU-side KV caches
 	e.kvCaches.ClearAll()
 
 	// Allocate paged KV cache blocks for this sequence if available
@@ -577,8 +585,8 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 
 // GenerateStream performs streaming text generation, calling the callback for each token.
 func (e *Engine) GenerateStream(ctx context.Context, req *GenerateRequest, callback TokenCallback) error {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	if e.tokenizer == nil {
 		return fmt.Errorf("tokenizer not set")
@@ -593,6 +601,13 @@ func (e *Engine) GenerateStream(ctx context.Context, req *GenerateRequest, callb
 
 	// Get sequence ID for this request
 	seqID := atomic.AddUint64(&e.seqCounter, 1)
+
+	// Reset CUDA KV caches and conv state for new request
+	if resetter, ok := e.layerExecutor.(interface{ ResetKVCache() error }); ok {
+		if err := resetter.ResetKVCache(); err != nil {
+			log.Printf("[GenerateStream] Warning: KV cache reset failed: %v", err)
+		}
+	}
 
 	// Clear KV caches for new sequence
 	e.kvCaches.ClearAll()

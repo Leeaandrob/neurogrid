@@ -423,6 +423,7 @@ void* cuda_decode_get_hidden_bf16_gpu_ptr(void* ctx);
 int cuda_decode_convert_fp16_to_bf16(void* ctx);
 int cuda_decode_convert_bf16_to_fp16(void* ctx);
 
+void cuda_decode_invalidate_graph(void* ctx);
 void cuda_free_decode_context(void* ctx);
 
 // ============================================================================

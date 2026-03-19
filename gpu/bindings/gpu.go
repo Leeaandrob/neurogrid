@@ -1254,6 +1254,13 @@ func DecodeConvertBF16ToFP16(ctx *DecodeContext) error {
 	return nil
 }
 
+// DecodeInvalidateGraph destroys the captured CUDA graph, forcing re-capture on next decode.
+func DecodeInvalidateGraph(ctx *DecodeContext) {
+	if ctx != nil && ctx.ptr != nil {
+		C.cuda_decode_invalidate_graph(ctx.ptr)
+	}
+}
+
 // FreeDecodeContext releases the decode context.
 func FreeDecodeContext(ctx *DecodeContext) {
 	if ctx != nil && ctx.ptr != nil {

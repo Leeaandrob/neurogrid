@@ -1163,6 +1163,12 @@ func (e *CUDALayerExecutor) ResetKVCache() error {
 		}
 	}
 
+	// Invalidate CUDA Graph — force re-capture after cache reset
+	// (graph may reference old cache addresses)
+	if e.decodeCtx != nil {
+		bindings.DecodeInvalidateGraph(e.decodeCtx)
+	}
+
 	return nil
 }
 

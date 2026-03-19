@@ -626,6 +626,22 @@ extern "C" void* cuda_decode_get_hidden_gpu_ptr(void* ctx_ptr) {
     return ctx->hidden_a;  // Always contains latest result after cuda_decode_step_gpu
 }
 
+// Invalidate CUDA Graph — force re-capture on next decode
+extern "C" void cuda_decode_invalidate_graph(void* ctx_ptr) {
+    if (!ctx_ptr) return;
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    if (ctx->graph_exec) {
+        cudaGraphExecDestroy(ctx->graph_exec);
+        ctx->graph_exec = nullptr;
+    }
+    if (ctx->graph) {
+        cudaGraphDestroy(ctx->graph);
+        ctx->graph = nullptr;
+    }
+    ctx->graph_captured = false;
+    ctx->warmup_count_gpu = 0;
+}
+
 extern "C" void cuda_free_decode_context(void* ctx_ptr) {
     if (!ctx_ptr) return;
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;

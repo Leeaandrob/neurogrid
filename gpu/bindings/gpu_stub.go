@@ -699,7 +699,8 @@ func DecodeSetHiddenBF16FromGPU(ctx *DecodeContext, gpuPtr unsafe.Pointer) error
 func DecodeGetHiddenBF16GPUPtr(ctx *DecodeContext) unsafe.Pointer { return nil }
 func DecodeConvertFP16ToBF16(ctx *DecodeContext) error            { return ErrNotImplemented }
 func DecodeConvertBF16ToFP16(ctx *DecodeContext) error            { return ErrNotImplemented }
-func FreeDecodeContext(ctx *DecodeContext) {}
+func DecodeInvalidateGraph(ctx *DecodeContext) {}
+func FreeDecodeContext(ctx *DecodeContext)     {}
 
 // =============================================================================
 // LFM2 / BF16 Operations (Stubs)
