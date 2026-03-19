@@ -360,10 +360,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Get stop strings for this model (prevents generating new turns)
 	stopStrings := getStopStringsForModel(s.config.ModelName)
 
-	// Cap max_tokens for thinking models (need ~400 think + ~100 answer)
+	// Cap max_tokens for thinking models (BF16 native reduces overthinking)
 	maxTokens := req.MaxTokens
-	if strings.Contains(strings.ToLower(s.config.ModelName), "lfm") && maxTokens > 512 {
-		maxTokens = 512
+	if strings.Contains(strings.ToLower(s.config.ModelName), "lfm") && maxTokens > 2048 {
+		maxTokens = 2048
 	}
 
 	genReq := &inference.GenerateRequest{
