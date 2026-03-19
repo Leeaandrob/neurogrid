@@ -1132,39 +1132,26 @@ func (e *CUDALayerExecutor) Close() error {
 	return nil
 }
 
-// ResetKVCache resets the KV cache for all layers.
+// ResetKVCache resets state for a new request.
+// With paged KV cache: frees all sequences (blocks return to pool).
+// Conv states are zeroed. CUDA Graph is invalidated for clean re-capture.
 func (e *CUDALayerExecutor) ResetKVCache() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Free all sequences in paged manager
+	// Free all paged sequences (blocks return to pool, GPU memory stays allocated)
 	if e.pagedManager != nil {
 		e.pagedManager.FreeAll()
 	}
 
-	for layerID, cache := range e.kvCaches {
-		bindings.FreeKVCache(cache)
-
-		maxSeqLen := 2048
-		if e.config.MaxSeqLen > 0 {
-			maxSeqLen = e.config.MaxSeqLen
-		}
-
-		newCache, err := bindings.NewKVCache(1, e.config.NumKVHeads, e.config.HeadDim, maxSeqLen)
-		if err != nil {
-			return fmt.Errorf("failed to reset KV cache for layer %d: %w", layerID, err)
-		}
-		e.kvCaches[layerID] = newCache
-	}
-
+	// Reset conv states (zero the state buffers, keep same GPU addresses)
 	for layerID, state := range e.convStates {
 		if err := bindings.ConvStateReset(state, 1, e.config.HiddenSize, e.config.ConvKernelSize); err != nil {
 			return fmt.Errorf("failed to reset conv state for layer %d: %w", layerID, err)
 		}
 	}
 
-	// Invalidate CUDA Graph — force re-capture after cache reset
-	// (graph may reference old cache addresses)
+	// Invalidate CUDA Graph — force re-capture with fresh state
 	if e.decodeCtx != nil {
 		bindings.DecodeInvalidateGraph(e.decodeCtx)
 	}
