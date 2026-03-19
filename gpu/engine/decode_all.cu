@@ -678,6 +678,9 @@ extern "C" int cuda_prefill_batch(
         cuda_fp16_to_bf16(bf16_a, fp16_a, (size_t)num_tokens * H);
     }
 
+    // Clear any pending CUDA errors before starting
+    cudaGetLastError();
+
     // Allocate batch-sized workspace
     if (ctx->use_bf16_native) {
         rc = cuda_create_layer_workspace_bf16(&batch_ws, num_tokens,
@@ -687,6 +690,7 @@ extern "C" int cuda_prefill_batch(
             H, ctx->intermediate_size, ctx->num_kv_heads, ctx->head_dim);
     }
     if (rc != 0) { fprintf(stderr, "[Prefill] Workspace alloc failed\n"); goto cleanup; }
+    fprintf(stderr, "[Prefill] Workspace allocated for %d tokens\n", num_tokens);
 
     // Process all layers
     for (int i = 0; i < ctx->num_layers; i++) {
@@ -744,8 +748,18 @@ extern "C" int cuda_prefill_batch(
             }
         }
 
+        // Check for CUDA errors after each layer
+        {
+            cudaError_t layerErr = cudaDeviceSynchronize();
+            if (layerErr != cudaSuccess) {
+                fprintf(stderr, "[Prefill] Layer %d CUDA error: %s\n", i, cudaGetErrorString(layerErr));
+                cudaGetLastError(); // clear error
+                result = -1;
+            }
+        }
         if (result != 0) {
-            fprintf(stderr, "[Prefill] Layer %d failed: %d\n", i, result);
+            fprintf(stderr, "[Prefill] Layer %d failed: rc=%d type=%s\n", i,
+                result, ctx->layer_types[i] == 0 ? "conv" : "attn");
             goto cleanup_ws;
         }
 

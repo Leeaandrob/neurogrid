@@ -753,9 +753,7 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 	}
 
 	// Fast path: batch prefill (all tokens in one pass, vLLM-style)
-	// TODO: enable after debugging workspace K/V extraction + CUDA error recovery
-	// Infrastructure is ready: cuda_prefill_batch, cuda_reshape_and_cache, cuda_gather_embeddings
-	if false {
+	if true {
 		if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
 			if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
 				embTable := embedLookup.(*GPUComponents).Embeddings.ptr
