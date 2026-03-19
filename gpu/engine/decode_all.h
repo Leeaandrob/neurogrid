@@ -26,6 +26,14 @@ int cuda_decode_step_gpu(void* ctx, int position);
 void* cuda_decode_get_hidden_gpu_ptr(void* ctx);
 
 void cuda_set_decode_paged_layer(void* ctx, int layer_id, void* paged_cache);
+
+// BF16-native decode support
+int cuda_set_decode_bf16_native(void* ctx, void* bf16_workspace);
+int cuda_decode_set_hidden_bf16(void* ctx, const void* h_hidden);
+int cuda_decode_get_hidden_bf16(void* ctx, void* h_hidden);
+int cuda_decode_set_hidden_bf16_from_gpu(void* ctx, const void* d_hidden);
+void* cuda_decode_get_hidden_bf16_gpu_ptr(void* ctx);
+
 void cuda_free_decode_context(void* ctx);
 
 #ifdef __cplusplus

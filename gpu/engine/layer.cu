@@ -1049,7 +1049,7 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
     result = cuda_gemm_fp16(normed, gate_buf, w->down_proj, num_tokens, intermediate_size, hidden_size, false, true);
     if (result != 0) return result;
 
-    // 9. Final residual add
+    // 9. Final residual add (output and residual are FP16)
     result = cuda_add(output, normed, residual, num_tokens * hidden_size);
     return result;
 }
@@ -1164,5 +1164,560 @@ extern "C" int cuda_layer_forward_fp16_paged(
 
     // 9. Final residual add
     result = cuda_add(output, normed, residual, num_tokens * hidden_size);
+    return result;
+}
+
+// ============================================================================
+// BF16-Native Layer — eliminates ALL FP16↔BF16 conversions for attention layers
+// ============================================================================
+
+#include <cuda_bf16.h>
+
+// Forward declarations for BF16 operations (from bf16_kernels.cu, bf16_matmul.cu)
+extern "C" int cuda_bf16_rmsnorm(void*, const void*, const void*, int, int, float);
+extern "C" int cuda_gemm_bf16(void*, const void*, const void*, int, int, int, bool, bool);
+extern "C" int cuda_bf16_silu(void*, const void*, size_t);
+extern "C" int cuda_bf16_add(void*, const void*, const void*, size_t);
+extern "C" int cuda_bf16_mul(void*, const void*, const void*, size_t);
+extern "C" int cuda_bf16_rope_with_theta(void*, const void*, const int*, int, int, int, int, int, float);
+extern "C" int cuda_fp16_to_bf16(void*, const void*, size_t);
+extern "C" int cuda_bf16_to_fp16(void*, const void*, size_t);
+// Forward declarations for attention (FP16)
+extern "C" int cuda_flash_attention_with_kvcache(void*, const void*, const void*, const void*, void*, const int*, int, int, int, int);
+extern "C" int cuda_basic_attention_gqa(void*, const void*, const void*, const void*, int, int, int, int, int, bool);
+
+// BF16-native weight structure (identical layout to FP16 but with __nv_bfloat16* pointers)
+struct LayerWeightsBF16 {
+    __nv_bfloat16* attn_norm;        // [hidden_size]
+    __nv_bfloat16* ffn_norm;         // [hidden_size]
+    __nv_bfloat16* q_proj;           // BF16 [hidden_size, hidden_size]
+    __nv_bfloat16* k_proj;           // BF16 [kv_dim, hidden_size]
+    __nv_bfloat16* v_proj;           // BF16 [kv_dim, hidden_size]
+    __nv_bfloat16* o_proj;           // BF16 [hidden_size, hidden_size]
+    __nv_bfloat16* gate_proj;        // BF16 [intermediate_size, hidden_size]
+    __nv_bfloat16* up_proj;          // BF16 [intermediate_size, hidden_size]
+    __nv_bfloat16* down_proj;        // BF16 [hidden_size, intermediate_size]
+    __nv_bfloat16* q_layernorm;      // BF16 [head_dim] — per-head QK LayerNorm (NULL if not used)
+    __nv_bfloat16* k_layernorm;      // BF16 [head_dim] — per-head QK LayerNorm (NULL if not used)
+    int hidden_size;
+    int intermediate_size;
+    int num_heads;
+    int num_kv_heads;
+    int head_dim;
+};
+
+// BF16-native workspace — pre-allocated buffers for zero-alloc forward passes
+struct LayerWorkspaceBF16 {
+    __nv_bfloat16* normed;      // [max_tokens * hidden_size]
+    __nv_bfloat16* q;           // [max_tokens * hidden_size]
+    __nv_bfloat16* k;           // [max_tokens * kv_dim]
+    __nv_bfloat16* v;           // [max_tokens * kv_dim]
+    __nv_bfloat16* attn_out;    // [max_tokens * hidden_size]
+    __nv_bfloat16* residual;    // [max_tokens * hidden_size]
+    __nv_bfloat16* gate_buf;    // [max_tokens * intermediate_size]
+    __nv_bfloat16* up_buf;      // [max_tokens * intermediate_size]
+    // Temporary FP16 buffers for attention (KV cache is still FP16)
+    half* q_fp16;               // [max_tokens * hidden_size]
+    half* k_fp16;               // [max_tokens * kv_dim]
+    half* v_fp16;               // [max_tokens * kv_dim]
+    half* attn_out_fp16;        // [max_tokens * hidden_size]
+};
+
+// Helper: Upload BF16 weight matrix directly (no conversion)
+static int upload_bf16_weight(__nv_bfloat16** d_weight, const void* h_weight, int rows, int cols) {
+    size_t size = (size_t)rows * cols * sizeof(__nv_bfloat16);
+    CUDA_CHECK(cudaMalloc(d_weight, size));
+    CUDA_CHECK(cudaMemcpy(*d_weight, h_weight, size, cudaMemcpyHostToDevice));
+    return 0;
+}
+
+// Helper: Upload BF16 norm weights
+static int upload_bf16_norm(__nv_bfloat16** d_norm, const void* h_norm, int size) {
+    CUDA_CHECK(cudaMalloc(d_norm, size * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMemcpy(*d_norm, h_norm, size * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    return 0;
+}
+
+extern "C" void cuda_free_layer_weights_bf16_native(void* weights) {
+    if (!weights) return;
+    LayerWeightsBF16* w = (LayerWeightsBF16*)weights;
+    if (w->attn_norm) cudaFree(w->attn_norm);
+    if (w->ffn_norm) cudaFree(w->ffn_norm);
+    if (w->q_proj) cudaFree(w->q_proj);
+    if (w->k_proj) cudaFree(w->k_proj);
+    if (w->v_proj) cudaFree(w->v_proj);
+    if (w->o_proj) cudaFree(w->o_proj);
+    if (w->gate_proj) cudaFree(w->gate_proj);
+    if (w->up_proj) cudaFree(w->up_proj);
+    if (w->down_proj) cudaFree(w->down_proj);
+    if (w->q_layernorm) cudaFree(w->q_layernorm);
+    if (w->k_layernorm) cudaFree(w->k_layernorm);
+    free(w);
+}
+
+extern "C" int cuda_create_layer_weights_bf16_native(
+    void** weights,
+    const void* h_q_proj, const void* h_k_proj, const void* h_v_proj, const void* h_o_proj,
+    const void* h_gate_proj, const void* h_up_proj, const void* h_down_proj,
+    const void* h_attn_norm, const void* h_ffn_norm,
+    const void* h_q_layernorm, const void* h_k_layernorm,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim
+) {
+    LayerWeightsBF16* w = (LayerWeightsBF16*)calloc(1, sizeof(LayerWeightsBF16));
+    if (!w) return -1;
+
+    w->hidden_size = hidden_size;
+    w->intermediate_size = intermediate_size;
+    w->num_heads = num_heads;
+    w->num_kv_heads = num_kv_heads;
+    w->head_dim = head_dim;
+
+    int kv_dim = num_kv_heads * head_dim;
+    int result;
+
+    // Upload norm weights (BF16 directly — no conversion)
+    result = upload_bf16_norm(&w->attn_norm, h_attn_norm, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_bf16_norm(&w->ffn_norm, h_ffn_norm, hidden_size);
+    if (result != 0) goto cleanup;
+
+    // Upload projection weights (BF16 directly — no conversion)
+    result = upload_bf16_weight(&w->q_proj, h_q_proj, hidden_size, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_bf16_weight(&w->k_proj, h_k_proj, kv_dim, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_bf16_weight(&w->v_proj, h_v_proj, kv_dim, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_bf16_weight(&w->o_proj, h_o_proj, hidden_size, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_bf16_weight(&w->gate_proj, h_gate_proj, intermediate_size, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_bf16_weight(&w->up_proj, h_up_proj, intermediate_size, hidden_size);
+    if (result != 0) goto cleanup;
+    result = upload_bf16_weight(&w->down_proj, h_down_proj, hidden_size, intermediate_size);
+    if (result != 0) goto cleanup;
+
+    // Upload QK LayerNorm weights (optional — NULL if not provided)
+    if (h_q_layernorm) {
+        result = upload_bf16_norm(&w->q_layernorm, h_q_layernorm, head_dim);
+        if (result != 0) goto cleanup;
+    }
+    if (h_k_layernorm) {
+        result = upload_bf16_norm(&w->k_layernorm, h_k_layernorm, head_dim);
+        if (result != 0) goto cleanup;
+    }
+
+    *weights = w;
+    return 0;
+
+cleanup:
+    cuda_free_layer_weights_bf16_native(w);
+    return -1;
+}
+
+// BF16 per-head RMSNorm kernel
+__global__ void per_head_rmsnorm_bf16_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    int num_tokens,
+    int num_heads,
+    int head_dim,
+    float eps
+) {
+    int token_head = blockIdx.x;
+    int token = token_head / num_heads;
+    int head = token_head % num_heads;
+    int tid = threadIdx.x;
+
+    if (token >= num_tokens || head >= num_heads) return;
+
+    const __nv_bfloat16* x = input + token * num_heads * head_dim + head * head_dim;
+    __nv_bfloat16* y = output + token * num_heads * head_dim + head * head_dim;
+
+    // Compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = __bfloat162float(x[i]);
+        sum_sq += val * val;
+    }
+
+    // Warp reduction
+    for (int offset = 16; offset > 0; offset /= 2) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+
+    __shared__ float s_rsqrt;
+    if (tid == 0) {
+        s_rsqrt = rsqrtf(sum_sq / float(head_dim) + eps);
+    }
+    __syncthreads();
+
+    // Normalize and scale
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float val = __bfloat162float(x[i]);
+        float w_val = __bfloat162float(weight[i]);
+        y[i] = __float2bfloat16(val * s_rsqrt * w_val);
+    }
+}
+
+extern "C" int cuda_create_layer_workspace_bf16(
+    void** workspace,
+    int max_tokens,
+    int hidden_size,
+    int intermediate_size,
+    int num_kv_heads,
+    int head_dim
+) {
+    LayerWorkspaceBF16* ws = (LayerWorkspaceBF16*)calloc(1, sizeof(LayerWorkspaceBF16));
+    if (!ws) return -1;
+
+    int kv_dim = num_kv_heads * head_dim;
+    cudaError_t err;
+
+    // BF16 buffers
+    err = cudaMalloc(&ws->normed, max_tokens * hidden_size * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->q, max_tokens * hidden_size * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->k, max_tokens * kv_dim * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->v, max_tokens * kv_dim * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->attn_out, max_tokens * hidden_size * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->residual, max_tokens * hidden_size * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->gate_buf, max_tokens * intermediate_size * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->up_buf, max_tokens * intermediate_size * sizeof(__nv_bfloat16));
+    if (err != cudaSuccess) goto ws_cleanup;
+
+    // FP16 buffers for attention (KV cache is still FP16)
+    err = cudaMalloc(&ws->q_fp16, max_tokens * hidden_size * sizeof(half));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->k_fp16, max_tokens * kv_dim * sizeof(half));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->v_fp16, max_tokens * kv_dim * sizeof(half));
+    if (err != cudaSuccess) goto ws_cleanup;
+    err = cudaMalloc(&ws->attn_out_fp16, max_tokens * hidden_size * sizeof(half));
+    if (err != cudaSuccess) goto ws_cleanup;
+
+    *workspace = ws;
+    return 0;
+
+ws_cleanup:
+    if (ws->normed) cudaFree(ws->normed);
+    if (ws->q) cudaFree(ws->q);
+    if (ws->k) cudaFree(ws->k);
+    if (ws->v) cudaFree(ws->v);
+    if (ws->attn_out) cudaFree(ws->attn_out);
+    if (ws->residual) cudaFree(ws->residual);
+    if (ws->gate_buf) cudaFree(ws->gate_buf);
+    if (ws->up_buf) cudaFree(ws->up_buf);
+    if (ws->q_fp16) cudaFree(ws->q_fp16);
+    if (ws->k_fp16) cudaFree(ws->k_fp16);
+    if (ws->v_fp16) cudaFree(ws->v_fp16);
+    if (ws->attn_out_fp16) cudaFree(ws->attn_out_fp16);
+    free(ws);
+    return -1;
+}
+
+extern "C" void cuda_free_layer_workspace_bf16(void* workspace) {
+    if (!workspace) return;
+    LayerWorkspaceBF16* ws = (LayerWorkspaceBF16*)workspace;
+    if (ws->normed) cudaFree(ws->normed);
+    if (ws->q) cudaFree(ws->q);
+    if (ws->k) cudaFree(ws->k);
+    if (ws->v) cudaFree(ws->v);
+    if (ws->attn_out) cudaFree(ws->attn_out);
+    if (ws->residual) cudaFree(ws->residual);
+    if (ws->gate_buf) cudaFree(ws->gate_buf);
+    if (ws->up_buf) cudaFree(ws->up_buf);
+    if (ws->q_fp16) cudaFree(ws->q_fp16);
+    if (ws->k_fp16) cudaFree(ws->k_fp16);
+    if (ws->v_fp16) cudaFree(ws->v_fp16);
+    if (ws->attn_out_fp16) cudaFree(ws->attn_out_fp16);
+    free(ws);
+}
+
+// ============================================================================
+// BF16-Native Layer Forward Pass
+// ============================================================================
+// Identical to cuda_layer_forward_fp16_with_workspace but uses BF16 throughout.
+// Only converts to FP16 for the attention kernel (KV cache is still FP16).
+
+extern "C" int cuda_layer_forward_bf16_native(
+    void* output,        // BF16 [batch, seq, hidden]
+    const void* input,   // BF16 [batch, seq, hidden]
+    const void* weights, // LayerWeightsBF16*
+    void* kv_cache,      // KVCache* (still FP16) or PagedKVCache*
+    const int* positions,
+    const int* d_seq_lens,
+    int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace      // LayerWorkspaceBF16*
+) {
+    LayerWeightsBF16* w = (LayerWeightsBF16*)weights;
+    LayerWorkspaceBF16* ws = (LayerWorkspaceBF16*)workspace;
+
+    int num_tokens = batch_size * seq_len;
+    int kv_dim = num_kv_heads * head_dim;
+
+    __nv_bfloat16* normed = ws->normed;
+    __nv_bfloat16* q = ws->q;
+    __nv_bfloat16* k = ws->k;
+    __nv_bfloat16* v = ws->v;
+    __nv_bfloat16* attn_out_bf16 = ws->attn_out;
+    __nv_bfloat16* residual = ws->residual;
+    __nv_bfloat16* gate_buf = ws->gate_buf;
+    __nv_bfloat16* up_buf = ws->up_buf;
+
+    // FP16 temp buffers for attention
+    half* q_fp16 = ws->q_fp16;
+    half* k_fp16 = ws->k_fp16;
+    half* v_fp16 = ws->v_fp16;
+    half* attn_out_fp16 = ws->attn_out_fp16;
+
+    int result;
+
+    // Save residual (BF16)
+    CUDA_CHECK(cudaMemcpyAsync(residual, input,
+        num_tokens * hidden_size * sizeof(__nv_bfloat16),
+        cudaMemcpyDeviceToDevice, ng_get_stream()));
+
+    // 1. Attention RMSNorm (BF16)
+    result = cuda_bf16_rmsnorm(normed, input, w->attn_norm, num_tokens, hidden_size, rms_norm_eps);
+    if (result != 0) return result;
+
+    // 2. Q, K, V projections (BF16 GEMM — no FP16 involved)
+    result = cuda_gemm_bf16(q, normed, w->q_proj, num_tokens, hidden_size, hidden_size, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_bf16(k, normed, w->k_proj, num_tokens, hidden_size, kv_dim, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_bf16(v, normed, w->v_proj, num_tokens, hidden_size, kv_dim, false, true);
+    if (result != 0) return result;
+
+    // 2b. QK LayerNorm (BF16 per-head RMSNorm)
+    if (w->q_layernorm != nullptr) {
+        int block_size_qk = min(32, head_dim);
+        block_size_qk = ((block_size_qk + 31) / 32) * 32;
+        per_head_rmsnorm_bf16_kernel<<<num_tokens * num_heads, block_size_qk, 0, ng_get_stream()>>>(
+            q, q, w->q_layernorm, num_tokens, num_heads, head_dim, rms_norm_eps);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return -1;
+    }
+    if (w->k_layernorm != nullptr) {
+        int block_size_qk = min(32, head_dim);
+        block_size_qk = ((block_size_qk + 31) / 32) * 32;
+        per_head_rmsnorm_bf16_kernel<<<num_tokens * num_kv_heads, block_size_qk, 0, ng_get_stream()>>>(
+            k, k, w->k_layernorm, num_tokens, num_kv_heads, head_dim, rms_norm_eps);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return -1;
+    }
+
+    // 3. RoPE (BF16)
+    result = cuda_bf16_rope_with_theta(q, q, positions, batch_size, seq_len, num_heads, head_dim, rope_style, rope_theta);
+    if (result != 0) return result;
+    result = cuda_bf16_rope_with_theta(k, k, positions, batch_size, seq_len, num_kv_heads, head_dim, rope_style, rope_theta);
+    if (result != 0) return result;
+
+    // 4. Attention — convert Q/K/V to FP16, run attention, convert back to BF16
+    // (KV cache and paged attention kernel expect FP16)
+    result = cuda_bf16_to_fp16(q_fp16, q, num_tokens * hidden_size);
+    if (result != 0) return result;
+    result = cuda_bf16_to_fp16(k_fp16, k, num_tokens * kv_dim);
+    if (result != 0) return result;
+    result = cuda_bf16_to_fp16(v_fp16, v, num_tokens * kv_dim);
+    if (result != 0) return result;
+
+    if (seq_len == 1 && kv_cache != nullptr) {
+        // Flash decode with contiguous KV cache
+        result = cuda_flash_attention_with_kvcache(attn_out_fp16, q_fp16, k_fp16, v_fp16,
+            kv_cache, positions,
+            batch_size, num_heads, num_kv_heads, head_dim);
+    } else {
+        // Prefill: basic attention
+        result = cuda_basic_attention_gqa(attn_out_fp16, q_fp16, k_fp16, v_fp16,
+            batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
+    }
+    if (result != 0) return result;
+
+    // Convert attention output back to BF16
+    result = cuda_fp16_to_bf16(attn_out_bf16, attn_out_fp16, num_tokens * hidden_size);
+    if (result != 0) return result;
+
+    // 5. O projection (BF16)
+    result = cuda_gemm_bf16(normed, attn_out_bf16, w->o_proj, num_tokens, hidden_size, hidden_size, false, true);
+    if (result != 0) return result;
+
+    // 6. Residual add (BF16): normed = normed + residual
+    result = cuda_bf16_add(normed, normed, residual, num_tokens * hidden_size);
+    if (result != 0) return result;
+
+    // Save new residual (BF16)
+    CUDA_CHECK(cudaMemcpyAsync(residual, normed,
+        num_tokens * hidden_size * sizeof(__nv_bfloat16),
+        cudaMemcpyDeviceToDevice, ng_get_stream()));
+
+    // 7. FFN RMSNorm (BF16)
+    result = cuda_bf16_rmsnorm(normed, normed, w->ffn_norm, num_tokens, hidden_size, rms_norm_eps);
+    if (result != 0) return result;
+
+    // 8. SwiGLU FFN (BF16 GEMM)
+    result = cuda_gemm_bf16(gate_buf, normed, w->gate_proj, num_tokens, hidden_size, intermediate_size, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_bf16(up_buf, normed, w->up_proj, num_tokens, hidden_size, intermediate_size, false, true);
+    if (result != 0) return result;
+
+    // SiLU(gate) * up (BF16)
+    result = cuda_bf16_silu(gate_buf, gate_buf, num_tokens * intermediate_size);
+    if (result != 0) return result;
+    result = cuda_bf16_mul(gate_buf, gate_buf, up_buf, num_tokens * intermediate_size);
+    if (result != 0) return result;
+
+    // Down projection (BF16)
+    result = cuda_gemm_bf16(normed, gate_buf, w->down_proj, num_tokens, intermediate_size, hidden_size, false, true);
+    if (result != 0) return result;
+
+    // 9. Final residual add (BF16)
+    result = cuda_bf16_add(output, normed, residual, num_tokens * hidden_size);
+    return result;
+}
+
+// ============================================================================
+// BF16-Native Layer Forward with Paged Attention
+// ============================================================================
+
+extern "C" int cuda_layer_forward_bf16_paged(
+    void* output, const void* input, const void* weights,
+    void* paged_cache,           // PagedKVCache*
+    const int* d_block_table,    // GPU block table
+    const int* positions,        // GPU buffer [1]: position
+    const int* d_seq_lens,       // GPU buffer [1]: seq_len = position + 1
+    int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+) {
+    LayerWeightsBF16* w = (LayerWeightsBF16*)weights;
+    LayerWorkspaceBF16* ws = (LayerWorkspaceBF16*)workspace;
+
+    int num_tokens = batch_size * seq_len;
+    int kv_dim = num_kv_heads * head_dim;
+
+    __nv_bfloat16* normed = ws->normed;
+    __nv_bfloat16* q = ws->q;
+    __nv_bfloat16* k = ws->k;
+    __nv_bfloat16* v = ws->v;
+    __nv_bfloat16* attn_out_bf16 = ws->attn_out;
+    __nv_bfloat16* residual = ws->residual;
+    __nv_bfloat16* gate_buf = ws->gate_buf;
+    __nv_bfloat16* up_buf = ws->up_buf;
+
+    half* q_fp16 = ws->q_fp16;
+    half* k_fp16 = ws->k_fp16;
+    half* v_fp16 = ws->v_fp16;
+    half* attn_out_fp16 = ws->attn_out_fp16;
+
+    int result;
+
+    // Save residual (BF16)
+    CUDA_CHECK(cudaMemcpyAsync(residual, input,
+        num_tokens * hidden_size * sizeof(__nv_bfloat16),
+        cudaMemcpyDeviceToDevice, ng_get_stream()));
+
+    // 1. Attention RMSNorm (BF16)
+    result = cuda_bf16_rmsnorm(normed, input, w->attn_norm, num_tokens, hidden_size, rms_norm_eps);
+    if (result != 0) return result;
+
+    // 2. Q, K, V projections (BF16 GEMM)
+    result = cuda_gemm_bf16(q, normed, w->q_proj, num_tokens, hidden_size, hidden_size, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_bf16(k, normed, w->k_proj, num_tokens, hidden_size, kv_dim, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_bf16(v, normed, w->v_proj, num_tokens, hidden_size, kv_dim, false, true);
+    if (result != 0) return result;
+
+    // 2b. QK LayerNorm (BF16)
+    if (w->q_layernorm != nullptr) {
+        int block_size_qk = min(32, head_dim);
+        block_size_qk = ((block_size_qk + 31) / 32) * 32;
+        per_head_rmsnorm_bf16_kernel<<<num_tokens * num_heads, block_size_qk, 0, ng_get_stream()>>>(
+            q, q, w->q_layernorm, num_tokens, num_heads, head_dim, rms_norm_eps);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return -1;
+    }
+    if (w->k_layernorm != nullptr) {
+        int block_size_qk = min(32, head_dim);
+        block_size_qk = ((block_size_qk + 31) / 32) * 32;
+        per_head_rmsnorm_bf16_kernel<<<num_tokens * num_kv_heads, block_size_qk, 0, ng_get_stream()>>>(
+            k, k, w->k_layernorm, num_tokens, num_kv_heads, head_dim, rms_norm_eps);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) return -1;
+    }
+
+    // 3. RoPE (BF16)
+    result = cuda_bf16_rope_with_theta(q, q, positions, batch_size, seq_len, num_heads, head_dim, rope_style, rope_theta);
+    if (result != 0) return result;
+    result = cuda_bf16_rope_with_theta(k, k, positions, batch_size, seq_len, num_kv_heads, head_dim, rope_style, rope_theta);
+    if (result != 0) return result;
+
+    // 4. Paged Attention — convert Q/K/V to FP16 for attention kernel
+    result = cuda_bf16_to_fp16(q_fp16, q, num_tokens * hidden_size);
+    if (result != 0) return result;
+    result = cuda_bf16_to_fp16(k_fp16, k, num_tokens * kv_dim);
+    if (result != 0) return result;
+    result = cuda_bf16_to_fp16(v_fp16, v, num_tokens * kv_dim);
+    if (result != 0) return result;
+
+    if (seq_len == 1 && paged_cache != nullptr) {
+        result = cuda_paged_attention(attn_out_fp16, q_fp16, k_fp16, v_fp16,
+            paged_cache, d_block_table, d_seq_lens, positions,
+            num_heads, num_kv_heads, head_dim);
+    } else {
+        result = cuda_basic_attention_gqa(attn_out_fp16, q_fp16, k_fp16, v_fp16,
+            batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
+    }
+    if (result != 0) return result;
+
+    // Convert attention output back to BF16
+    result = cuda_fp16_to_bf16(attn_out_bf16, attn_out_fp16, num_tokens * hidden_size);
+    if (result != 0) return result;
+
+    // 5. O projection (BF16)
+    result = cuda_gemm_bf16(normed, attn_out_bf16, w->o_proj, num_tokens, hidden_size, hidden_size, false, true);
+    if (result != 0) return result;
+
+    // 6. Residual add (BF16)
+    result = cuda_bf16_add(normed, normed, residual, num_tokens * hidden_size);
+    if (result != 0) return result;
+
+    // Save new residual
+    CUDA_CHECK(cudaMemcpyAsync(residual, normed,
+        num_tokens * hidden_size * sizeof(__nv_bfloat16),
+        cudaMemcpyDeviceToDevice, ng_get_stream()));
+
+    // 7. FFN RMSNorm (BF16)
+    result = cuda_bf16_rmsnorm(normed, normed, w->ffn_norm, num_tokens, hidden_size, rms_norm_eps);
+    if (result != 0) return result;
+
+    // 8. SwiGLU FFN (BF16 GEMM)
+    result = cuda_gemm_bf16(gate_buf, normed, w->gate_proj, num_tokens, hidden_size, intermediate_size, false, true);
+    if (result != 0) return result;
+    result = cuda_gemm_bf16(up_buf, normed, w->up_proj, num_tokens, hidden_size, intermediate_size, false, true);
+    if (result != 0) return result;
+
+    result = cuda_bf16_silu(gate_buf, gate_buf, num_tokens * intermediate_size);
+    if (result != 0) return result;
+    result = cuda_bf16_mul(gate_buf, gate_buf, up_buf, num_tokens * intermediate_size);
+    if (result != 0) return result;
+
+    result = cuda_gemm_bf16(normed, gate_buf, w->down_proj, num_tokens, intermediate_size, hidden_size, false, true);
+    if (result != 0) return result;
+
+    // 9. Final residual add (BF16)
+    result = cuda_bf16_add(output, normed, residual, num_tokens * hidden_size);
     return result;
 }

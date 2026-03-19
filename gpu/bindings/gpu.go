@@ -1192,6 +1192,50 @@ func DecodeGetHiddenGPUPtr(ctx *DecodeContext) unsafe.Pointer {
 	return C.cuda_decode_get_hidden_gpu_ptr(ctx.ptr)
 }
 
+// SetDecodeBF16Native enables BF16-native mode on the decode context.
+func SetDecodeBF16Native(ctx *DecodeContext, workspace *LayerWorkspaceBF16) error {
+	if ctx == nil || workspace == nil {
+		return errors.New("nil argument to SetDecodeBF16Native")
+	}
+	result := C.cuda_set_decode_bf16_native(ctx.ptr, workspace.ptr)
+	if result != 0 {
+		return fmt.Errorf("set decode BF16 native failed: %d", result)
+	}
+	return nil
+}
+
+// DecodeSetHiddenBF16 copies BF16 hidden state from host to GPU decode context.
+func DecodeSetHiddenBF16(ctx *DecodeContext, hidden []byte) error {
+	result := C.cuda_decode_set_hidden_bf16(ctx.ptr, unsafe.Pointer(&hidden[0]))
+	if result != 0 {
+		return fmt.Errorf("decode set hidden BF16 failed: %d", result)
+	}
+	return nil
+}
+
+// DecodeGetHiddenBF16 copies BF16 hidden state from GPU to host.
+func DecodeGetHiddenBF16(ctx *DecodeContext, hidden []byte) error {
+	result := C.cuda_decode_get_hidden_bf16(ctx.ptr, unsafe.Pointer(&hidden[0]))
+	if result != 0 {
+		return fmt.Errorf("decode get hidden BF16 failed: %d", result)
+	}
+	return nil
+}
+
+// DecodeSetHiddenBF16FromGPU copies BF16 hidden from GPU buffer.
+func DecodeSetHiddenBF16FromGPU(ctx *DecodeContext, gpuPtr unsafe.Pointer) error {
+	result := C.cuda_decode_set_hidden_bf16_from_gpu(ctx.ptr, gpuPtr)
+	if result != 0 {
+		return fmt.Errorf("decode set hidden BF16 from GPU failed: %d", result)
+	}
+	return nil
+}
+
+// DecodeGetHiddenBF16GPUPtr returns GPU pointer to BF16 hidden state.
+func DecodeGetHiddenBF16GPUPtr(ctx *DecodeContext) unsafe.Pointer {
+	return C.cuda_decode_get_hidden_bf16_gpu_ptr(ctx.ptr)
+}
+
 // FreeDecodeContext releases the decode context.
 func FreeDecodeContext(ctx *DecodeContext) {
 	if ctx != nil && ctx.ptr != nil {
@@ -1316,6 +1360,198 @@ func FreeConvLayerWeights(w *ConvLayerWeights) {
 	}
 	C.cuda_free_conv_layer_weights(w.ptr)
 	w.ptr = nil
+}
+
+// =============================================================================
+// BF16-Native Attention Layer (eliminates FP16↔BF16 conversions)
+// =============================================================================
+
+// LayerWeightsBF16 holds BF16-native weights (no FP16↔BF16 conversion needed).
+type LayerWeightsBF16 struct {
+	ptr unsafe.Pointer
+}
+
+// Ptr returns the underlying C pointer.
+func (w *LayerWeightsBF16) Ptr() unsafe.Pointer { return w.ptr }
+
+// CreateLayerWeightsBF16Native creates BF16-native layer weights from BF16 host data.
+// Uploads weights directly as BF16 — no FP16↔BF16 conversion.
+func CreateLayerWeightsBF16Native(
+	qProj, kProj, vProj, oProj []byte,
+	gateProj, upProj, downProj []byte,
+	attnNorm, ffnNorm []byte,
+	qLayerNorm, kLayerNorm []byte,
+	config *types.LlamaConfig,
+) (*LayerWeightsBF16, error) {
+	var ptr unsafe.Pointer
+
+	var qLNPtr, kLNPtr unsafe.Pointer
+	if len(qLayerNorm) > 0 {
+		qLNPtr = unsafe.Pointer(&qLayerNorm[0])
+	}
+	if len(kLayerNorm) > 0 {
+		kLNPtr = unsafe.Pointer(&kLayerNorm[0])
+	}
+
+	result := C.cuda_create_layer_weights_bf16_native(
+		&ptr,
+		unsafe.Pointer(&qProj[0]), unsafe.Pointer(&kProj[0]),
+		unsafe.Pointer(&vProj[0]), unsafe.Pointer(&oProj[0]),
+		unsafe.Pointer(&gateProj[0]), unsafe.Pointer(&upProj[0]),
+		unsafe.Pointer(&downProj[0]),
+		unsafe.Pointer(&attnNorm[0]), unsafe.Pointer(&ffnNorm[0]),
+		qLNPtr, kLNPtr,
+		C.int(config.HiddenSize), C.int(config.IntermediateSize),
+		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
+	)
+	if result != 0 {
+		return nil, fmt.Errorf("failed to create BF16 native layer weights: %d", result)
+	}
+	return &LayerWeightsBF16{ptr: ptr}, nil
+}
+
+// FreeLayerWeightsBF16Native frees BF16-native layer weights.
+func FreeLayerWeightsBF16Native(w *LayerWeightsBF16) {
+	if w == nil || w.ptr == nil {
+		return
+	}
+	C.cuda_free_layer_weights_bf16_native(w.ptr)
+	w.ptr = nil
+}
+
+// LayerWorkspaceBF16 holds pre-allocated GPU buffers for BF16 layer forward passes.
+type LayerWorkspaceBF16 struct {
+	ptr unsafe.Pointer
+}
+
+// CreateLayerWorkspaceBF16 pre-allocates all temporary GPU buffers for BF16 forward.
+func CreateLayerWorkspaceBF16(maxTokens int, config *types.LlamaConfig) (*LayerWorkspaceBF16, error) {
+	var ptr unsafe.Pointer
+	result := C.cuda_create_layer_workspace_bf16(
+		&ptr,
+		C.int(maxTokens),
+		C.int(config.HiddenSize),
+		C.int(config.IntermediateSize),
+		C.int(config.NumKVHeads),
+		C.int(config.HeadDim),
+	)
+	if result != 0 {
+		return nil, fmt.Errorf("failed to create BF16 layer workspace: %d", result)
+	}
+	return &LayerWorkspaceBF16{ptr: ptr}, nil
+}
+
+// FreeLayerWorkspaceBF16 releases the pre-allocated BF16 workspace buffers.
+func FreeLayerWorkspaceBF16(ws *LayerWorkspaceBF16) {
+	if ws == nil || ws.ptr == nil {
+		return
+	}
+	C.cuda_free_layer_workspace_bf16(ws.ptr)
+	ws.ptr = nil
+}
+
+// LayerForwardBF16Native executes BF16-native layer forward using pre-allocated workspace.
+func LayerForwardBF16Native(output, input *types.Tensor, weights *LayerWeightsBF16, cache *KVCache,
+	positions []int32, config *types.LlamaConfig, ropeStyle int, workspace *LayerWorkspaceBF16) error {
+	if output == nil || input == nil || weights == nil || workspace == nil {
+		return errors.New("nil argument to LayerForwardBF16Native")
+	}
+
+	batch := input.Shape[0]
+	seqLen := input.Shape[1]
+
+	var dPositions unsafe.Pointer
+	posSize := C.size_t(len(positions) * 4)
+	if C.cuda_malloc(&dPositions, posSize) != 0 {
+		return errors.New("failed to allocate positions on GPU")
+	}
+	defer C.cuda_free(dPositions)
+
+	if C.cudaMemcpy(dPositions, unsafe.Pointer(&positions[0]), posSize, C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy positions to GPU")
+	}
+
+	ropeTheta := config.RopeTheta
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0
+	}
+
+	var cachePtr unsafe.Pointer
+	if cache != nil {
+		cachePtr = cache.ptr
+	}
+
+	result := C.cuda_layer_forward_bf16_native(
+		output.Data, input.Data, weights.ptr, cachePtr,
+		(*C.int)(dPositions),
+		nil, // d_seq_lens (not used for non-paged path)
+		C.int(batch), C.int(seqLen),
+		C.int(config.HiddenSize), C.int(config.IntermediateSize),
+		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
+		C.float(config.RMSNormEps), C.float(ropeTheta), C.int(ropeStyle),
+		workspace.ptr,
+	)
+	if result != 0 {
+		return fmt.Errorf("BF16 native layer forward failed: %d", result)
+	}
+	return nil
+}
+
+// LayerForwardBF16Paged executes BF16-native layer forward with paged attention.
+func LayerForwardBF16Paged(output, input *types.Tensor, weights *LayerWeightsBF16,
+	pagedCache *PagedKVCache, dBlockTable unsafe.Pointer,
+	positions []int32, config *types.LlamaConfig, ropeStyle int,
+	workspace *LayerWorkspaceBF16) error {
+	if output == nil || input == nil || weights == nil || pagedCache == nil || workspace == nil {
+		return errors.New("nil argument to LayerForwardBF16Paged")
+	}
+
+	batch := input.Shape[0]
+	seqLen := input.Shape[1]
+
+	var dPositions unsafe.Pointer
+	posSize := C.size_t(len(positions) * 4)
+	if C.cuda_malloc(&dPositions, posSize) != 0 {
+		return errors.New("failed to allocate positions on GPU")
+	}
+	defer C.cuda_free(dPositions)
+
+	if C.cudaMemcpy(dPositions, unsafe.Pointer(&positions[0]), posSize, C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy positions to GPU")
+	}
+
+	// Allocate GPU buffer for seq_lens (= position + 1)
+	var dSeqLens unsafe.Pointer
+	if C.cuda_malloc(&dSeqLens, C.size_t(4)) != 0 {
+		return errors.New("failed to allocate seq_lens buffer")
+	}
+	defer C.cuda_free(dSeqLens)
+	seqLenVal := C.int(positions[0] + 1)
+	if C.cudaMemcpy(dSeqLens, unsafe.Pointer(&seqLenVal), C.size_t(4), C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy seq_lens to GPU")
+	}
+
+	ropeTheta := config.RopeTheta
+	if ropeTheta == 0 {
+		ropeTheta = 10000.0
+	}
+
+	result := C.cuda_layer_forward_bf16_paged(
+		output.Data, input.Data, weights.ptr,
+		pagedCache.ptr,
+		(*C.int)(dBlockTable),
+		(*C.int)(dPositions),
+		(*C.int)(dSeqLens),
+		C.int(batch), C.int(seqLen),
+		C.int(config.HiddenSize), C.int(config.IntermediateSize),
+		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),
+		C.float(config.RMSNormEps), C.float(ropeTheta), C.int(ropeStyle),
+		workspace.ptr,
+	)
+	if result != 0 {
+		return fmt.Errorf("BF16 paged layer forward failed: %d", result)
+	}
+	return nil
 }
 
 // =============================================================================

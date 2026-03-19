@@ -688,6 +688,15 @@ func DecodeSetHidden(ctx *DecodeContext, hidden []byte) error                 { 
 func DecodeGetHidden(ctx *DecodeContext, hidden []byte) error { return ErrNotImplemented }
 func DecodeStepGPU(ctx *DecodeContext, position int) error     { return ErrNotImplemented }
 func DecodeGetHiddenGPUPtr(ctx *DecodeContext) unsafe.Pointer  { return nil }
+func SetDecodeBF16Native(ctx *DecodeContext, workspace *LayerWorkspaceBF16) error {
+	return ErrNotImplemented
+}
+func DecodeSetHiddenBF16(ctx *DecodeContext, hidden []byte) error       { return ErrNotImplemented }
+func DecodeGetHiddenBF16(ctx *DecodeContext, hidden []byte) error       { return ErrNotImplemented }
+func DecodeSetHiddenBF16FromGPU(ctx *DecodeContext, gpuPtr unsafe.Pointer) error {
+	return ErrNotImplemented
+}
+func DecodeGetHiddenBF16GPUPtr(ctx *DecodeContext) unsafe.Pointer { return nil }
 func FreeDecodeContext(ctx *DecodeContext) {}
 
 // =============================================================================
@@ -753,6 +762,58 @@ func FreeConvLayerWeights(w *ConvLayerWeights) {
 	if w != nil {
 		w.ptr = nil
 	}
+}
+
+// =============================================================================
+// BF16-Native Attention Layer (Stubs)
+// =============================================================================
+
+// LayerWeightsBF16 holds BF16-native weights (stub).
+type LayerWeightsBF16 struct {
+	ptr unsafe.Pointer
+}
+
+func (w *LayerWeightsBF16) Ptr() unsafe.Pointer { return w.ptr }
+
+// CreateLayerWeightsBF16Native creates BF16-native layer weights (stub).
+func CreateLayerWeightsBF16Native(
+	qProj, kProj, vProj, oProj []byte,
+	gateProj, upProj, downProj []byte,
+	attnNorm, ffnNorm []byte,
+	qLayerNorm, kLayerNorm []byte,
+	config *types.LlamaConfig,
+) (*LayerWeightsBF16, error) {
+	return nil, ErrNotImplemented
+}
+
+// FreeLayerWeightsBF16Native frees BF16-native layer weights (stub).
+func FreeLayerWeightsBF16Native(w *LayerWeightsBF16) {}
+
+// LayerWorkspaceBF16 holds pre-allocated BF16 workspace (stub).
+type LayerWorkspaceBF16 struct {
+	ptr unsafe.Pointer
+}
+
+// CreateLayerWorkspaceBF16 pre-allocates BF16 workspace buffers (stub).
+func CreateLayerWorkspaceBF16(maxTokens int, config *types.LlamaConfig) (*LayerWorkspaceBF16, error) {
+	return nil, ErrNotImplemented
+}
+
+// FreeLayerWorkspaceBF16 frees BF16 workspace buffers (stub).
+func FreeLayerWorkspaceBF16(ws *LayerWorkspaceBF16) {}
+
+// LayerForwardBF16Native executes BF16-native layer forward (stub).
+func LayerForwardBF16Native(output, input *types.Tensor, weights *LayerWeightsBF16, cache *KVCache,
+	positions []int32, config *types.LlamaConfig, ropeStyle int, workspace *LayerWorkspaceBF16) error {
+	return ErrNotImplemented
+}
+
+// LayerForwardBF16Paged executes BF16-native layer forward with paged attention (stub).
+func LayerForwardBF16Paged(output, input *types.Tensor, weights *LayerWeightsBF16,
+	pagedCache *PagedKVCache, dBlockTable unsafe.Pointer,
+	positions []int32, config *types.LlamaConfig, ropeStyle int,
+	workspace *LayerWorkspaceBF16) error {
+	return ErrNotImplemented
 }
 
 // =============================================================================

@@ -112,6 +112,55 @@ int cuda_layer_forward_fp16_paged(
     void* workspace
 );
 
+// ============================================================================
+// BF16-Native Layer (no FP16↔BF16 conversions for attention layers)
+// ============================================================================
+
+// Create BF16-native layer weights from BF16 host data (NO conversion)
+int cuda_create_layer_weights_bf16_native(
+    void** weights,
+    const void* h_q_proj, const void* h_k_proj, const void* h_v_proj, const void* h_o_proj,
+    const void* h_gate_proj, const void* h_up_proj, const void* h_down_proj,
+    const void* h_attn_norm, const void* h_ffn_norm,
+    const void* h_q_layernorm, const void* h_k_layernorm,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim
+);
+
+void cuda_free_layer_weights_bf16_native(void* weights);
+
+// BF16 layer workspace
+int cuda_create_layer_workspace_bf16(
+    void** workspace,
+    int max_tokens,
+    int hidden_size,
+    int intermediate_size,
+    int num_kv_heads,
+    int head_dim
+);
+
+void cuda_free_layer_workspace_bf16(void* workspace);
+
+// BF16-native layer forward pass (uses BF16 throughout, FP16 only for attention)
+int cuda_layer_forward_bf16_native(
+    void* output, const void* input, const void* weights,
+    void* kv_cache, const int* positions, const int* d_seq_lens,
+    int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+);
+
+// BF16-native layer forward with paged attention
+int cuda_layer_forward_bf16_paged(
+    void* output, const void* input, const void* weights,
+    void* paged_cache, const int* d_block_table,
+    const int* positions, const int* d_seq_lens,
+    int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+);
+
 #ifdef __cplusplus
 }
 #endif

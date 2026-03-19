@@ -27,6 +27,12 @@ extern "C" int cuda_layer_forward_fp16_paged(
 extern "C" int cuda_fp16_to_bf16(void*, const void*, size_t);
 extern "C" int cuda_bf16_to_fp16(void*, const void*, size_t);
 extern "C" int cublas_set_stream(void* stream);
+extern "C" int cuda_layer_forward_bf16_native(
+    void*, const void*, const void*, void*, const int*, const int*, int, int,
+    int, int, int, int, int, float, float, int, void*);
+extern "C" int cuda_layer_forward_bf16_paged(
+    void*, const void*, const void*, void*, const int*, const int*, const int*, int, int,
+    int, int, int, int, int, float, float, int, void*);
 
 // Error checking
 #define CUDA_CHECK(call) do { \
@@ -83,6 +89,12 @@ struct DecodeContext {
     int* d_block_table;          // GPU block table buffer (shared, updated before each step)
     int max_blocks_per_seq;
     bool use_paged;
+
+    // BF16-native attention support (eliminates FP16↔BF16 conversions)
+    bool use_bf16_native;             // true if attention layers use BF16 native weights
+    void* bf16_attn_workspace;        // LayerWorkspaceBF16*
+    __nv_bfloat16* bf16_hidden_a;     // [hidden_size] BF16 ping buffer
+    __nv_bfloat16* bf16_hidden_b;     // [hidden_size] BF16 pong buffer
 
     // CUDA Graph for decode step replay
     cudaGraph_t graph;
@@ -191,6 +203,55 @@ extern "C" void cuda_set_decode_paged_layer(void* ctx_ptr, int layer_id, void* p
     ctx->paged_caches[layer_id] = paged_cache;
 }
 
+// Enable BF16-native mode: allocate BF16 hidden state buffers, set workspace
+extern "C" int cuda_set_decode_bf16_native(void* ctx_ptr, void* bf16_workspace) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    int H = ctx->hidden_size;
+
+    // Allocate BF16 ping-pong hidden state buffers
+    if (!ctx->bf16_hidden_a) {
+        CUDA_CHECK(cudaMalloc(&ctx->bf16_hidden_a, H * sizeof(__nv_bfloat16)));
+    }
+    if (!ctx->bf16_hidden_b) {
+        CUDA_CHECK(cudaMalloc(&ctx->bf16_hidden_b, H * sizeof(__nv_bfloat16)));
+    }
+
+    ctx->bf16_attn_workspace = bf16_workspace;
+    ctx->use_bf16_native = true;
+    return 0;
+}
+
+// Set BF16 hidden state from host (for first token after prefill)
+extern "C" int cuda_decode_set_hidden_bf16(void* ctx_ptr, const void* h_hidden) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    CUDA_CHECK(cudaMemcpy(ctx->bf16_hidden_a, h_hidden,
+        ctx->hidden_size * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    return 0;
+}
+
+// Get BF16 hidden state to host
+extern "C" int cuda_decode_get_hidden_bf16(void* ctx_ptr, void* h_hidden) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    __nv_bfloat16* result_buf = (ctx->num_layers % 2 == 0) ? ctx->bf16_hidden_a : ctx->bf16_hidden_b;
+    CUDA_CHECK(cudaMemcpy(h_hidden, result_buf,
+        ctx->hidden_size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+// Set BF16 hidden state from GPU pointer
+extern "C" int cuda_decode_set_hidden_bf16_from_gpu(void* ctx_ptr, const void* d_hidden) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    CUDA_CHECK(cudaMemcpy(ctx->bf16_hidden_a, d_hidden,
+        ctx->hidden_size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+    return 0;
+}
+
+// Get BF16 hidden GPU pointer
+extern "C" void* cuda_decode_get_hidden_bf16_gpu_ptr(void* ctx_ptr) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    return ctx->bf16_hidden_a;
+}
+
 // ============================================================================
 // Internal: run all layers (used for both normal and graph-captured paths)
 // ============================================================================
@@ -199,6 +260,63 @@ extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*
 
 static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
     int H = ctx->hidden_size;
+
+    // BF16-native path: conv layers already BF16, attention layers now BF16 too
+    // No FP16↔BF16 conversions needed at layer boundaries!
+    if (ctx->use_bf16_native && ctx->bf16_hidden_a && ctx->bf16_attn_workspace) {
+        __nv_bfloat16* current = ctx->bf16_hidden_a;
+        __nv_bfloat16* next = ctx->bf16_hidden_b;
+
+        for (int i = 0; i < ctx->num_layers; i++) {
+            int result;
+
+            if (ctx->layer_types[i] == 0) {
+                // Conv layer: already BF16 native — no conversion needed
+                if (ctx->conv_workspace) {
+                    result = cuda_conv_layer_forward_bf16_ws(
+                        next, current,
+                        ctx->layer_weights[i], ctx->layer_caches[i],
+                        1, 1, 0, ctx->conv_workspace);
+                } else {
+                    result = cuda_conv_layer_forward_bf16(
+                        next, current,
+                        ctx->layer_weights[i], ctx->layer_caches[i],
+                        1, 1, 0);
+                }
+                if (result != 0) return result;
+            } else {
+                // Attention layer: BF16 native forward
+                if (ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
+                    result = cuda_layer_forward_bf16_paged(
+                        next, current, ctx->layer_weights[i],
+                        ctx->paged_caches[i], ctx->d_block_table,
+                        ctx->d_position, ctx->d_seq_lens, 1, 1,
+                        H, ctx->intermediate_size, ctx->num_heads,
+                        ctx->num_kv_heads, ctx->head_dim,
+                        ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
+                        ctx->bf16_attn_workspace);
+                } else {
+                    result = cuda_layer_forward_bf16_native(
+                        next, current, ctx->layer_weights[i],
+                        ctx->layer_caches[i],
+                        ctx->d_position, ctx->d_seq_lens, 1, 1,
+                        H, ctx->intermediate_size, ctx->num_heads,
+                        ctx->num_kv_heads, ctx->head_dim,
+                        ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
+                        ctx->bf16_attn_workspace);
+                }
+                if (result != 0) return result;
+            }
+
+            // Ping-pong (BF16)
+            __nv_bfloat16* tmp = current;
+            current = next;
+            next = tmp;
+        }
+        return 0;
+    }
+
+    // FP16 path (original): conv layers need FP16↔BF16 conversion
     half* current = ctx->hidden_a;
     half* next = ctx->hidden_b;
 
@@ -264,9 +382,6 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
         next = tmp;
     }
 
-    // If num_layers is odd, result is in hidden_b; if even, in hidden_a.
-    // Copy to hidden_a if needed (so output is always in hidden_a after even layers,
-    // hidden_b after odd layers — we track this in the caller)
     return 0;
 }
 
@@ -432,9 +547,15 @@ extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
 
     // Swap buffers for next call
     if (ctx->num_layers % 2 != 0) {
-        half* tmp = ctx->hidden_a;
-        ctx->hidden_a = ctx->hidden_b;
-        ctx->hidden_b = tmp;
+        if (ctx->use_bf16_native && ctx->bf16_hidden_a) {
+            __nv_bfloat16* tmp = ctx->bf16_hidden_a;
+            ctx->bf16_hidden_a = ctx->bf16_hidden_b;
+            ctx->bf16_hidden_b = tmp;
+        } else {
+            half* tmp = ctx->hidden_a;
+            ctx->hidden_a = ctx->hidden_b;
+            ctx->hidden_b = tmp;
+        }
     }
     return 0;
 }
@@ -457,6 +578,8 @@ extern "C" void cuda_free_decode_context(void* ctx_ptr) {
     if (ctx->conv_fp16_out) cudaFree(ctx->conv_fp16_out);
     if (ctx->hidden_a) cudaFree(ctx->hidden_a);
     if (ctx->hidden_b) cudaFree(ctx->hidden_b);
+    if (ctx->bf16_hidden_a) cudaFree(ctx->bf16_hidden_a);
+    if (ctx->bf16_hidden_b) cudaFree(ctx->bf16_hidden_b);
     if (ctx->d_position) cudaFree(ctx->d_position);
     if (ctx->d_seq_lens) cudaFree(ctx->d_seq_lens);
     if (ctx->layer_types) free(ctx->layer_types);

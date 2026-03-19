@@ -411,6 +411,14 @@ int cuda_decode_set_hidden_from_gpu(void* ctx, const void* d_hidden);
 int cuda_decode_get_hidden(void* ctx, void* h_hidden);
 int cuda_decode_step_gpu(void* ctx, int position);
 void* cuda_decode_get_hidden_gpu_ptr(void* ctx);
+
+// BF16-native decode support
+int cuda_set_decode_bf16_native(void* ctx, void* bf16_workspace);
+int cuda_decode_set_hidden_bf16(void* ctx, const void* h_hidden);
+int cuda_decode_get_hidden_bf16(void* ctx, void* h_hidden);
+int cuda_decode_set_hidden_bf16_from_gpu(void* ctx, const void* d_hidden);
+void* cuda_decode_get_hidden_bf16_gpu_ptr(void* ctx);
+
 void cuda_free_decode_context(void* ctx);
 
 // ============================================================================
@@ -506,6 +514,51 @@ int cuda_conv_layer_forward_bf16(void* output, const void* input, const void* we
     void* conv_state, int batch, int seq_len, int position);
 
 void cuda_free_conv_layer_weights(void* weights);
+
+// ============================================================================
+// BF16-Native Attention Layer (eliminates FP16↔BF16 conversions)
+// ============================================================================
+
+int cuda_create_layer_weights_bf16_native(
+    void** weights,
+    const void* h_q_proj, const void* h_k_proj, const void* h_v_proj, const void* h_o_proj,
+    const void* h_gate_proj, const void* h_up_proj, const void* h_down_proj,
+    const void* h_attn_norm, const void* h_ffn_norm,
+    const void* h_q_layernorm, const void* h_k_layernorm,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim
+);
+
+void cuda_free_layer_weights_bf16_native(void* weights);
+
+int cuda_create_layer_workspace_bf16(
+    void** workspace,
+    int max_tokens,
+    int hidden_size,
+    int intermediate_size,
+    int num_kv_heads,
+    int head_dim
+);
+
+void cuda_free_layer_workspace_bf16(void* workspace);
+
+int cuda_layer_forward_bf16_native(
+    void* output, const void* input, const void* weights,
+    void* kv_cache, const int* positions, const int* d_seq_lens,
+    int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+);
+
+int cuda_layer_forward_bf16_paged(
+    void* output, const void* input, const void* weights,
+    void* paged_cache, const int* d_block_table,
+    const int* positions, const int* d_seq_lens,
+    int batch_size, int seq_len,
+    int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
+    float rms_norm_eps, float rope_theta, int rope_style,
+    void* workspace
+);
 
 #ifdef __cplusplus
 }

@@ -117,7 +117,7 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 				return nil, fmt.Errorf("GPU conv layer %d: %w", layerID, err)
 			}
 		} else if e.config.ModelType == "lfm2" {
-			// Load LFM2 attention layer (different tensor names: out_proj, feed_forward, operator_norm)
+			// Load LFM2 attention layer as BF16-native (eliminates FP16↔BF16 conversions)
 			layerWeights, qLayerNorm, kLayerNorm, err := loader.LoadAttentionLayerWeightsLFM2(layerID)
 			if err != nil {
 				gpu.Close()
@@ -138,9 +138,14 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 				KLayerNorm: kLayerNorm,
 			}
 
-			if err := gpu.LayerExecutor.LoadLayerFP16(layerID, weights); err != nil {
-				gpu.Close()
-				return nil, fmt.Errorf("GPU attn layer %d: %w", layerID, err)
+			// Try BF16-native first (preferred — eliminates FP16↔BF16 conversions)
+			if err := gpu.LayerExecutor.LoadLayerBF16Native(layerID, weights); err != nil {
+				// Fallback to FP16-pure path
+				log.Printf("BF16 native load failed for layer %d, falling back to FP16: %v", layerID, err)
+				if err := gpu.LayerExecutor.LoadLayerFP16(layerID, weights); err != nil {
+					gpu.Close()
+					return nil, fmt.Errorf("GPU attn layer %d: %w", layerID, err)
+				}
 			}
 		} else {
 			// Load standard Llama attention layer

@@ -37,6 +37,11 @@ type CUDALayerExecutor struct {
 	// FP16-pure attention layers (LFM2 — no INT8 quantization)
 	fp16LayerWeights map[int]*bindings.LayerWeightsFP16
 
+	// BF16-native attention layers (LFM2 — eliminates FP16↔BF16 conversions)
+	bf16LayerWeights map[int]*bindings.LayerWeightsBF16
+	bf16Workspace    *bindings.LayerWorkspaceBF16
+	useBF16Native    bool
+
 	// Full decode context — runs all layers in single CUDA call
 	decodeCtx *bindings.DecodeContext
 
@@ -147,6 +152,7 @@ func NewCUDALayerExecutor(config *types.LlamaConfig, deviceID int) (*CUDALayerEx
 		convLayerWeights: make(map[int]*bindings.ConvLayerWeights),
 		convStates:       make(map[int]unsafe.Pointer),
 		fp16LayerWeights: make(map[int]*bindings.LayerWeightsFP16),
+		bf16LayerWeights: make(map[int]*bindings.LayerWeightsBF16),
 		config:           config,
 		deviceID:         deviceID,
 		inputGPU:         inputGPU,
@@ -373,6 +379,54 @@ func (e *CUDALayerExecutor) LoadLayerFP16(layerID int, weights *TransformerLayer
 	return nil
 }
 
+// LoadLayerBF16Native uploads attention layer weights as BF16 native (no FP16↔BF16 conversion).
+// Used for LFM2 where weights are already in BF16 format.
+func (e *CUDALayerExecutor) LoadLayerBF16Native(layerID int, weights *TransformerLayerWeights) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if existing, ok := e.bf16LayerWeights[layerID]; ok {
+		bindings.FreeLayerWeightsBF16Native(existing)
+	}
+
+	gpuWeights, err := bindings.CreateLayerWeightsBF16Native(
+		weights.QProj, weights.KProj, weights.VProj, weights.OProj,
+		weights.GateProj, weights.UpProj, weights.DownProj,
+		weights.AttnNorm, weights.FFNNorm,
+		weights.QLayerNorm, weights.KLayerNorm,
+		e.config,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upload BF16 native layer %d: %w", layerID, err)
+	}
+	e.bf16LayerWeights[layerID] = gpuWeights
+	e.useBF16Native = true
+
+	// Create BF16 workspace if not yet created
+	if e.bf16Workspace == nil {
+		ws, wsErr := bindings.CreateLayerWorkspaceBF16(1, e.config)
+		if wsErr != nil {
+			return fmt.Errorf("failed to create BF16 workspace: %w", wsErr)
+		}
+		e.bf16Workspace = ws
+	}
+
+	// Create KV cache (still FP16 for now)
+	if _, ok := e.kvCaches[layerID]; !ok {
+		maxSeqLen := 2048
+		if e.config.MaxSeqLen > 0 {
+			maxSeqLen = e.config.MaxSeqLen
+		}
+		cache, err := bindings.NewKVCache(1, e.config.NumKVHeads, e.config.HeadDim, maxSeqLen)
+		if err != nil {
+			return fmt.Errorf("failed to create KV cache for layer %d: %w", layerID, err)
+		}
+		e.kvCaches[layerID] = cache
+	}
+
+	return nil
+}
+
 // Forward executes the transformer layer forward pass on GPU.
 // Returns: output hidden state, K cache data, V cache data
 //
@@ -386,8 +440,14 @@ func (e *CUDALayerExecutor) Forward(
 	e.mu.RLock()
 	weights, ok := e.layerWeights[layerID]
 	fp16Weights, fp16Ok := e.fp16LayerWeights[layerID]
+	bf16Weights, bf16Ok := e.bf16LayerWeights[layerID]
 	cache := e.kvCaches[layerID]
 	e.mu.RUnlock()
+
+	// Use BF16-native path if available (LFM2 attention layers, no FP16↔BF16 conversions)
+	if bf16Ok && bf16Weights != nil {
+		return e.forwardBF16(ctx, layerID, hidden, position, bf16Weights, cache)
+	}
 
 	// Use FP16-pure path if available (LFM2 attention layers)
 	if fp16Ok && fp16Weights != nil {
@@ -537,6 +597,14 @@ func (e *CUDALayerExecutor) BuildDecodeContext() error {
 				state := e.convStates[i]
 				bindings.SetDecodeLayer(ctx, i, 0, w.Ptr(), state) // 0=conv
 			}
+		} else if w, ok := e.bf16LayerWeights[i]; ok {
+			// BF16-native attention layer
+			cache := e.kvCaches[i]
+			var cachePtr unsafe.Pointer
+			if cache != nil {
+				cachePtr = cache.Ptr()
+			}
+			bindings.SetDecodeLayer(ctx, i, 1, w.Ptr(), cachePtr) // 1=attention
 		} else {
 			if w, ok := e.fp16LayerWeights[i]; ok {
 				cache := e.kvCaches[i]
@@ -549,7 +617,12 @@ func (e *CUDALayerExecutor) BuildDecodeContext() error {
 		}
 	}
 
-	// Set workspace
+	// Set workspace: prefer BF16 native if available
+	if e.useBF16Native && e.bf16Workspace != nil {
+		if err := bindings.SetDecodeBF16Native(ctx, e.bf16Workspace); err != nil {
+			return fmt.Errorf("set decode BF16 native: %w", err)
+		}
+	}
 	if e.fp16Workspace != nil {
 		bindings.SetDecodeWorkspace(ctx, e.fp16Workspace)
 	}
@@ -705,6 +778,77 @@ func (e *CUDALayerExecutor) forwardFP16(ctx context.Context, layerID int, hidden
 			}
 		}
 	}
+	output := make([]byte, len(hidden))
+	if err := bindings.CopyFromDeviceRaw(getBytePointer(output), e.outputGPU, uint64(len(output))); err != nil {
+		return nil, nil, nil, fmt.Errorf("copy output: %w", err)
+	}
+
+	kvSize := e.config.NumKVHeads * e.config.HeadDim * 2
+	k := make([]byte, kvSize)
+	v := make([]byte, kvSize)
+
+	return output, k, v, nil
+}
+
+func (e *CUDALayerExecutor) forwardBF16(ctx context.Context, layerID int, hidden []byte, position int,
+	weights *bindings.LayerWeightsBF16, cache *bindings.KVCache) ([]byte, []byte, []byte, error) {
+
+	hiddenSize := e.config.HiddenSize
+
+	inputTensor := &types.Tensor{
+		Shape:  []int{1, 1, hiddenSize},
+		Dtype:  types.DtypeFP16, // BF16 is same size as FP16 (2 bytes)
+		Device: e.deviceID,
+		Data:   e.inputGPU,
+	}
+
+	if err := bindings.CopyToDeviceRaw(e.inputGPU, getBytePointer(hidden), uint64(len(hidden))); err != nil {
+		return nil, nil, nil, fmt.Errorf("copy input: %w", err)
+	}
+
+	outputTensor := &types.Tensor{
+		Shape:  []int{1, 1, hiddenSize},
+		Dtype:  types.DtypeFP16,
+		Device: e.deviceID,
+		Data:   e.outputGPU,
+	}
+
+	positions := []int32{int32(position)}
+	ropeStyle := 1 // RoPEStyleInterleaved for LFM2
+
+	// Choose attention path: paged or contiguous
+	usedPaged := false
+	if e.usePagedCache && e.pagedManager != nil && e.bf16Workspace != nil {
+		layerCache, hasLayerCache := e.pagedCaches[layerID]
+		if hasLayerCache {
+			activeSeqID := e.pagedManager.FirstActiveSequenceID()
+			blockTable, _, btErr := e.pagedManager.GetBlockTable(activeSeqID, e.maxBlocksPerSeq)
+			if btErr == nil {
+				tableBytes := uint64(len(blockTable) * 4)
+				if cpErr := bindings.CopyToDeviceRaw(e.blockTableGPU, unsafe.Pointer(&blockTable[0]), tableBytes); cpErr != nil {
+					return nil, nil, nil, fmt.Errorf("copy block table to GPU: %w", cpErr)
+				}
+
+				if fwdErr := bindings.LayerForwardBF16Paged(outputTensor, inputTensor, weights,
+					layerCache, e.blockTableGPU,
+					positions, e.config, ropeStyle, e.bf16Workspace); fwdErr != nil {
+					return nil, nil, nil, fmt.Errorf("BF16 paged layer forward failed: %w", fwdErr)
+				}
+				usedPaged = true
+			}
+		}
+	}
+
+	if !usedPaged {
+		if e.bf16Workspace != nil {
+			if err := bindings.LayerForwardBF16Native(outputTensor, inputTensor, weights, cache, positions, e.config, ropeStyle, e.bf16Workspace); err != nil {
+				return nil, nil, nil, fmt.Errorf("BF16 native layer forward failed: %w", err)
+			}
+		} else {
+			return nil, nil, nil, fmt.Errorf("BF16 workspace not initialized")
+		}
+	}
+
 	output := make([]byte, len(hidden))
 	if err := bindings.CopyFromDeviceRaw(getBytePointer(output), e.outputGPU, uint64(len(output))); err != nil {
 		return nil, nil, nil, fmt.Errorf("copy output: %w", err)
@@ -891,6 +1035,12 @@ func (e *CUDALayerExecutor) Close() error {
 		e.fp16Workspace = nil
 	}
 
+	// Free BF16 layer workspace
+	if e.bf16Workspace != nil {
+		bindings.FreeLayerWorkspaceBF16(e.bf16Workspace)
+		e.bf16Workspace = nil
+	}
+
 	// Free preallocated conv buffers
 	if e.convInputFP16 != nil {
 		bindings.FreeOnDevice(e.convInputFP16, e.deviceID)
@@ -922,6 +1072,11 @@ func (e *CUDALayerExecutor) Close() error {
 	for id, w := range e.fp16LayerWeights {
 		bindings.FreeLayerWeightsFP16(w)
 		delete(e.fp16LayerWeights, id)
+	}
+
+	for id, w := range e.bf16LayerWeights {
+		bindings.FreeLayerWeightsBF16Native(w)
+		delete(e.bf16LayerWeights, id)
 	}
 
 	for id, weights := range e.convLayerWeights {
