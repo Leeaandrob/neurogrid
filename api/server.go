@@ -514,8 +514,8 @@ func buildLlamaPrompt(messages []Message) string {
 func getStopStringsForModel(modelName string) []string {
 	lower := strings.ToLower(modelName)
 	if strings.Contains(lower, "lfm") {
-		// LFM2 thinking models: stop after </think> + answer, or at turn boundary
-		return []string{"<|im_end|>", "<|im_start|>"}
+		// LFM2 thinking models: stop at end of assistant turn
+		return []string{"<|im_end|>"}
 	}
 	return []string{}
 }
@@ -524,10 +524,16 @@ func getStopStringsForModel(modelName string) []string {
 func cleanModelOutput(text string, modelName string) string {
 	lower := strings.ToLower(modelName)
 
-	// Strip <think>...</think> blocks for thinking models (LFM2, etc.)
+	// For thinking models: extract content AFTER </think> if present
 	if strings.Contains(lower, "lfm") || strings.Contains(text, "<think>") {
-		text = model.StripThinkingTokens(text)
-		text = strings.TrimSpace(text)
+		if idx := strings.Index(text, "</think>"); idx != -1 {
+			// Return only the answer part after </think>
+			text = strings.TrimSpace(text[idx+len("</think>"):])
+		} else {
+			// No </think> found — strip <think> and return everything
+			text = model.StripThinkingTokens(text)
+			text = strings.TrimSpace(text)
+		}
 	}
 
 	// Define markers to remove based on model type
