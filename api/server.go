@@ -360,10 +360,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Get stop strings for this model (prevents generating new turns)
 	stopStrings := getStopStringsForModel(s.config.ModelName)
 
-	// Generate response
+	// Cap max_tokens for thinking models (need ~400 think + ~100 answer)
+	maxTokens := req.MaxTokens
+	if strings.Contains(strings.ToLower(s.config.ModelName), "lfm") && maxTokens > 512 {
+		maxTokens = 512
+	}
+
 	genReq := &inference.GenerateRequest{
 		Prompt:      prompt,
-		MaxTokens:   req.MaxTokens,
+		MaxTokens:   maxTokens,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
 		StopStrings: stopStrings,
@@ -515,6 +520,7 @@ func getStopStringsForModel(modelName string) []string {
 	lower := strings.ToLower(modelName)
 	if strings.Contains(lower, "lfm") {
 		// LFM2 thinking models: stop at end of assistant turn
+		// Note: the model generates <think>...</think>\nanswer<|im_end|>
 		return []string{"<|im_end|>"}
 	}
 	return []string{}
