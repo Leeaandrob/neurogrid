@@ -229,6 +229,20 @@ extern "C" int cuda_decode_set_hidden_bf16(void* ctx_ptr, const void* h_hidden) 
     return 0;
 }
 
+// Convert FP16 hidden_a → BF16 bf16_hidden_a (called after SetHidden when BF16 native is active)
+extern "C" int cuda_decode_convert_fp16_to_bf16(void* ctx_ptr) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    if (!ctx->bf16_hidden_a || !ctx->hidden_a) return -1;
+    return cuda_fp16_to_bf16(ctx->bf16_hidden_a, ctx->hidden_a, ctx->hidden_size);
+}
+
+// Convert BF16 bf16_hidden_a → FP16 hidden_a (called after BF16 decode so LM head gets FP16)
+extern "C" int cuda_decode_convert_bf16_to_fp16(void* ctx_ptr) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    if (!ctx->bf16_hidden_a || !ctx->hidden_a) return -1;
+    return cuda_bf16_to_fp16(ctx->hidden_a, ctx->bf16_hidden_a, ctx->hidden_size);
+}
+
 // Get BF16 hidden state to host
 extern "C" int cuda_decode_get_hidden_bf16(void* ctx_ptr, void* h_hidden) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
@@ -557,6 +571,13 @@ extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
             ctx->hidden_b = tmp;
         }
     }
+
+    // BF16→FP16 post-conversion: LM head reads from hidden_a (FP16)
+    if (ctx->use_bf16_native && ctx->bf16_hidden_a && ctx->hidden_a) {
+        int cvt = cuda_bf16_to_fp16(ctx->hidden_a, ctx->bf16_hidden_a, ctx->hidden_size);
+        if (cvt != 0) return cvt;
+    }
+
     return 0;
 }
 

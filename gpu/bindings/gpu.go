@@ -1236,6 +1236,24 @@ func DecodeGetHiddenBF16GPUPtr(ctx *DecodeContext) unsafe.Pointer {
 	return C.cuda_decode_get_hidden_bf16_gpu_ptr(ctx.ptr)
 }
 
+// DecodeConvertFP16ToBF16 converts hidden_a (FP16) → bf16_hidden_a (BF16) on GPU.
+func DecodeConvertFP16ToBF16(ctx *DecodeContext) error {
+	result := C.cuda_decode_convert_fp16_to_bf16(ctx.ptr)
+	if result != 0 {
+		return fmt.Errorf("decode convert FP16→BF16 failed: %d", result)
+	}
+	return nil
+}
+
+// DecodeConvertBF16ToFP16 converts bf16_hidden_a (BF16) → hidden_a (FP16) on GPU.
+func DecodeConvertBF16ToFP16(ctx *DecodeContext) error {
+	result := C.cuda_decode_convert_bf16_to_fp16(ctx.ptr)
+	if result != 0 {
+		return fmt.Errorf("decode convert BF16→FP16 failed: %d", result)
+	}
+	return nil
+}
+
 // FreeDecodeContext releases the decode context.
 func FreeDecodeContext(ctx *DecodeContext) {
 	if ctx != nil && ctx.ptr != nil {

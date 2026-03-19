@@ -419,6 +419,10 @@ int cuda_decode_get_hidden_bf16(void* ctx, void* h_hidden);
 int cuda_decode_set_hidden_bf16_from_gpu(void* ctx, const void* d_hidden);
 void* cuda_decode_get_hidden_bf16_gpu_ptr(void* ctx);
 
+// FP16↔BF16 hidden state conversion
+int cuda_decode_convert_fp16_to_bf16(void* ctx);
+int cuda_decode_convert_bf16_to_fp16(void* ctx);
+
 void cuda_free_decode_context(void* ctx);
 
 // ============================================================================

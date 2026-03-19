@@ -681,19 +681,35 @@ func (e *CUDALayerExecutor) DecodeStepGPUResident(position int) error {
 }
 
 // SetHiddenFromGPU copies hidden from another GPU buffer (zero-copy).
+// When BF16 native mode is active, also converts FP16→BF16 for the BF16 decode path.
 func (e *CUDALayerExecutor) SetHiddenFromGPU(gpuPtr unsafe.Pointer) error {
 	if e.decodeCtx == nil {
 		return fmt.Errorf("decode context not initialized")
 	}
-	return bindings.DecodeSetHiddenFromGPU(e.decodeCtx, gpuPtr)
+	if err := bindings.DecodeSetHiddenFromGPU(e.decodeCtx, gpuPtr); err != nil {
+		return err
+	}
+	// BF16 native: convert FP16 hidden_a → BF16 bf16_hidden_a
+	if e.useBF16Native {
+		return bindings.DecodeConvertFP16ToBF16(e.decodeCtx)
+	}
+	return nil
 }
 
 // SetHiddenGPU copies hidden state from host to GPU decode context.
+// When BF16 native mode is active, also converts FP16→BF16 for the BF16 decode path.
 func (e *CUDALayerExecutor) SetHiddenGPU(hidden []byte) error {
 	if e.decodeCtx == nil {
 		return fmt.Errorf("decode context not initialized")
 	}
-	return bindings.DecodeSetHidden(e.decodeCtx, hidden)
+	if err := bindings.DecodeSetHidden(e.decodeCtx, hidden); err != nil {
+		return err
+	}
+	// BF16 native: convert FP16 hidden_a → BF16 bf16_hidden_a
+	if e.useBF16Native {
+		return bindings.DecodeConvertFP16ToBF16(e.decodeCtx)
+	}
+	return nil
 }
 
 // GetHiddenGPU copies hidden state from GPU to host.
