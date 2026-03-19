@@ -423,6 +423,14 @@ void* cuda_decode_get_hidden_bf16_gpu_ptr(void* ctx);
 int cuda_decode_convert_fp16_to_bf16(void* ctx);
 int cuda_decode_convert_bf16_to_fp16(void* ctx);
 
+// Batched prefill
+int cuda_prefill_batch(void* ctx, const void* d_input, void* d_output,
+    const int* d_positions, const int* d_slot_mapping, int num_tokens);
+int cuda_gather_embeddings(void* output, const void* embed_table,
+    const int* d_token_ids, int hidden_size, int num_tokens);
+int cuda_reshape_and_cache(const void* key, const void* value,
+    void* cache, const int* d_slot_mapping, int num_tokens);
+
 void cuda_decode_invalidate_graph(void* ctx);
 void cuda_free_decode_context(void* ctx);
 

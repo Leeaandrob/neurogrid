@@ -663,6 +663,50 @@ __global__ void scale_kernel(
     }
 }
 
+// ============================================================================
+// Batch embedding gather: lookup N token embeddings into contiguous buffer
+// ============================================================================
+__global__ void gather_embeddings_kernel(
+    half* __restrict__ output,           // [num_tokens, hidden_size]
+    const half* __restrict__ embed_table, // [vocab_size, hidden_size]
+    const int* __restrict__ token_ids,    // [num_tokens]
+    int hidden_size,
+    int num_tokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = num_tokens * hidden_size;
+    if (idx >= total) return;
+
+    int token_idx = idx / hidden_size;
+    int dim_idx = idx % hidden_size;
+    int token_id = token_ids[token_idx];
+
+    output[idx] = embed_table[token_id * hidden_size + dim_idx];
+}
+
+extern "C" int cuda_gather_embeddings(
+    void* output,            // GPU: [num_tokens, hidden_size] FP16
+    const void* embed_table, // GPU: [vocab_size, hidden_size] FP16
+    const int* d_token_ids,  // GPU: [num_tokens]
+    int hidden_size,
+    int num_tokens
+) {
+    int total = num_tokens * hidden_size;
+    int block_size = 256;
+    int num_blocks = (total + block_size - 1) / block_size;
+
+    gather_embeddings_kernel<<<num_blocks, block_size, 0, ng_get_stream()>>>(
+        (half*)output,
+        (const half*)embed_table,
+        d_token_ids,
+        hidden_size,
+        num_tokens
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
 extern "C" int cuda_scale(void* output, const void* input, float scale, size_t num_elements) {
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;

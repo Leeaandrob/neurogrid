@@ -38,6 +38,10 @@ void* cuda_decode_get_hidden_bf16_gpu_ptr(void* ctx);
 int cuda_decode_convert_fp16_to_bf16(void* ctx);
 int cuda_decode_convert_bf16_to_fp16(void* ctx);
 
+// Batched prefill: process all input tokens through all layers at once
+int cuda_prefill_batch(void* ctx, const void* d_input, void* d_output,
+    const int* d_positions, const int* d_slot_mapping, int num_tokens);
+
 void cuda_decode_invalidate_graph(void* ctx);
 void cuda_free_decode_context(void* ctx);
 

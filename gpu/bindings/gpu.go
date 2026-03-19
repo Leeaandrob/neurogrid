@@ -1254,6 +1254,32 @@ func DecodeConvertBF16ToFP16(ctx *DecodeContext) error {
 	return nil
 }
 
+// PrefillBatch processes all input tokens through all layers at once.
+// Writes K/V to paged cache via slot_mapping (vLLM pattern).
+// Returns last token's hidden state in dOutput.
+func PrefillBatch(ctx *DecodeContext, dInput, dOutput unsafe.Pointer,
+	dPositions, dSlotMapping unsafe.Pointer, numTokens int) error {
+	result := C.cuda_prefill_batch(ctx.ptr,
+		dInput, dOutput,
+		(*C.int)(dPositions), (*C.int)(dSlotMapping),
+		C.int(numTokens))
+	if result != 0 {
+		return fmt.Errorf("prefill batch failed: %d", result)
+	}
+	return nil
+}
+
+// GatherEmbeddings looks up N token embeddings into a contiguous GPU buffer.
+func GatherEmbeddings(output, embedTable unsafe.Pointer, dTokenIDs unsafe.Pointer,
+	hiddenSize, numTokens int) error {
+	result := C.cuda_gather_embeddings(output, embedTable,
+		(*C.int)(dTokenIDs), C.int(hiddenSize), C.int(numTokens))
+	if result != 0 {
+		return fmt.Errorf("gather embeddings failed: %d", result)
+	}
+	return nil
+}
+
 // DecodeInvalidateGraph destroys the captured CUDA graph, forcing re-capture on next decode.
 func DecodeInvalidateGraph(ctx *DecodeContext) {
 	if ctx != nil && ctx.ptr != nil {

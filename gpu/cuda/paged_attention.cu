@@ -113,6 +113,138 @@ __global__ void paged_kvcache_update_kernel(
     value_cache[offset] = new_val[kv_head * head_dim + d];
 }
 
+// Batch update: write K/V for multiple tokens at once (used during prefill)
+__global__ void paged_kvcache_update_batch_kernel(
+    half* __restrict__ key_cache,
+    half* __restrict__ value_cache,
+    const half* __restrict__ keys,    // [num_tokens, num_kv_heads, head_dim]
+    const half* __restrict__ values,  // [num_tokens, num_kv_heads, head_dim]
+    const int* __restrict__ block_table,
+    int block_size,
+    int num_kv_heads,
+    int head_dim,
+    int num_tokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int kv_dim = num_kv_heads * head_dim;
+    int total = num_tokens * kv_dim;
+    if (idx >= total) return;
+
+    int token_idx = idx / kv_dim;
+    int kv_offset = idx % kv_dim;
+    int kv_head = kv_offset / head_dim;
+    int d = kv_offset % head_dim;
+
+    int position = token_idx; // positions are 0, 1, 2, ... num_tokens-1
+    int block_idx = position / block_size;
+    int slot_in_block = position % block_size;
+    int physical_block = block_table[block_idx];
+
+    size_t cache_offset = (size_t)physical_block * num_kv_heads * block_size * head_dim
+                        + kv_head * block_size * head_dim
+                        + slot_in_block * head_dim
+                        + d;
+
+    size_t src_offset = (size_t)token_idx * kv_dim + kv_offset;
+    key_cache[cache_offset] = keys[src_offset];
+    value_cache[cache_offset] = values[src_offset];
+}
+
+extern "C" int cuda_paged_kvcache_update_batch(
+    void* cache_ptr,
+    const void* keys,             // [num_tokens, num_kv_heads, head_dim] FP16
+    const void* values,           // [num_tokens, num_kv_heads, head_dim] FP16
+    const int* d_block_table,
+    int num_tokens
+) {
+    PagedKVCache* cache = (PagedKVCache*)cache_ptr;
+    int kv_dim = cache->num_kv_heads * cache->head_dim;
+    int total = num_tokens * kv_dim;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+
+    paged_kvcache_update_batch_kernel<<<grid, block, 0, ng_get_stream()>>>(
+        cache->key_cache, cache->value_cache,
+        (const half*)keys, (const half*)values,
+        d_block_table,
+        cache->block_size,
+        cache->num_kv_heads,
+        cache->head_dim,
+        num_tokens
+    );
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// ============================================================================
+// reshape_and_cache — vLLM-style KV cache write using slot_mapping
+// ============================================================================
+// Writes K/V for multiple tokens to paged cache using pre-computed slot mappings.
+// slot_mapping[i] = physical_block * block_size + offset_in_block (flat index)
+// Works for both prefill (num_tokens > 1) and decode (num_tokens = 1).
+
+__global__ void reshape_and_cache_kernel(
+    const half* __restrict__ key,         // [num_tokens, num_kv_heads, head_dim]
+    const half* __restrict__ value,       // [num_tokens, num_kv_heads, head_dim]
+    half* __restrict__ key_cache,          // [num_blocks, num_kv_heads, block_size, head_dim]
+    half* __restrict__ value_cache,        // [num_blocks, num_kv_heads, block_size, head_dim]
+    const int* __restrict__ slot_mapping,  // [num_tokens]
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int num_tokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int kv_dim = num_kv_heads * head_dim;
+    int total = num_tokens * kv_dim;
+    if (idx >= total) return;
+
+    int token_idx = idx / kv_dim;
+    int kv_offset = idx % kv_dim;
+    int kv_head = kv_offset / head_dim;
+    int d = kv_offset % head_dim;
+
+    int slot = slot_mapping[token_idx];
+    if (slot < 0) return; // PAD_SLOT
+
+    int physical_block = slot / block_size;
+    int offset_in_block = slot % block_size;
+
+    // Cache layout: [physical_block, num_kv_heads, block_size, head_dim]
+    size_t cache_offset = (size_t)physical_block * num_kv_heads * block_size * head_dim
+                        + kv_head * block_size * head_dim
+                        + offset_in_block * head_dim
+                        + d;
+
+    size_t src_offset = (size_t)token_idx * kv_dim + kv_offset;
+    key_cache[cache_offset] = key[src_offset];
+    value_cache[cache_offset] = value[src_offset];
+}
+
+extern "C" int cuda_reshape_and_cache(
+    const void* key,            // [num_tokens, num_kv_heads, head_dim] FP16
+    const void* value,          // [num_tokens, num_kv_heads, head_dim] FP16
+    void* cache_ptr,            // PagedKVCache*
+    const int* d_slot_mapping,  // [num_tokens] GPU
+    int num_tokens
+) {
+    PagedKVCache* cache = (PagedKVCache*)cache_ptr;
+    int kv_dim = cache->num_kv_heads * cache->head_dim;
+    int total = num_tokens * kv_dim;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+
+    reshape_and_cache_kernel<<<grid, block, 0, ng_get_stream()>>>(
+        (const half*)key, (const half*)value,
+        cache->key_cache, cache->value_cache,
+        d_slot_mapping,
+        cache->num_kv_heads, cache->head_dim,
+        cache->block_size, num_tokens
+    );
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
 extern "C" int cuda_paged_kvcache_update(
     void* cache_ptr,
     const void* new_key,          // [num_kv_heads, head_dim] FP16 on GPU
