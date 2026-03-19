@@ -5,6 +5,40 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-03-19
+
+### Paged KV Cache (PagedAttention)
+
+Inspired by vLLM's PagedAttention — KV cache allocated in fixed-size blocks
+instead of contiguous buffers. Eliminates memory fragmentation and enables
+future continuous batching.
+
+#### Block Allocator
+- `BlockPool`: O(1) alloc/free via LIFO free list
+- `PagedKVCacheManager`: per-sequence block table management
+- `BlockSize=16` tokens per block, on-demand allocation
+- `CalculateNumBlocks`: auto-size from available VRAM
+
+#### Paged Attention CUDA Kernel
+- `paged_attention_v1_kernel`: reads K/V via block_table indirection
+- GQA support (num_heads != num_kv_heads)
+- Online softmax with FP32 accumulation
+- Works on CC >= 7.0 (RTX 2080 Ti and RTX 4090)
+- Per-layer PagedKVCache (one cache per attention layer)
+
+#### Benchmark (LFM2.5-1.2B, RTX 4090, 128 tokens)
+| Config | tok/s | vs vLLM |
+|--------|-------|---------|
+| Contiguous KV | 204 | 58% |
+| **Paged KV** | **216** | **62%** |
+| vLLM 0.17.1 | 350 | 100% |
+
+### Fixed
+- CUDA Graph capture removed (caused stream corruption with paged attention)
+- GPU-resident decode path disabled when paged cache active (incompatible)
+
+---
+
 ## [0.6.0] - 2026-03-19
 
 ### Performance Optimizations
