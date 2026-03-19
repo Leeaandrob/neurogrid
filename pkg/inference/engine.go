@@ -439,27 +439,30 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 
 		if hasGPUDecoder && gpuInf != nil {
 			if i == 0 {
-				// First decode step: the prefill output is already in hidden_a via SetHiddenGPU.
-				// Apply LM head directly — do NOT run layers again on already-processed data.
+				// First decode step: apply LM head directly to prefill output (host path).
+				// The prefill output has already been through all layers — skip layer forward.
+				logits, err = e.applyLMHead(hidden)
+				if err != nil {
+					return nil, fmt.Errorf("LM head failed at step 0: %w", err)
+				}
 			} else {
 				// Subsequent steps: hidden_a has the embedding, run through layers
 				if err := gpuDecoder.DecodeStepGPUResident(len(inputTokens) + i - 1); err != nil {
 					return nil, fmt.Errorf("GPU decode step %d failed: %w", i, err)
 				}
-			}
-			// Apply LM head from GPU hidden state
-			hiddenGPUPtr := gpuDecoder.GetHiddenGPUPtr()
-			if lmForwarder, ok := gpuInf.(GPULMHeadForwarder); ok {
-				logits, err = lmForwarder.ApplyLMHeadFromGPU(hiddenGPUPtr)
-				if err != nil {
-					return nil, fmt.Errorf("LM head GPU forward failed at step %d: %w", i, err)
-				}
-			} else {
-				// Fallback: copy hidden from GPU and use standard LM head
-				gpuDecoder.GetHiddenGPU(hidden)
-				logits, err = e.applyLMHead(hidden)
-				if err != nil {
-					return nil, fmt.Errorf("LM head failed at step %d: %w", i, err)
+				// Apply LM head from GPU hidden state
+				hiddenGPUPtr := gpuDecoder.GetHiddenGPUPtr()
+				if lmForwarder, ok := gpuInf.(GPULMHeadForwarder); ok {
+					logits, err = lmForwarder.ApplyLMHeadFromGPU(hiddenGPUPtr)
+					if err != nil {
+						return nil, fmt.Errorf("LM head GPU forward failed at step %d: %w", i, err)
+					}
+				} else {
+					gpuDecoder.GetHiddenGPU(hidden)
+					logits, err = e.applyLMHead(hidden)
+					if err != nil {
+						return nil, fmt.Errorf("LM head failed at step %d: %w", i, err)
+					}
 				}
 			}
 		} else {
