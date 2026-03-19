@@ -55,6 +55,7 @@ type CoordinatorConfig struct {
 	MaxSeqLen          int             // Maximum sequence length for KV cache (caps model's max_position_embeddings)
 	DisableMDNS        bool            // Disable mDNS discovery (use only explicit bootstrap peers)
 	PeerVRAMGB         float64         // Override worker GPU VRAM in GB (0 = auto-detect)
+	SpecK              int             // Speculative decoding K tokens (0 = disabled)
 }
 
 // Coordinator orchestrates distributed inference
@@ -535,6 +536,12 @@ func (c *Coordinator) initializeComponents() error {
 	}
 
 	log.Printf("Inference engine initialized with %d peers", len(c.peers)+1)
+
+	// Enable speculative decoding if requested
+	if c.config.SpecK > 0 {
+		c.engine.EnableSpeculativeDecoding(c.config.SpecK)
+	}
+
 	return nil
 }
 
@@ -888,6 +895,7 @@ func main() {
 	maxSeqLen := flag.Int("max-seq-len", 4096, "Maximum sequence length for KV cache (caps model's max_position_embeddings to save VRAM)")
 	disableMDNS := flag.Bool("disable-mdns", false, "Disable mDNS discovery (workers must connect via bootstrap to this coordinator)")
 	peerVRAMGB := flag.Float64("peer-vram-gb", 0, "Override worker GPU VRAM in GB (workaround for GPU info protocol timeout)")
+	specK := flag.Int("speculative", 0, "Enable speculative decoding with K draft tokens (0=disabled, 4=recommended)")
 	flag.Parse()
 
 	// Parse bootstrap peers
@@ -927,6 +935,7 @@ func main() {
 		MaxSeqLen:          *maxSeqLen,
 		DisableMDNS:        *disableMDNS,
 		PeerVRAMGB:         *peerVRAMGB,
+		SpecK:              *specK,
 	}
 
 	log.Println("================================================")

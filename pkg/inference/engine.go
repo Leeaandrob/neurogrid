@@ -122,6 +122,7 @@ type Engine struct {
 	kvCaches     *KVCacheManager
 	assignments  []scheduler.LayerAssignment
 	localPeerID  string
+	specDecoder  *SpeculativeDecoder // Optional: speculative decoding (self-spec mode)
 	seqCounter   uint64
 	layerExecutor LayerExecutor
 
@@ -372,6 +373,11 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 
 	if e.tokenizer == nil {
 		return nil, fmt.Errorf("tokenizer not set")
+	}
+
+	// Use speculative decoding if available
+	if e.specDecoder != nil && e.specDecoder.config.Enabled {
+		return e.specDecoder.GenerateSpeculative(ctx, req)
 	}
 
 	// Tokenize input
@@ -982,6 +988,13 @@ func (e *Engine) applyLMHead(hidden []byte) ([]float32, error) {
 // Config returns the model configuration.
 func (e *Engine) Config() *types.LlamaConfig {
 	return e.config
+}
+
+// EnableSpeculativeDecoding enables self-speculative decoding with K draft tokens.
+func (e *Engine) EnableSpeculativeDecoding(numSpecTokens int) {
+	config := &SpeculativeConfig{NumSpecTokens: numSpecTokens, Enabled: true}
+	e.specDecoder = NewSelfSpeculativeDecoder(e, config)
+	log.Printf("[Engine] Speculative decoding enabled (K=%d)", numSpecTokens)
 }
 
 // KVCaches returns the KV cache manager.
