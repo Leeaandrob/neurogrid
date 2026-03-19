@@ -527,6 +527,25 @@ extern "C" int cuda_decode_get_hidden(void* ctx_ptr, void* h_hidden) {
 extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
 
+    // Debug: check hidden_a content on first few calls
+    static int gpu_dbg = 0;
+    if (gpu_dbg < 3) {
+        half h_fp16[4];
+        cudaMemcpy(h_fp16, ctx->hidden_a, 4*sizeof(half), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[GPU-DBG] step_gpu pos=%d hidden_a=[%.6f, %.6f, %.6f, %.6f] bf16=%s warmup=%d\n",
+            position, __half2float(h_fp16[0]), __half2float(h_fp16[1]),
+            __half2float(h_fp16[2]), __half2float(h_fp16[3]),
+            ctx->use_bf16_native ? "yes" : "no", ctx->warmup_count_gpu);
+        if (ctx->use_bf16_native && ctx->bf16_hidden_a) {
+            __nv_bfloat16 h_bf16[4];
+            cudaMemcpy(h_bf16, ctx->bf16_hidden_a, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[GPU-DBG] bf16_hidden_a=[%.6f, %.6f, %.6f, %.6f]\n",
+                __bfloat162float(h_bf16[0]), __bfloat162float(h_bf16[1]),
+                __bfloat162float(h_bf16[2]), __bfloat162float(h_bf16[3]));
+        }
+        gpu_dbg++;
+    }
+
     // Update position and seq_len GPU buffers (OUTSIDE graph — H2D copies)
     CUDA_CHECK(cudaMemcpy(ctx->d_position, &position, sizeof(int), cudaMemcpyHostToDevice));
     int seq_len_val = position + 1;
