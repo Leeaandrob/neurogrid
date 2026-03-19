@@ -232,26 +232,8 @@ extern "C" int cuda_decode_set_hidden_bf16(void* ctx_ptr, const void* h_hidden) 
 // Convert FP16 hidden_a → BF16 bf16_hidden_a (called after SetHidden when BF16 native is active)
 extern "C" int cuda_decode_convert_fp16_to_bf16(void* ctx_ptr) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
-    if (!ctx->bf16_hidden_a || !ctx->hidden_a) {
-        fprintf(stderr, "[BF16-CVT] SKIP: bf16_hidden_a=%p hidden_a=%p\n", ctx->bf16_hidden_a, ctx->hidden_a);
-        return -1;
-    }
-    // Debug: check FP16 input before conversion
-    half h_fp16[4];
-    cudaMemcpy(h_fp16, ctx->hidden_a, 4 * sizeof(half), cudaMemcpyDeviceToHost);
-    fprintf(stderr, "[BF16-CVT] FP16 input: [%f, %f, %f, %f] H=%d\n",
-        __half2float(h_fp16[0]), __half2float(h_fp16[1]),
-        __half2float(h_fp16[2]), __half2float(h_fp16[3]), ctx->hidden_size);
-    cudaDeviceSynchronize(); // ensure FP16 data is committed
-    int rc = cuda_fp16_to_bf16(ctx->bf16_hidden_a, ctx->hidden_a, ctx->hidden_size);
-    cudaDeviceSynchronize(); // ensure conversion kernel completes
-    // Debug: check BF16 output after conversion
-    __nv_bfloat16 h_bf16[4];
-    cudaMemcpy(h_bf16, ctx->bf16_hidden_a, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-    fprintf(stderr, "[BF16-CVT] BF16 output: [%f, %f, %f, %f] rc=%d ptr=%p\n",
-        __bfloat162float(h_bf16[0]), __bfloat162float(h_bf16[1]),
-        __bfloat162float(h_bf16[2]), __bfloat162float(h_bf16[3]), rc, ctx->bf16_hidden_a);
-    return rc;
+    if (!ctx->bf16_hidden_a || !ctx->hidden_a) return -1;
+    return cuda_fp16_to_bf16(ctx->bf16_hidden_a, ctx->hidden_a, ctx->hidden_size);
 }
 
 // Convert BF16 bf16_hidden_a → FP16 hidden_a (called after BF16 decode so LM head gets FP16)
@@ -299,18 +281,6 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
         __nv_bfloat16* current = ctx->bf16_hidden_a;
         __nv_bfloat16* next = ctx->bf16_hidden_b;
 
-        // Debug: print first values of BF16 input on first call
-        static int bf16_debug_count = 0;
-        if (bf16_debug_count < 2) {
-            cudaDeviceSynchronize(); // ensure all prior kernels committed
-            __nv_bfloat16 h_val[4];
-            cudaMemcpy(h_val, current, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[BF16-DBG] run_all_layers input: [%f, %f, %f, %f] ptr=%p (b=%p)\n",
-                __bfloat162float(h_val[0]), __bfloat162float(h_val[1]),
-                __bfloat162float(h_val[2]), __bfloat162float(h_val[3]),
-                current, ctx->bf16_hidden_b);
-        }
-
         for (int i = 0; i < ctx->num_layers; i++) {
             int result;
 
@@ -352,22 +322,11 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
                 if (result != 0) return result;
             }
 
-            // Debug: print output after each layer
-            if (bf16_debug_count < 2) {
-                __nv_bfloat16 h_val[4];
-                cudaMemcpy(h_val, next, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-                fprintf(stderr, "[BF16-DBG] layer %d (%s) output: [%f, %f, %f, %f] rc=%d\n",
-                    i, ctx->layer_types[i] == 0 ? "conv" : "attn",
-                    __bfloat162float(h_val[0]), __bfloat162float(h_val[1]),
-                    __bfloat162float(h_val[2]), __bfloat162float(h_val[3]), result);
-            }
-
             // Ping-pong (BF16)
             __nv_bfloat16* tmp = current;
             current = next;
             next = tmp;
         }
-        if (bf16_debug_count < 2) bf16_debug_count++;
         return 0;
     }
 
@@ -464,6 +423,12 @@ extern "C" int cuda_decode_step(
     CUDA_CHECK(cudaMemcpy(ctx->d_seq_lens, &seq_len_val, sizeof(int), cudaMemcpyHostToDevice));
     ctx->current_position = position;  // Host-side position (used inside graph to avoid D2H copy)
 
+    // BF16 native: convert FP16 hidden_a → BF16 bf16_hidden_a
+    if (ctx->use_bf16_native && ctx->bf16_hidden_a) {
+        int cvt = cuda_fp16_to_bf16(ctx->bf16_hidden_a, ctx->hidden_a, H);
+        if (cvt != 0) return cvt;
+    }
+
     // Determine output buffer
     half* result_buf = (ctx->num_layers % 2 == 0) ? ctx->hidden_a : ctx->hidden_b;
 
@@ -484,6 +449,20 @@ extern "C" int cuda_decode_step(
     } else {
         int res = run_all_layers(ctx, nullptr);
         if (res != 0) return res;
+    }
+
+    // BF16→FP16 post-conversion: result_buf is FP16, but BF16 path wrote to bf16_hidden_a
+    if (ctx->use_bf16_native && ctx->bf16_hidden_a && ctx->hidden_a) {
+        // After BF16 run_all_layers, result is in bf16_hidden_a (even layers → no swap)
+        int cvt = cuda_bf16_to_fp16(ctx->hidden_a, ctx->bf16_hidden_a, H);
+        if (cvt != 0) return cvt;
+        // result_buf points to hidden_a (for even num_layers) or hidden_b
+        // We converted into hidden_a, which is result_buf for even num_layers
+        if (ctx->num_layers % 2 != 0) {
+            // Odd layers: result is in hidden_b, but BF16 result was converted to hidden_a
+            // Need to copy to hidden_b OR adjust result_buf
+            result_buf = ctx->hidden_a;
+        }
     }
 
     // Copy result back to host
