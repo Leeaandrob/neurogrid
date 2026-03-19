@@ -117,8 +117,11 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 				return nil, fmt.Errorf("GPU conv layer %d: %w", layerID, err)
 			}
 		} else if e.config.ModelType == "lfm2" {
-			// Load LFM2 attention layer as BF16-native (eliminates FP16↔BF16 conversions)
+			// Load LFM2 attention layer — try BF16-native first
+			// Use LoadTensorNative (keeps BF16) instead of LoadTensor (converts to FP16)
+			loader.SetKeepBF16(true) // Temporarily keep BF16 for attention weights
 			layerWeights, qLayerNorm, kLayerNorm, err := loader.LoadAttentionLayerWeightsLFM2(layerID)
+			loader.SetKeepBF16(false) // Reset for other tensors
 			if err != nil {
 				gpu.Close()
 				return nil, fmt.Errorf("load LFM2 attn layer %d: %w", layerID, err)
