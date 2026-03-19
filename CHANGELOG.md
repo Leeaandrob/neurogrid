@@ -5,6 +5,44 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-03-19
+
+### BF16 Native Compute — Precision-Preserving Inference
+
+Full BF16 native compute pipeline for LFM2 attention layers, eliminating
+FP16 precision loss that caused model overthinking (infinite `<think>` loop).
+
+#### BF16 Native Pipeline
+- **BF16 attention weights**: loaded directly from safetensors without FP16 conversion
+- **BF16 GEMM** via cublasGemmEx (CUDA_R_16BF, CUBLAS_COMPUTE_32F)
+- **BF16 RMSNorm, SiLU, RoPE**: all intermediate ops in BF16 with FP32 accumulation
+- **FP16↔BF16 conversion**: at attention boundary (Q/K/V to FP16 for paged attention kernel)
+- **BF16→FP16 post-decode**: automatic conversion for LM head compatibility
+
+#### Critical Bug Fixes
+- **Double-forward bug**: first decode step was running layers on prefill output (already processed), computing `layers(layers(embed))` instead of `layers(embed)`. Fixed by applying LM head directly to prefill output at i=0.
+- **Missing RMSNorm in ForwardFromGPU**: GPU-pointer LM head path skipped final layernorm, producing flat logits (~0.5 max vs ~30 expected). This was the root cause of GPU-resident decode producing garbage output.
+- **BF16 hidden state never populated**: `cuda_decode_step` copied FP16 to `hidden_a` but never converted to `bf16_hidden_a` for the BF16 native path. Added FP16→BF16 conversion in both decode paths.
+
+#### Production Hardening
+- **Request serialization**: exclusive mutex prevents concurrent request corruption
+- **KV cache + conv state reset**: cleared between requests (paged blocks freed, conv state zeroed)
+- **CUDA Graph invalidation**: graph destroyed and warmup counter reset on cache clear
+- **Max tokens cap**: increased from 512 to 2048 (BF16 reduces overthinking)
+
+#### Benchmark (LFM2.5-1.2B, BF16 native, 512 tokens)
+| GPU | tok/s | vs vLLM |
+|-----|-------|---------|
+| RTX 4090 | 256 | 73% |
+| **GH200 480GB** | **357** | **102%** |
+| vLLM 0.17.1 (RTX 4090) | 352 | 100% |
+
+CUDA Graph: 302 nodes captured.
+Correctness: factual Q&A verified (Paris, Tokyo, Newton, H₂O, 8 spider legs).
+Production: deployed on GH200 (192.222.50.16:8090).
+
+---
+
 ## [0.8.0] - 2026-03-19
 
 ### CUDA Graphs — Full Kernel Launch Replay
@@ -383,10 +421,7 @@ future continuous batching.
 ## [Unreleased]
 
 ### Planned
-- Observability infrastructure (OpenTelemetry, Prometheus dashboards)
-- Tensor checkpoints for debugging
-- KV cache with continuous batching
-- Flash Attention integration
-- CUDA graphs for reduced kernel launch overhead
-- Speculative decoding
+- Continuous batching (process multiple requests simultaneously)
+- Prefill batching (batch input tokens instead of 1-by-1)
+- Prefix caching (share KV cache for common system prompts)
 - INT4 quantization support
