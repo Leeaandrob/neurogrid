@@ -413,13 +413,12 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	outputTokens := make([]int, 0, req.MaxTokens)
 	stopReason := "max_tokens"
 
-	// Try GPU-resident decode path
+	// Try GPU-resident decode path (hidden stays on GPU, eliminates copies)
 	gpuDecoder, hasGPUDecoder := e.layerExecutor.(GPUResidentDecoder)
 	gpuInf := e.gpuInference
 
 	if hasGPUDecoder && gpuInf != nil {
 		log.Printf("[Generate] Using GPU-resident decode path")
-		// Don't call SetHiddenGPU here — i=0 uses host LM head directly
 	} else {
 		log.Printf("[Generate] Using per-layer decode path")
 	}
@@ -435,8 +434,8 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 
 		if hasGPUDecoder && gpuInf != nil {
 			if i == 0 {
-				// First decode step: apply LM head directly to prefill output (host path).
-				// The prefill output has already been through all layers — skip layer forward.
+				// First decode step: prefill output is already layer-processed.
+				// Just apply LM head (with final RMSNorm) — don't run layers again.
 				logits, err = e.applyLMHead(hidden)
 				if err != nil {
 					return nil, fmt.Errorf("LM head failed at step 0: %w", err)
@@ -446,7 +445,7 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 				if err := gpuDecoder.DecodeStepGPUResident(len(inputTokens) + i - 1); err != nil {
 					return nil, fmt.Errorf("GPU decode step %d failed: %w", i, err)
 				}
-				// Apply LM head from GPU hidden state
+				// Apply LM head (with final RMSNorm) from GPU hidden state
 				hiddenGPUPtr := gpuDecoder.GetHiddenGPUPtr()
 				if lmForwarder, ok := gpuInf.(GPULMHeadForwarder); ok {
 					logits, err = lmForwarder.ApplyLMHeadFromGPU(hiddenGPUPtr)

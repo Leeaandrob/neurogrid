@@ -227,17 +227,42 @@ func (h *GPULMHead) Forward(hidden []byte) ([]float32, error) {
 //
 // OPTIMIZED: Uses preallocated logits buffer to avoid per-token cudaMalloc/cudaFree.
 func (h *GPULMHead) ForwardFromGPU(hiddenGPUPtr unsafe.Pointer) ([]float32, error) {
-	// Create tensors for GEMM using preallocated logits buffer
-	// lm_head weights are [vocabSize, hiddenSize], need transB=true
+	// Apply final layernorm if available (same as Forward — must not skip!)
+	inputForGEMM := hiddenGPUPtr
+	if h.finalNormPtr != nil {
+		inputTensor := &types.Tensor{
+			Shape:  []int{1, h.hiddenSize},
+			Dtype:  types.DtypeFP16,
+			Device: 0,
+			Data:   hiddenGPUPtr,
+		}
+		outputTensor := &types.Tensor{
+			Shape:  []int{1, h.hiddenSize},
+			Dtype:  types.DtypeFP16,
+			Device: 0,
+			Data:   h.normalizedGPU,
+		}
+		weightTensor := &types.Tensor{
+			Shape:  []int{h.hiddenSize},
+			Dtype:  types.DtypeFP16,
+			Device: 0,
+			Data:   h.finalNormPtr,
+		}
+		if err := bindings.RMSNorm(outputTensor, inputTensor, weightTensor, h.rmsNormEps); err != nil {
+			return nil, fmt.Errorf("final RMSNorm (GPU ptr) failed: %w", err)
+		}
+		inputForGEMM = h.normalizedGPU
+	}
+
 	hiddenTensor := &types.Tensor{
 		Shape:  []int{1, h.hiddenSize},
 		Dtype:  types.DtypeFP16,
 		Device: 0,
-		Data:   hiddenGPUPtr,
+		Data:   inputForGEMM,
 	}
 
 	lmHeadTensor := &types.Tensor{
-		Shape:  []int{h.vocabSize, h.hiddenSize}, // Actual shape in memory
+		Shape:  []int{h.vocabSize, h.hiddenSize},
 		Dtype:  types.DtypeFP16,
 		Device: 0,
 		Data:   h.ptr,
@@ -250,7 +275,6 @@ func (h *GPULMHead) ForwardFromGPU(hiddenGPUPtr unsafe.Pointer) ([]float32, erro
 		Data:   h.logitsGPU,
 	}
 
-	// Execute GEMM with transB=true
 	if err := bindings.GEMMFP16(logitsTensor, hiddenTensor, lmHeadTensor, false, true); err != nil {
 		return nil, fmt.Errorf("LM head GEMM failed: %w", err)
 	}
