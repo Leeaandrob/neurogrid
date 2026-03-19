@@ -281,6 +281,15 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
         __nv_bfloat16* current = ctx->bf16_hidden_a;
         __nv_bfloat16* next = ctx->bf16_hidden_b;
 
+        static int bf16_trace = 0;
+        if (bf16_trace < 3) {
+            __nv_bfloat16 dbg[4];
+            cudaMemcpy(dbg, current, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[BF16] input: [%.6f, %.6f, %.6f, %.6f]\n",
+                __bfloat162float(dbg[0]), __bfloat162float(dbg[1]),
+                __bfloat162float(dbg[2]), __bfloat162float(dbg[3]));
+        }
+
         for (int i = 0; i < ctx->num_layers; i++) {
             int result;
 
@@ -322,11 +331,21 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
                 if (result != 0) return result;
             }
 
+            if (bf16_trace < 1) {
+                __nv_bfloat16 dbg[4];
+                cudaMemcpy(dbg, next, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[BF16] L%d(%s): [%.6f, %.6f, %.6f, %.6f] rc=%d\n",
+                    i, ctx->layer_types[i]==0?"conv":"attn",
+                    __bfloat162float(dbg[0]), __bfloat162float(dbg[1]),
+                    __bfloat162float(dbg[2]), __bfloat162float(dbg[3]), result);
+            }
+
             // Ping-pong (BF16)
             __nv_bfloat16* tmp = current;
             current = next;
             next = tmp;
         }
+        if (bf16_trace < 3) bf16_trace++;
         return 0;
     }
 
