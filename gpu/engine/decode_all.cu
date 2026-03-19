@@ -260,14 +260,6 @@ extern "C" int cuda_decode_step(
     // Determine output buffer
     half* result_buf = (ctx->num_layers % 2 == 0) ? ctx->hidden_a : ctx->hidden_b;
 
-    // Skip graph for paged attention (block tables change per step)
-    if (ctx->paged_cache != nullptr) {
-        int res = run_all_layers(ctx, nullptr);
-        if (res != 0) return res;
-        CUDA_CHECK(cudaMemcpy(h_output, result_buf, hs, cudaMemcpyDeviceToHost));
-        return 0;
-    }
-
     if (ctx->graph_captured && ctx->graph_exec) {
         // REPLAY: all kernels replayed from captured graph
         // Input data was already written to persistent buffers above
