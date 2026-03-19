@@ -232,8 +232,24 @@ extern "C" int cuda_decode_set_hidden_bf16(void* ctx_ptr, const void* h_hidden) 
 // Convert FP16 hidden_a → BF16 bf16_hidden_a (called after SetHidden when BF16 native is active)
 extern "C" int cuda_decode_convert_fp16_to_bf16(void* ctx_ptr) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
-    if (!ctx->bf16_hidden_a || !ctx->hidden_a) return -1;
-    return cuda_fp16_to_bf16(ctx->bf16_hidden_a, ctx->hidden_a, ctx->hidden_size);
+    if (!ctx->bf16_hidden_a || !ctx->hidden_a) {
+        fprintf(stderr, "[BF16-CVT] SKIP: bf16_hidden_a=%p hidden_a=%p\n", ctx->bf16_hidden_a, ctx->hidden_a);
+        return -1;
+    }
+    // Debug: check FP16 input before conversion
+    half h_fp16[4];
+    cudaMemcpy(h_fp16, ctx->hidden_a, 4 * sizeof(half), cudaMemcpyDeviceToHost);
+    fprintf(stderr, "[BF16-CVT] FP16 input: [%f, %f, %f, %f] H=%d\n",
+        __half2float(h_fp16[0]), __half2float(h_fp16[1]),
+        __half2float(h_fp16[2]), __half2float(h_fp16[3]), ctx->hidden_size);
+    int rc = cuda_fp16_to_bf16(ctx->bf16_hidden_a, ctx->hidden_a, ctx->hidden_size);
+    // Debug: check BF16 output after conversion
+    __nv_bfloat16 h_bf16[4];
+    cudaMemcpy(h_bf16, ctx->bf16_hidden_a, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    fprintf(stderr, "[BF16-CVT] BF16 output: [%f, %f, %f, %f] rc=%d\n",
+        __bfloat162float(h_bf16[0]), __bfloat162float(h_bf16[1]),
+        __bfloat162float(h_bf16[2]), __bfloat162float(h_bf16[3]), rc);
+    return rc;
 }
 
 // Convert BF16 bf16_hidden_a → FP16 hidden_a (called after BF16 decode so LM head gets FP16)
