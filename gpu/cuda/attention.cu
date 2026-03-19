@@ -483,8 +483,16 @@ extern "C" int cuda_kvcache_get_length(void* cache) {
     return kv->current_len;
 }
 
-// Kernel to copy K/V to cache at specific position
-// position parameter kept for backward compatibility with cuda_kvcache_update
+// Tiny kernel: out[0] = in[0] + 1 (used to compute kv_len from position on GPU)
+__global__ void add_one_kernel(int* __restrict__ out, const int* __restrict__ in) {
+    out[0] = in[0] + 1;
+}
+
+extern "C" void cuda_add_one_gpu(int* out, const int* in) {
+    add_one_kernel<<<1, 1, 0, ng_get_stream()>>>(out, in);
+}
+
+// Kernel to copy K/V to cache — reads position from GPU buffer (CUDA Graph safe)
 __global__ void update_cache_kernel(
     half* __restrict__ cache,
     const half* __restrict__ new_data,
@@ -492,8 +500,9 @@ __global__ void update_cache_kernel(
     int num_heads,
     int head_dim,
     int max_seq_len,
-    int position
+    const int* __restrict__ d_position  // GPU buffer: position read at runtime
 ) {
+    int position = d_position[0];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch_size * num_heads * head_dim;
 
@@ -511,19 +520,14 @@ __global__ void update_cache_kernel(
     }
 }
 
-extern "C" int cuda_kvcache_update(
+// cuda_kvcache_update_gpu: update KV cache reading position from GPU buffer (CUDA Graph safe)
+extern "C" int cuda_kvcache_update_gpu(
     void* cache,
     const void* k,
     const void* v,
-    int position
+    const int* d_position  // GPU buffer
 ) {
     KVCache* kv = (KVCache*)cache;
-
-    if (position >= kv->max_seq_len) {
-        fprintf(stderr, "Position %d exceeds max_seq_len %d\n", position, kv->max_seq_len);
-        return -1;
-    }
-
     int total = kv->batch_size * kv->num_heads * kv->head_dim;
     int block_size = 256;
     int num_blocks = (total + block_size - 1) / block_size;
@@ -535,7 +539,7 @@ extern "C" int cuda_kvcache_update(
         kv->num_heads,
         kv->head_dim,
         kv->max_seq_len,
-        position
+        d_position
     );
     CUDA_CHECK(cudaGetLastError());
 
@@ -546,15 +550,26 @@ extern "C" int cuda_kvcache_update(
         kv->num_heads,
         kv->head_dim,
         kv->max_seq_len,
-        position
+        d_position
     );
     CUDA_CHECK(cudaGetLastError());
 
-    if (position >= kv->current_len) {
-        kv->current_len = position + 1;
-    }
-
+    // Note: current_len tracking skipped during graph capture (no D2H allowed).
+    // The seq_len is tracked via d_seq_lens GPU buffer instead.
     return 0;
+}
+
+// Legacy wrapper for backward compatibility (non-graph callers)
+extern "C" int cuda_kvcache_update(void* cache, const void* k, const void* v, int position) {
+    // Allocate temp GPU buffer for position
+    int* d_pos;
+    cudaMalloc(&d_pos, sizeof(int));
+    cudaMemcpy(d_pos, &position, sizeof(int), cudaMemcpyHostToDevice);
+    int result = cuda_kvcache_update_gpu(cache, k, v, d_pos);
+    cudaFree(d_pos);
+    KVCache* kv = (KVCache*)cache;
+    if (position >= kv->current_len) kv->current_len = position + 1;
+    return result;
 }
 
 // ============================================================================
@@ -680,32 +695,23 @@ extern "C" int cuda_attention_with_kvcache(
 ) {
     KVCache* kv = (KVCache*)cache;
 
-    // Read position from GPU to update cache (host-side metadata still needed)
-    int position;
-    CUDA_CHECK(cudaMemcpy(&position, d_position, sizeof(int), cudaMemcpyDeviceToHost));
-
-    // First, update cache with new K, V (uses num_kv_heads from cache)
-    int result = cuda_kvcache_update(cache, new_key, new_value, position);
+    // Update cache using GPU position buffer (no D2H copy — CUDA Graph safe)
+    int result = cuda_kvcache_update_gpu(cache, new_key, new_value, d_position);
     if (result != 0) return result;
 
     int total_query_heads = batch_size * num_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
-
-    // For GQA, we use a custom kernel that maps query heads to KV heads
-    int block_size = 128;  // Threads per block
-    // Fixed shared memory for CUDA Graph compatibility (max 4096 tokens + 2*128 threads)
+    int block_size = 128;
     int max_kv_len_for_shared = 4096;
     int shared_size = (max_kv_len_for_shared + 2 * block_size) * sizeof(float);
 
-    // d_position contains position; kernel needs kv_len = position + 1
-    // We pass a GPU buffer with kv_len pre-computed by the caller (d_position stores position,
-    // but the kernel reads d_kv_len[0]). For backward compat, compute d_kv_len on the fly:
-    // The caller (layer forward) will write position+1 to a seq_lens buffer.
-    // For now, use a temp buffer approach: write position+1 to d_kv_len.
-    int kv_len = position + 1;
-    int* d_kv_len;
-    CUDA_CHECK(cudaMalloc(&d_kv_len, sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_kv_len, &kv_len, sizeof(int), cudaMemcpyHostToDevice));
+    // d_kv_len = position + 1, computed on GPU (CUDA Graph safe)
+    // Use persistent static buffer (allocated once)
+    static int* s_d_kv_len = nullptr;
+    if (!s_d_kv_len) cudaMalloc(&s_d_kv_len, sizeof(int));
+    // Tiny kernel: d_kv_len[0] = d_position[0] + 1
+    add_one_kernel<<<1, 1, 0, ng_get_stream()>>>(s_d_kv_len, d_position);
+    int* d_kv_len = s_d_kv_len;
 
     gqa_attention_kernel<<<total_query_heads, block_size, shared_size, ng_get_stream()>>>(
         (half*)output,
@@ -721,9 +727,9 @@ extern "C" int cuda_attention_with_kvcache(
         scale
     );
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // cudaDeviceSynchronize removed for CUDA Graph compatibility
 
-    cudaFree(d_kv_len);
+    // d_kv_len is static, not freed
 
     return 0;
 }

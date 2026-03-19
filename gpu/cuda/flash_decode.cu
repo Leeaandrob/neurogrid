@@ -18,6 +18,8 @@
 #include "stream.h"
 #include "attention.h"
 
+extern "C" void cuda_add_one_gpu(int* out, const int* in);
+
 #include "stream.h"
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -200,22 +202,21 @@ extern "C" int cuda_flash_attention_with_kvcache(
 ) {
     KVCache* kv = (KVCache*)cache;
 
-    // Read position from GPU for cache update (host-side metadata)
-    int position;
-    CUDA_CHECK(cudaMemcpy(&position, d_position, sizeof(int), cudaMemcpyDeviceToHost));
-
-    // Update cache first
-    int result = cuda_kvcache_update(cache, new_key, new_value, position);
+    // Update cache using GPU position (CUDA Graph safe — no D2H copy)
+    extern int cuda_kvcache_update_gpu(void*, const void*, const void*, const int*);
+    int result = cuda_kvcache_update_gpu(cache, new_key, new_value, d_position);
     if (result != 0) return result;
 
     int total_query_heads = batch_size * num_heads;
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    // Compute kv_len = position + 1 and write to GPU buffer for kernel
-    int kv_len = position + 1;
-    int* d_kv_len;
-    CUDA_CHECK(cudaMalloc(&d_kv_len, sizeof(int)));
-    CUDA_CHECK(cudaMemcpy(d_kv_len, &kv_len, sizeof(int), cudaMemcpyHostToDevice));
+    // d_kv_len = position + 1, computed on GPU
+    static int* s_d_kv_len_flash = nullptr;
+    if (!s_d_kv_len_flash) cudaMalloc(&s_d_kv_len_flash, sizeof(int));
+    // Compute kv_len = position + 1 on GPU
+    cuda_add_one_gpu(s_d_kv_len_flash, d_position);
+    int* d_kv_len = s_d_kv_len_flash;
+    // kv_len computed by add_one_kernel above
 
     // Block size: enough threads to cover head_dim elements
     int block_size = 128;
@@ -237,7 +238,7 @@ extern "C" int cuda_flash_attention_with_kvcache(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    cudaFree(d_kv_len);
+    // d_kv_len is static, not freed
 
     return 0;
 }
