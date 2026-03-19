@@ -408,23 +408,75 @@ extern "C" int cuda_decode_get_hidden(void* ctx_ptr, void* h_hidden) {
 extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
 
-    // Only copy position and seq_len (8 bytes total) — hidden already on GPU from previous step
+    // Update position and seq_len GPU buffers (OUTSIDE graph — H2D copies)
     CUDA_CHECK(cudaMemcpy(ctx->d_position, &position, sizeof(int), cudaMemcpyHostToDevice));
     int seq_len_val = position + 1;
     CUDA_CHECK(cudaMemcpy(ctx->d_seq_lens, &seq_len_val, sizeof(int), cudaMemcpyHostToDevice));
 
-    int res = run_all_layers(ctx, nullptr);
-    if (res != 0) return res;
+    if (ctx->graph_captured && ctx->graph_exec) {
+        // REPLAY captured graph
+        cudaError_t err = cudaGraphLaunch(ctx->graph_exec, (cudaStream_t)0);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[NeuroGrid] GPU graph replay failed: %s\n", cudaGetErrorString(err));
+            ctx->graph_captured = false;
+            int res = run_all_layers(ctx, nullptr);
+            if (res != 0) return res;
+        } else {
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+    } else if (ctx->warmup_count == 2 && !ctx->graph_captured) {
+        // CAPTURE on step 2
+        fprintf(stderr, "[NeuroGrid] Capturing CUDA graph (GPU-resident path)...\n");
+        ctx->warmup_count = 3;
+        cudaGetLastError(); // Clear stale errors
 
-    // Swap buffers: result is in the "next" buffer after run_all_layers
-    // For next call, we need input in hidden_a. If num_layers is odd, result is in hidden_b.
+        cudaError_t err = cudaStreamBeginCapture((cudaStream_t)0, cudaStreamCaptureModeRelaxed);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[NeuroGrid] Graph capture failed: %s (running without graphs)\n", cudaGetErrorString(err));
+            int res = run_all_layers(ctx, nullptr);
+            if (res != 0) return res;
+        } else {
+            run_all_layers(ctx, nullptr);
+            cudaGraph_t graph = nullptr;
+            err = cudaStreamEndCapture((cudaStream_t)0, &graph);
+            if (err == cudaSuccess && graph != nullptr) {
+                cudaGraphExec_t exec = nullptr;
+                err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+                if (err == cudaSuccess && exec != nullptr) {
+                    ctx->graph = graph;
+                    ctx->graph_exec = exec;
+                    ctx->graph_captured = true;
+                    size_t numNodes = 0;
+                    cudaGraphGetNodes(graph, nullptr, &numNodes);
+                    fprintf(stderr, "[NeuroGrid] CUDA graph captured! %zu nodes\n", numNodes);
+                    // Replay to get this step's result
+                    cudaGraphLaunch(exec, (cudaStream_t)0);
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                } else {
+                    fprintf(stderr, "[NeuroGrid] Graph instantiate failed: %s\n",
+                            err != cudaSuccess ? cudaGetErrorString(err) : "null");
+                    if (graph) cudaGraphDestroy(graph);
+                    run_all_layers(ctx, nullptr);
+                }
+            } else {
+                fprintf(stderr, "[NeuroGrid] Graph end capture failed: %s\n",
+                        err != cudaSuccess ? cudaGetErrorString(err) : "null graph");
+                run_all_layers(ctx, nullptr);
+            }
+        }
+    } else {
+        // Warmup or post-failed-capture: run normally
+        int res = run_all_layers(ctx, nullptr);
+        if (res != 0) return res;
+        ctx->warmup_count++;
+    }
+
+    // Swap buffers for next call
     if (ctx->num_layers % 2 != 0) {
-        // Swap a↔b so result is always in hidden_a for next call
         half* tmp = ctx->hidden_a;
         ctx->hidden_a = ctx->hidden_b;
         ctx->hidden_b = tmp;
     }
-    // Now result is always in hidden_a
     return 0;
 }
 
