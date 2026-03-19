@@ -307,14 +307,17 @@ extern "C" int cuda_decode_step(
         } else {
             CUDA_CHECK(cudaDeviceSynchronize());
         }
-    } else if (ctx->warmup_count >= 2 && !ctx->graph_captured) {
-        // CAPTURE: record all kernel launches on stream 0 (default stream)
-        // All our kernels (cuBLAS, custom) use stream 0 implicitly
+    } else if (ctx->warmup_count == 2 && !ctx->graph_captured) {
+        // CAPTURE: attempt exactly once on step 2
         fprintf(stderr, "[NeuroGrid] Capturing CUDA graph on default stream...\n");
+        ctx->warmup_count = 3; // Prevent re-attempts
+
+        // Clear any stale CUDA errors
+        cudaGetLastError();
 
         cudaError_t err = cudaStreamBeginCapture((cudaStream_t)0, cudaStreamCaptureModeRelaxed);
         if (err != cudaSuccess) {
-            fprintf(stderr, "[NeuroGrid] Graph capture start failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "[NeuroGrid] Graph capture start failed: %s (running without graphs)\n", cudaGetErrorString(err));
             int res = run_all_layers(ctx, nullptr);
             if (res != 0) return res;
         } else {
