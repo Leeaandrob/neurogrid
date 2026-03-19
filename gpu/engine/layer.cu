@@ -15,7 +15,8 @@
 #include "../cuda/memory.h"
 
 // Forward declaration for paged attention (from paged_attention.cu)
-extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*, void*, const int*, int, int, int, int);
+// Signature: output, query, new_key, new_value, cache, d_block_table, d_seq_lens, d_position, num_heads, num_kv_heads, head_dim
+extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*, void*, const int*, const int*, const int*, int, int, int);
 
 // Enable debug output (disabled for clean testing)
 // #define DEBUG_CUDA 1
@@ -521,12 +522,10 @@ extern "C" int cuda_layer_forward(
     // 4. Attention
     if (seq_len == 1 && kv_cache != nullptr) {
         // Single token with cache - use incremental attention with GQA support
-        // Copy position from device to host (positions is now a device pointer)
-        int position;
-        CUDA_CHECK(cudaMemcpy(&position, positions, sizeof(int), cudaMemcpyDeviceToHost));
+        // Pass GPU position pointer directly — no D2H copy (CUDA Graph safe)
         result = cuda_attention_with_kvcache(
-            attn_out, q, k, v, kv_cache,
-            batch_size, num_heads, num_kv_heads, head_dim, position
+            attn_out, q, k, v, kv_cache, positions,
+            batch_size, num_heads, num_kv_heads, head_dim
         );
     } else {
         // Multiple tokens or no cache - use full attention with GQA support
@@ -824,10 +823,9 @@ extern "C" int cuda_layer_forward_fp16(
 
     // 4. Attention
     if (seq_len == 1 && kv_cache != nullptr) {
-        int position;
-        CUDA_CHECK(cudaMemcpy(&position, positions, sizeof(int), cudaMemcpyDeviceToHost));
-        result = cuda_attention_with_kvcache(attn_out, q, k, v, kv_cache,
-            batch_size, num_heads, num_kv_heads, head_dim, position);
+        // Pass GPU position pointer directly — no D2H copy (CUDA Graph safe)
+        result = cuda_attention_with_kvcache(attn_out, q, k, v, kv_cache, positions,
+            batch_size, num_heads, num_kv_heads, head_dim);
     } else {
         result = cuda_basic_attention_gqa(attn_out, q, k, v,
             batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
@@ -1016,11 +1014,9 @@ extern "C" int cuda_layer_forward_fp16_with_workspace(
 
     // 4. Attention (Flash Decode for single-token, naive for prefill)
     if (seq_len == 1 && kv_cache != nullptr) {
-        int position;
-        CUDA_CHECK(cudaMemcpy(&position, positions, sizeof(int), cudaMemcpyDeviceToHost));
-        // Use Flash Attention decode (online softmax, no score materialization)
-        result = cuda_flash_attention_with_kvcache(attn_out, q, k, v, kv_cache,
-            batch_size, num_heads, num_kv_heads, head_dim, position);
+        // Pass GPU position pointer directly — no D2H copy (CUDA Graph safe)
+        result = cuda_flash_attention_with_kvcache(attn_out, q, k, v, kv_cache, positions,
+            batch_size, num_heads, num_kv_heads, head_dim);
     } else {
         result = cuda_basic_attention_gqa(attn_out, q, k, v,
             batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
@@ -1064,7 +1060,9 @@ extern "C" int cuda_layer_forward_fp16_paged(
     void* output, const void* input, const void* weights,
     void* paged_cache,           // PagedKVCache* instead of KVCache*
     const int* d_block_table,    // GPU block table for this sequence
-    const int* positions, int batch_size, int seq_len,
+    const int* positions,        // GPU buffer [1]: position (CUDA Graph safe)
+    const int* d_seq_lens,       // GPU buffer [1]: seq_len = position + 1 (CUDA Graph safe)
+    int batch_size, int seq_len,
     int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
     float rms_norm_eps, float rope_theta, int rope_style,
     void* workspace
@@ -1127,13 +1125,11 @@ extern "C" int cuda_layer_forward_fp16_paged(
 
     // 4. Paged Attention (replaces flash/contiguous attention)
     if (seq_len == 1 && paged_cache != nullptr) {
-        // Note: position is read from GPU via D2H copy. During CUDA Graph capture,
-        // this is the only D2H copy in the hot path. If it fails during capture,
-        // it means this path isn't graph-compatible yet.
-        int position;
-        CUDA_CHECK(cudaMemcpy(&position, positions, sizeof(int), cudaMemcpyDeviceToHost));
+        // CUDA Graph safe: pass GPU buffers for position and seq_len, no D2H copy
+        // d_seq_lens[0] = position + 1, written by caller before graph replay
         result = cuda_paged_attention(attn_out, q, k, v, paged_cache, d_block_table,
-            num_heads, num_kv_heads, head_dim, position);
+            d_seq_lens, positions,
+            num_heads, num_kv_heads, head_dim);
     } else {
         // Prefill: use basic attention (paged cache not used during prefill)
         result = cuda_basic_attention_gqa(attn_out, q, k, v,

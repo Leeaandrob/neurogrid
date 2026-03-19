@@ -52,9 +52,11 @@ struct KVCache {
 #endif
 
 // Flash Attention decode (online softmax, no score materialization)
+// d_position is a GPU buffer [1]: position (CUDA Graph safe)
 int cuda_flash_attention_with_kvcache(
     void* output, const void* query, const void* new_key, const void* new_value,
-    void* cache, int batch_size, int num_heads, int num_kv_heads, int head_dim, int position);
+    void* cache, const int* d_position,
+    int batch_size, int num_heads, int num_kv_heads, int head_dim);
 int cuda_flash_attention_supported(void);
 
 // KV Cache management
@@ -77,17 +79,18 @@ int cuda_kvcache_update(
 
 // Attention with KV cache (for autoregressive generation)
 // Supports GQA (Grouped Query Attention) when num_kv_heads < num_heads
+// d_position is a GPU buffer [1]: position (CUDA Graph safe)
 int cuda_attention_with_kvcache(
     void* output,
     const void* query,          // [batch, num_heads, 1, head_dim]
     const void* new_key,        // [batch, num_kv_heads, 1, head_dim]
     const void* new_value,      // [batch, num_kv_heads, 1, head_dim]
     void* cache,
+    const int* d_position,      // GPU buffer [1]: position (CUDA Graph safe)
     int batch_size,
     int num_heads,
     int num_kv_heads,           // For GQA: num_kv_heads < num_heads
-    int head_dim,
-    int position
+    int head_dim
 );
 
 #ifdef __cplusplus

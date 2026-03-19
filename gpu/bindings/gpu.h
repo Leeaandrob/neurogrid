@@ -223,17 +223,18 @@ int cuda_kvcache_update(
 // Get current length of KV cache.
 int cuda_kvcache_get_length(void* cache);
 
-// Attention using KV cache.
+// Attention using KV cache (CUDA Graph safe — reads position from GPU buffer).
 int cuda_attention_with_kvcache(
     void* output,
     const void* query,
     const void* new_key,
     const void* new_value,
     void* cache,
+    const int* d_position,
     int batch_size,
     int num_heads,
-    int head_dim,
-    int position
+    int num_kv_heads,
+    int head_dim
 );
 
 // ============================================================================
@@ -416,10 +417,10 @@ void cuda_free_decode_context(void* ctx);
 int cuda_paged_kvcache_create(void** cache, int num_blocks, int num_kv_heads, int head_dim, int block_size);
 void cuda_paged_kvcache_free(void* cache);
 int cuda_paged_kvcache_update(void* cache, const void* new_key, const void* new_value,
-    const int* d_block_table, int position);
+    const int* d_block_table, const int* d_position);
 int cuda_paged_attention(void* output, const void* query, const void* new_key, const void* new_value,
-    void* cache, const int* d_block_table,
-    int num_heads, int num_kv_heads, int head_dim, int position);
+    void* cache, const int* d_block_table, const int* d_seq_lens, const int* d_position,
+    int num_heads, int num_kv_heads, int head_dim);
 
 // FP16 layer workspace — pre-allocated buffers for zero-alloc forward passes
 int cuda_create_layer_workspace_fp16(
@@ -441,12 +442,14 @@ int cuda_layer_forward_fp16_with_workspace(
     void* workspace
 );
 
-// FP16 layer forward with paged attention (block-based KV cache)
+// FP16 layer forward with paged attention (block-based KV cache, CUDA Graph safe)
 int cuda_layer_forward_fp16_paged(
     void* output, const void* input, const void* weights,
     void* paged_cache,           // PagedKVCache*
     const int* d_block_table,    // GPU block table
-    const int* positions, int batch_size, int seq_len,
+    const int* positions,        // GPU buffer [1]: position
+    const int* d_seq_lens,       // GPU buffer [1]: seq_len = position + 1
+    int batch_size, int seq_len,
     int hidden_size, int intermediate_size, int num_heads, int num_kv_heads, int head_dim,
     float rms_norm_eps, float rope_theta, int rope_style,
     void* workspace

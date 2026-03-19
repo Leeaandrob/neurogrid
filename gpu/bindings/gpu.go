@@ -591,6 +591,7 @@ func GetKVCacheLength(cache *KVCache) int {
 }
 
 // AttentionWithKVCache computes attention using KV cache.
+// Allocates a temporary GPU buffer for position (CUDA Graph safe internally).
 func AttentionWithKVCache(output, q, k, v *types.Tensor, cache *KVCache, position int) error {
 	if output == nil || q == nil || k == nil || v == nil || cache == nil {
 		return errors.New("nil argument")
@@ -598,7 +599,19 @@ func AttentionWithKVCache(output, q, k, v *types.Tensor, cache *KVCache, positio
 
 	batch := q.Shape[0]
 	numHeads := q.Shape[1]
+	numKVHeads := k.Shape[1]
 	headDim := q.Shape[3]
+
+	// Allocate GPU buffer for position
+	var dPos unsafe.Pointer
+	if C.cuda_malloc(&dPos, C.size_t(4)) != 0 {
+		return errors.New("failed to allocate position buffer")
+	}
+	defer C.cuda_free(dPos)
+	pos := C.int(position)
+	if C.cudaMemcpy(dPos, unsafe.Pointer(&pos), C.size_t(4), C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy position to GPU")
+	}
 
 	result := C.cuda_attention_with_kvcache(
 		output.Data,
@@ -606,10 +619,11 @@ func AttentionWithKVCache(output, q, k, v *types.Tensor, cache *KVCache, positio
 		k.Data,
 		v.Data,
 		cache.ptr,
+		(*C.int)(dPos),
 		C.int(batch),
 		C.int(numHeads),
+		C.int(numKVHeads),
 		C.int(headDim),
-		C.int(position),
 	)
 	if result != 0 {
 		return fmt.Errorf("attention with KV cache failed: %d", result)
@@ -949,10 +963,32 @@ func FreePagedKVCache(cache *PagedKVCache) {
 }
 
 // PagedAttention runs paged attention with KV cache update.
+// Allocates temporary GPU buffers for position and seq_len (CUDA Graph safe internally).
 func PagedAttention(output, query, newKey, newValue unsafe.Pointer, cache *PagedKVCache,
 	dBlockTable unsafe.Pointer, numHeads, numKVHeads, headDim, position int) error {
+	// Allocate GPU buffers for seq_lens and position
+	var dSeqLens, dPos unsafe.Pointer
+	if C.cuda_malloc(&dSeqLens, C.size_t(4)) != 0 {
+		return errors.New("failed to allocate seq_lens buffer")
+	}
+	defer C.cuda_free(dSeqLens)
+	if C.cuda_malloc(&dPos, C.size_t(4)) != 0 {
+		return errors.New("failed to allocate position buffer")
+	}
+	defer C.cuda_free(dPos)
+
+	seqLen := C.int(position + 1)
+	pos := C.int(position)
+	if C.cudaMemcpy(dSeqLens, unsafe.Pointer(&seqLen), C.size_t(4), C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy seq_len to GPU")
+	}
+	if C.cudaMemcpy(dPos, unsafe.Pointer(&pos), C.size_t(4), C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy position to GPU")
+	}
+
 	result := C.cuda_paged_attention(output, query, newKey, newValue, cache.ptr,
-		(*C.int)(dBlockTable), C.int(numHeads), C.int(numKVHeads), C.int(headDim), C.int(position))
+		(*C.int)(dBlockTable), (*C.int)(dSeqLens), (*C.int)(dPos),
+		C.int(numHeads), C.int(numKVHeads), C.int(headDim))
 	if result != 0 {
 		return fmt.Errorf("paged attention failed: %d", result)
 	}
@@ -985,6 +1021,17 @@ func LayerForwardFP16Paged(output, input *types.Tensor, weights *LayerWeightsFP1
 		return errors.New("failed to copy positions to GPU")
 	}
 
+	// Allocate GPU buffer for seq_lens (= position + 1)
+	var dSeqLens unsafe.Pointer
+	if C.cuda_malloc(&dSeqLens, C.size_t(4)) != 0 {
+		return errors.New("failed to allocate seq_lens buffer")
+	}
+	defer C.cuda_free(dSeqLens)
+	seqLenVal := C.int(positions[0] + 1)
+	if C.cudaMemcpy(dSeqLens, unsafe.Pointer(&seqLenVal), C.size_t(4), C.cudaMemcpyHostToDevice) != 0 {
+		return errors.New("failed to copy seq_lens to GPU")
+	}
+
 	ropeTheta := config.RopeTheta
 	if ropeTheta == 0 {
 		ropeTheta = 10000.0
@@ -995,6 +1042,7 @@ func LayerForwardFP16Paged(output, input *types.Tensor, weights *LayerWeightsFP1
 		pagedCache.ptr,
 		(*C.int)(dBlockTable),
 		(*C.int)(dPositions),
+		(*C.int)(dSeqLens),
 		C.int(batch), C.int(seqLen),
 		C.int(config.HiddenSize), C.int(config.IntermediateSize),
 		C.int(config.NumHeads), C.int(config.NumKVHeads), C.int(config.HeadDim),

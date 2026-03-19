@@ -82,11 +82,13 @@ __global__ void paged_kvcache_update_kernel(
     const half* __restrict__ new_key, // [num_kv_heads, head_dim]
     const half* __restrict__ new_val, // [num_kv_heads, head_dim]
     const int* __restrict__ block_table, // [max_blocks_per_seq]
-    int position,                     // Current token position
+    const int* __restrict__ d_position, // GPU buffer: position read at runtime (CUDA Graph safe)
     int block_size,
     int num_kv_heads,
     int head_dim
 ) {
+    int position = d_position[0];  // Read position from GPU buffer
+
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = num_kv_heads * head_dim;
     if (tid >= total) return;
@@ -114,7 +116,7 @@ extern "C" int cuda_paged_kvcache_update(
     const void* new_key,          // [num_kv_heads, head_dim] FP16 on GPU
     const void* new_value,        // [num_kv_heads, head_dim] FP16 on GPU
     const int* d_block_table,     // Block table on GPU
-    int position
+    const int* d_position         // GPU buffer: position (CUDA Graph safe)
 ) {
     PagedKVCache* cache = (PagedKVCache*)cache_ptr;
     int total = cache->num_kv_heads * cache->head_dim;
@@ -125,7 +127,7 @@ extern "C" int cuda_paged_kvcache_update(
         cache->key_cache, cache->value_cache,
         (const half*)new_key, (const half*)new_value,
         d_block_table,
-        position,
+        d_position,
         cache->block_size,
         cache->num_kv_heads,
         cache->head_dim
@@ -145,13 +147,14 @@ __global__ void paged_attention_v1_kernel(
     const half* __restrict__ key_cache,  // [num_blocks, num_kv_heads, block_size, head_dim]
     const half* __restrict__ value_cache,// [num_blocks, num_kv_heads, block_size, head_dim]
     const int* __restrict__ block_table, // [max_blocks_per_seq]
+    const int* __restrict__ d_seq_lens,  // GPU buffer: seq_len read at runtime (CUDA Graph safe)
     int num_heads,
     int num_kv_heads,
     int head_dim,
     int block_size,
-    int seq_len,                         // Number of tokens to attend to
     float scale
 ) {
+    int seq_len = d_seq_lens[0];  // Read seq_len from GPU buffer
     int head_idx = blockIdx.x;
     int tid = threadIdx.x;
     int num_threads = blockDim.x;
@@ -260,20 +263,20 @@ extern "C" int cuda_paged_attention(
     const void* new_value,  // [num_kv_heads, head_dim] FP16 on GPU
     void* cache_ptr,        // PagedKVCache*
     const int* d_block_table, // Block table on GPU [max_blocks]
+    const int* d_seq_lens,  // GPU buffer [1]: seq_len = position + 1 (CUDA Graph safe)
+    const int* d_position,  // GPU buffer [1]: position (CUDA Graph safe)
     int num_heads,
     int num_kv_heads,
-    int head_dim,
-    int position            // Current position (0-indexed)
+    int head_dim
 ) {
     PagedKVCache* cache = (PagedKVCache*)cache_ptr;
 
-    // Step 1: Update cache with new K,V at position
+    // Step 1: Update cache with new K,V at position (reads from GPU buffer)
     int result = cuda_paged_kvcache_update(
-        cache_ptr, new_key, new_value, d_block_table, position);
+        cache_ptr, new_key, new_value, d_block_table, d_position);
     if (result != 0) return result;
 
-    // Step 2: Run paged attention
-    int seq_len = position + 1;
+    // Step 2: Run paged attention (reads seq_len from GPU buffer)
     float scale_val = 1.0f / sqrtf((float)head_dim);
 
     int num_threads = 128;
@@ -288,11 +291,11 @@ extern "C" int cuda_paged_attention(
         (const half*)cache->key_cache,
         (const half*)cache->value_cache,
         d_block_table,
+        d_seq_lens,
         num_heads,
         num_kv_heads,
         head_dim,
         cache->block_size,
-        seq_len,
         scale_val
     );
     CUDA_CHECK(cudaGetLastError());

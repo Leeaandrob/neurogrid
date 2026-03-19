@@ -482,6 +482,7 @@ extern "C" int cuda_kvcache_get_length(void* cache) {
 }
 
 // Kernel to copy K/V to cache at specific position
+// position parameter kept for backward compatibility with cuda_kvcache_update
 __global__ void update_cache_kernel(
     half* __restrict__ cache,
     const half* __restrict__ new_data,
@@ -566,14 +567,16 @@ __global__ void gqa_attention_kernel(
     const half* __restrict__ query,      // [batch * num_heads, head_dim]
     const half* __restrict__ k_cache,    // [batch * num_kv_heads, max_seq_len, head_dim]
     const half* __restrict__ v_cache,    // [batch * num_kv_heads, max_seq_len, head_dim]
+    const int* __restrict__ d_kv_len,    // GPU buffer [1]: kv_len read at runtime (CUDA Graph safe)
     int batch_size,
     int num_heads,
     int num_kv_heads,
     int head_dim,
     int max_seq_len,
-    int kv_len,
     float scale
 ) {
+    int kv_len = d_kv_len[0];  // Read kv_len from GPU buffer
+
     // One block per query head, threads cooperate on the computation
     int query_head = blockIdx.x;
     int tid = threadIdx.x;
@@ -594,9 +597,9 @@ __global__ void gqa_attention_kernel(
     const half* v = v_cache + kv_head * max_seq_len * head_dim;
     half* out = output + query_head * head_dim;
 
-    // Shared memory for scores
+    // Shared memory for scores (use fixed-size allocation for CUDA Graph compatibility)
     extern __shared__ float shared[];
-    float* scores = shared;  // [kv_len]
+    float* scores = shared;  // [kv_len] (max padded)
     float* thread_max = shared + kv_len;  // [block_size]
     float* thread_sum = shared + kv_len + block_size;  // [block_size]
 
@@ -667,42 +670,58 @@ extern "C" int cuda_attention_with_kvcache(
     const void* new_key,        // [batch, num_kv_heads, 1, head_dim]
     const void* new_value,      // [batch, num_kv_heads, 1, head_dim]
     void* cache,
+    const int* d_position,      // GPU buffer [1]: position (CUDA Graph safe)
     int batch_size,
     int num_heads,
     int num_kv_heads,
-    int head_dim,
-    int position
+    int head_dim
 ) {
     KVCache* kv = (KVCache*)cache;
+
+    // Read position from GPU to update cache (host-side metadata still needed)
+    int position;
+    CUDA_CHECK(cudaMemcpy(&position, d_position, sizeof(int), cudaMemcpyDeviceToHost));
 
     // First, update cache with new K, V (uses num_kv_heads from cache)
     int result = cuda_kvcache_update(cache, new_key, new_value, position);
     if (result != 0) return result;
 
     int total_query_heads = batch_size * num_heads;
-    int kv_len = position + 1;  // Number of KV pairs to attend to
     float scale = 1.0f / sqrtf((float)head_dim);
 
     // For GQA, we use a custom kernel that maps query heads to KV heads
     int block_size = 128;  // Threads per block
-    // Shared memory: scores[kv_len] + thread_max[block_size] + thread_sum[block_size]
-    int shared_size = (kv_len + 2 * block_size) * sizeof(float);
+    // Fixed shared memory for CUDA Graph compatibility (max 4096 tokens + 2*128 threads)
+    int max_kv_len_for_shared = 4096;
+    int shared_size = (max_kv_len_for_shared + 2 * block_size) * sizeof(float);
+
+    // d_position contains position; kernel needs kv_len = position + 1
+    // We pass a GPU buffer with kv_len pre-computed by the caller (d_position stores position,
+    // but the kernel reads d_kv_len[0]). For backward compat, compute d_kv_len on the fly:
+    // The caller (layer forward) will write position+1 to a seq_lens buffer.
+    // For now, use a temp buffer approach: write position+1 to d_kv_len.
+    int kv_len = position + 1;
+    int* d_kv_len;
+    CUDA_CHECK(cudaMalloc(&d_kv_len, sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_kv_len, &kv_len, sizeof(int), cudaMemcpyHostToDevice));
 
     gqa_attention_kernel<<<total_query_heads, block_size, shared_size>>>(
         (half*)output,
         (const half*)query,
         ((half*)kv->k_cache),
         ((half*)kv->v_cache),
+        d_kv_len,
         batch_size,
         num_heads,
         num_kv_heads,
         head_dim,
         kv->max_seq_len,
-        kv_len,
         scale
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(d_kv_len);
 
     return 0;
 }

@@ -20,7 +20,7 @@ extern "C" int cuda_layer_forward_fp16(
     void*, const void*, const void*, void*, const int*, int, int,
     int, int, int, int, int, float, float, int);
 extern "C" int cuda_layer_forward_fp16_paged(
-    void*, const void*, const void*, void*, const int*, const int*, int, int,
+    void*, const void*, const void*, void*, const int*, const int*, const int*, int, int,
     int, int, int, int, int, float, float, int, void*);
 extern "C" int cuda_fp16_to_bf16(void*, const void*, size_t);
 extern "C" int cuda_bf16_to_fp16(void*, const void*, size_t);
@@ -73,6 +73,7 @@ struct DecodeContext {
 
     // GPU position buffer (avoids per-step allocation)
     int* d_position;
+    int* d_seq_lens;      // GPU buffer [1]: seq_len = position + 1 (CUDA Graph safe)
 
     // Paged KV Cache — per-layer (replaces per-layer KVCache* for attention layers)
     void** paged_caches;         // [num_layers] PagedKVCache* (NULL for conv layers)
@@ -130,8 +131,9 @@ extern "C" int cuda_create_decode_context(
     CUDA_CHECK(cudaMalloc(&ctx->hidden_a, hs));
     CUDA_CHECK(cudaMalloc(&ctx->hidden_b, hs));
 
-    // Allocate position buffer (single int)
+    // Allocate position and seq_lens buffers (single int each)
     CUDA_CHECK(cudaMalloc(&ctx->d_position, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_seq_lens, sizeof(int)));
 
     // Create CUDA stream for graph capture
     CUDA_CHECK(cudaStreamCreate(&ctx->stream));
@@ -183,8 +185,8 @@ extern "C" void cuda_set_decode_paged_layer(void* ctx_ptr, int layer_id, void* p
 // ============================================================================
 // Internal: run all layers (used for both normal and graph-captured paths)
 // ============================================================================
-// Forward declaration for paged attention without D2H copy
-extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*, void*, const int*, int, int, int, int);
+// Forward declaration for paged attention (CUDA Graph safe — reads position/seq_len from GPU buffers)
+extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*, void*, const int*, const int*, const int*, int, int, int);
 
 static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
     int H = ctx->hidden_size;
@@ -215,7 +217,7 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
                 result = cuda_layer_forward_fp16_paged(
                     next, current, ctx->layer_weights[i],
                     ctx->paged_caches[i], ctx->d_block_table,
-                    ctx->d_position, 1, 1,
+                    ctx->d_position, ctx->d_seq_lens, 1, 1,
                     H, ctx->intermediate_size, ctx->num_heads,
                     ctx->num_kv_heads, ctx->head_dim,
                     ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
@@ -268,9 +270,11 @@ extern "C" int cuda_decode_step(
     int H = ctx->hidden_size;
     size_t hs = H * sizeof(half);
 
-    // Copy input and position to persistent GPU buffers (OUTSIDE graph)
+    // Copy input, position, and seq_len to persistent GPU buffers (OUTSIDE graph)
     CUDA_CHECK(cudaMemcpy(ctx->hidden_a, h_input, hs, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(ctx->d_position, &position, sizeof(int), cudaMemcpyHostToDevice));
+    int seq_len_val = position + 1;
+    CUDA_CHECK(cudaMemcpy(ctx->d_seq_lens, &seq_len_val, sizeof(int), cudaMemcpyHostToDevice));
     ctx->current_position = position;  // Host-side position (used inside graph to avoid D2H copy)
 
     // Determine output buffer
@@ -386,8 +390,10 @@ extern "C" int cuda_decode_get_hidden(void* ctx_ptr, void* h_hidden) {
 extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
 
-    // Only copy position (4 bytes) — hidden already on GPU from previous step
+    // Only copy position and seq_len (8 bytes total) — hidden already on GPU from previous step
     CUDA_CHECK(cudaMemcpy(ctx->d_position, &position, sizeof(int), cudaMemcpyHostToDevice));
+    int seq_len_val = position + 1;
+    CUDA_CHECK(cudaMemcpy(ctx->d_seq_lens, &seq_len_val, sizeof(int), cudaMemcpyHostToDevice));
 
     int res = run_all_layers(ctx, nullptr);
     if (res != 0) return res;
@@ -423,6 +429,7 @@ extern "C" void cuda_free_decode_context(void* ctx_ptr) {
     if (ctx->hidden_a) cudaFree(ctx->hidden_a);
     if (ctx->hidden_b) cudaFree(ctx->hidden_b);
     if (ctx->d_position) cudaFree(ctx->d_position);
+    if (ctx->d_seq_lens) cudaFree(ctx->d_seq_lens);
     if (ctx->layer_types) free(ctx->layer_types);
     if (ctx->layer_weights) free(ctx->layer_weights);
     if (ctx->layer_caches) free(ctx->layer_caches);

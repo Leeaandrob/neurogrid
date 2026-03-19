@@ -44,14 +44,15 @@ __global__ void flash_decode_gqa_kernel(
     const half* __restrict__ query,      // [batch * num_heads, head_dim]
     const half* __restrict__ k_cache,    // [batch * num_kv_heads, max_seq_len, head_dim]
     const half* __restrict__ v_cache,    // [batch * num_kv_heads, max_seq_len, head_dim]
+    const int* __restrict__ d_kv_len,   // GPU buffer [1]: kv_len read at runtime (CUDA Graph safe)
     int batch_size,
     int num_heads,
     int num_kv_heads,
     int head_dim,
     int max_seq_len,
-    int kv_len,
     float scale
 ) {
+    int kv_len = d_kv_len[0];  // Read kv_len from GPU buffer
     int query_head = blockIdx.x;
     int tid = threadIdx.x;
     int block_size = blockDim.x;
@@ -189,21 +190,30 @@ extern "C" int cuda_flash_attention_with_kvcache(
     const void* new_key,
     const void* new_value,
     void* cache,
+    const int* d_position,      // GPU buffer [1]: position (CUDA Graph safe)
     int batch_size,
     int num_heads,
     int num_kv_heads,
-    int head_dim,
-    int position
+    int head_dim
 ) {
     KVCache* kv = (KVCache*)cache;
+
+    // Read position from GPU for cache update (host-side metadata)
+    int position;
+    CUDA_CHECK(cudaMemcpy(&position, d_position, sizeof(int), cudaMemcpyDeviceToHost));
 
     // Update cache first
     int result = cuda_kvcache_update(cache, new_key, new_value, position);
     if (result != 0) return result;
 
     int total_query_heads = batch_size * num_heads;
-    int kv_len = position + 1;
     float scale = 1.0f / sqrtf((float)head_dim);
+
+    // Compute kv_len = position + 1 and write to GPU buffer for kernel
+    int kv_len = position + 1;
+    int* d_kv_len;
+    CUDA_CHECK(cudaMalloc(&d_kv_len, sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_kv_len, &kv_len, sizeof(int), cudaMemcpyHostToDevice));
 
     // Block size: enough threads to cover head_dim elements
     int block_size = 128;
@@ -215,15 +225,17 @@ extern "C" int cuda_flash_attention_with_kvcache(
         (const half*)query,
         (const half*)kv->k_cache,
         (const half*)kv->v_cache,
+        d_kv_len,
         batch_size,
         num_heads,
         num_kv_heads,
         head_dim,
         kv->max_seq_len,
-        kv_len,
         scale
     );
     CUDA_CHECK(cudaGetLastError());
+
+    cudaFree(d_kv_len);
 
     return 0;
 }
