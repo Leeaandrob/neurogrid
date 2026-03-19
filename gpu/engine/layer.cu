@@ -1441,6 +1441,13 @@ extern "C" void cuda_free_layer_workspace_bf16(void* workspace) {
     free(ws);
 }
 
+// Accessor: get FP16 K/V pointers from BF16 workspace (for paged cache writes during prefill)
+extern "C" void cuda_workspace_bf16_get_kv_fp16(void* workspace, void** k_fp16, void** v_fp16) {
+    LayerWorkspaceBF16* ws = (LayerWorkspaceBF16*)workspace;
+    *k_fp16 = ws->k_fp16;
+    *v_fp16 = ws->v_fp16;
+}
+
 // ============================================================================
 // BF16-Native Layer Forward Pass
 // ============================================================================

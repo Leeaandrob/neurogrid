@@ -256,6 +256,126 @@ func (e *CUDALayerExecutor) AppendToken(seqID uint64) error {
 	return e.pagedManager.AppendToken(seqID)
 }
 
+// AppendTokens bulk-records N tokens added to the sequence's KV cache (for batch prefill).
+func (e *CUDALayerExecutor) AppendTokens(seqID uint64, count int) error {
+	if e.pagedManager == nil {
+		return nil
+	}
+	e.pagedManager.mu.Lock()
+	defer e.pagedManager.mu.Unlock()
+	seq, ok := e.pagedManager.sequences[seqID]
+	if !ok {
+		return fmt.Errorf("sequence %d not found", seqID)
+	}
+	seq.SeqLen += count
+	return nil
+}
+
+// PrefillBatch processes all input tokens through all layers in a single batched pass.
+// Uses cuda_gather_embeddings for batch embedding + cuda_prefill_batch for batched layer forward.
+// Writes K/V to paged cache via slot_mapping (vLLM pattern).
+func (e *CUDALayerExecutor) PrefillBatch(tokens []int, embeddingTable unsafe.Pointer, seqID uint64) ([]byte, error) {
+	if e.decodeCtx == nil {
+		return nil, fmt.Errorf("decode context not initialized")
+	}
+	numTokens := len(tokens)
+	H := e.config.HiddenSize
+
+	// 1. Upload token IDs to GPU
+	tokenIDs := make([]int32, numTokens)
+	for i, t := range tokens {
+		tokenIDs[i] = int32(t)
+	}
+	dTokenIDs, err := bindings.AllocOnDevice(uint64(numTokens*4), 0)
+	if err != nil {
+		return nil, fmt.Errorf("alloc token IDs: %w", err)
+	}
+	defer bindings.FreeOnDevice(dTokenIDs, 0)
+	if err := bindings.CopyToDeviceRaw(dTokenIDs, unsafe.Pointer(&tokenIDs[0]), uint64(numTokens*4)); err != nil {
+		return nil, fmt.Errorf("copy token IDs: %w", err)
+	}
+
+	// 2. Allocate positions array [0, 1, 2, ..., N-1]
+	positions := make([]int32, numTokens)
+	for i := range positions {
+		positions[i] = int32(i)
+	}
+	dPositions, err := bindings.AllocOnDevice(uint64(numTokens*4), 0)
+	if err != nil {
+		return nil, fmt.Errorf("alloc positions: %w", err)
+	}
+	defer bindings.FreeOnDevice(dPositions, 0)
+	if err := bindings.CopyToDeviceRaw(dPositions, unsafe.Pointer(&positions[0]), uint64(numTokens*4)); err != nil {
+		return nil, fmt.Errorf("copy positions: %w", err)
+	}
+
+	// 3. Compute slot_mapping from block table (vLLM pattern)
+	var dSlotMapping unsafe.Pointer
+	if e.usePagedCache && e.pagedManager != nil {
+		slotMapping := make([]int32, numTokens)
+		e.pagedManager.mu.RLock()
+		seq, ok := e.pagedManager.sequences[seqID]
+		if ok {
+			for i := 0; i < numTokens; i++ {
+				blockIdx := i / BlockSize
+				slotInBlock := i % BlockSize
+				if blockIdx < len(seq.BlockIDs) {
+					slotMapping[i] = int32(seq.BlockIDs[blockIdx]*BlockSize + slotInBlock)
+				} else {
+					slotMapping[i] = -1 // PAD
+				}
+			}
+		}
+		e.pagedManager.mu.RUnlock()
+
+		dSlotMapping, err = bindings.AllocOnDevice(uint64(numTokens*4), 0)
+		if err != nil {
+			return nil, fmt.Errorf("alloc slot mapping: %w", err)
+		}
+		defer bindings.FreeOnDevice(dSlotMapping, 0)
+		if err := bindings.CopyToDeviceRaw(dSlotMapping, unsafe.Pointer(&slotMapping[0]), uint64(numTokens*4)); err != nil {
+			return nil, fmt.Errorf("copy slot mapping: %w", err)
+		}
+	}
+
+	// 4. Gather embeddings: batch lookup [N, H]
+	dEmbeddings, err := bindings.AllocOnDevice(uint64(numTokens*H*2), 0) // FP16
+	if err != nil {
+		return nil, fmt.Errorf("alloc embeddings: %w", err)
+	}
+	defer bindings.FreeOnDevice(dEmbeddings, 0)
+	if err := bindings.GatherEmbeddings(dEmbeddings, embeddingTable, dTokenIDs, H, numTokens); err != nil {
+		return nil, fmt.Errorf("gather embeddings: %w", err)
+	}
+
+	// 5. Allocate output buffer (single token hidden state)
+	dOutput, err := bindings.AllocOnDevice(uint64(H*2), 0) // FP16
+	if err != nil {
+		return nil, fmt.Errorf("alloc output: %w", err)
+	}
+	defer bindings.FreeOnDevice(dOutput, 0)
+
+	// 6. Run batched prefill (all layers, all tokens, writes KV to paged cache)
+	if err := bindings.PrefillBatch(e.decodeCtx, dEmbeddings, dOutput, dPositions, dSlotMapping, numTokens); err != nil {
+		return nil, fmt.Errorf("prefill batch: %w", err)
+	}
+
+	// 7. Bulk-update paged manager's seq_len
+	if e.usePagedCache {
+		if err := e.AppendTokens(seqID, numTokens); err != nil {
+			return nil, fmt.Errorf("append tokens: %w", err)
+		}
+	}
+
+	// 8. Copy last token's hidden state to host
+	output := make([]byte, H*2) // FP16
+	if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&output[0]), dOutput, uint64(H*2)); err != nil {
+		return nil, fmt.Errorf("copy output: %w", err)
+	}
+
+	return output, nil
+}
+
 // FreeSequence releases all paged KV cache blocks for a sequence.
 func (e *CUDALayerExecutor) FreeSequence(seqID uint64) {
 	if e.pagedManager == nil {

@@ -634,26 +634,37 @@ extern "C" void* cuda_decode_get_hidden_gpu_ptr(void* ctx_ptr) {
 // Uses basic_attention_gqa with causal mask for attention (no paged cache).
 // After prefill, writes all K/V to paged cache for subsequent decode steps.
 
-// Forward declaration for batch paged cache update
-extern "C" int cuda_paged_kvcache_update(void*, const void*, const void*, const int*, const int*);
+// Forward declarations
+extern "C" int cuda_reshape_and_cache(const void*, const void*, void*, const int*, int);
+extern "C" int cuda_create_layer_workspace_bf16(void**, int, int, int, int, int);
+extern "C" int cuda_create_layer_workspace_fp16(void**, int, int, int, int, int);
+extern "C" void cuda_free_layer_workspace_bf16(void*);
+extern "C" void cuda_free_layer_workspace_fp16(void*);
+
+// Accessor for workspace K/V buffers (defined in layer.cu)
+extern "C" void cuda_workspace_bf16_get_kv_fp16(void*, void**, void**);
 
 extern "C" int cuda_prefill_batch(
     void* ctx_ptr,
-    const void* d_input,     // GPU: [num_tokens, hidden_size] FP16 embeddings
-    void* d_output,          // GPU: [hidden_size] FP16 — last token's hidden state
-    const int* d_positions,  // GPU: [num_tokens] position indices (0, 1, 2, ...)
+    const void* d_input,        // GPU: [num_tokens, hidden_size] FP16 embeddings
+    void* d_output,             // GPU: [hidden_size] FP16 — last token's hidden state
+    const int* d_positions,     // GPU: [num_tokens] position indices (0, 1, 2, ...)
+    const int* d_slot_mapping,  // GPU: [num_tokens] slot mapping for paged KV cache writes
     int num_tokens
 ) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
     int H = ctx->hidden_size;
+    int kv_dim = ctx->num_kv_heads * ctx->head_dim;
     size_t token_bytes_fp16 = (size_t)num_tokens * H * sizeof(half);
     size_t token_bytes_bf16 = (size_t)num_tokens * H * sizeof(__nv_bfloat16);
+    int rc = 0;
 
     // Allocate temporary ping-pong buffers for the batch
     half* fp16_a = nullptr;
     half* fp16_b = nullptr;
     __nv_bfloat16* bf16_a = nullptr;
     __nv_bfloat16* bf16_b = nullptr;
+    void* batch_ws = nullptr;
 
     CUDA_CHECK(cudaMalloc(&fp16_a, token_bytes_fp16));
     CUDA_CHECK(cudaMalloc(&fp16_b, token_bytes_fp16));
@@ -664,118 +675,114 @@ extern "C" int cuda_prefill_batch(
     if (ctx->use_bf16_native) {
         CUDA_CHECK(cudaMalloc(&bf16_a, token_bytes_bf16));
         CUDA_CHECK(cudaMalloc(&bf16_b, token_bytes_bf16));
-        // Convert FP16 input → BF16
-        int cvt = cuda_fp16_to_bf16(bf16_a, fp16_a, (size_t)num_tokens * H);
-        if (cvt != 0) goto cleanup;
+        cuda_fp16_to_bf16(bf16_a, fp16_a, (size_t)num_tokens * H);
     }
 
-    // Create temporary workspace for batch (larger than 1-token workspace)
-    {
-        // Allocate batch-sized workspace
-        void* batch_ws = nullptr;
-        if (ctx->use_bf16_native) {
-            int rc = cuda_create_layer_workspace_bf16(&batch_ws, num_tokens,
-                H, ctx->intermediate_size, ctx->num_kv_heads, ctx->head_dim);
-            if (rc != 0) { fprintf(stderr, "[Prefill] Failed to create BF16 batch workspace\n"); goto cleanup; }
-        } else {
-            int rc = cuda_create_layer_workspace_fp16(&batch_ws, num_tokens,
-                H, ctx->intermediate_size, ctx->num_kv_heads, ctx->head_dim);
-            if (rc != 0) { fprintf(stderr, "[Prefill] Failed to create FP16 batch workspace\n"); goto cleanup; }
-        }
+    // Allocate batch-sized workspace
+    if (ctx->use_bf16_native) {
+        rc = cuda_create_layer_workspace_bf16(&batch_ws, num_tokens,
+            H, ctx->intermediate_size, ctx->num_kv_heads, ctx->head_dim);
+    } else {
+        rc = cuda_create_layer_workspace_fp16(&batch_ws, num_tokens,
+            H, ctx->intermediate_size, ctx->num_kv_heads, ctx->head_dim);
+    }
+    if (rc != 0) { fprintf(stderr, "[Prefill] Workspace alloc failed\n"); goto cleanup; }
 
-        // Process all layers
-        for (int i = 0; i < ctx->num_layers; i++) {
-            int result;
+    // Process all layers
+    for (int i = 0; i < ctx->num_layers; i++) {
+        int result;
 
-            if (ctx->layer_types[i] == 0) {
-                // Conv layer — supports seq_len > 1 natively
-                if (ctx->use_bf16_native) {
-                    result = cuda_conv_layer_forward_bf16(
-                        bf16_b, bf16_a,
-                        ctx->layer_weights[i], ctx->layer_caches[i],
-                        1, num_tokens, 0);
-                } else {
-                    // FP16 path: convert to BF16, run conv, convert back
-                    __nv_bfloat16* tmp_in = nullptr;
-                    __nv_bfloat16* tmp_out = nullptr;
-                    cudaMalloc(&tmp_in, token_bytes_bf16);
-                    cudaMalloc(&tmp_out, token_bytes_bf16);
-                    cuda_fp16_to_bf16(tmp_in, fp16_a, (size_t)num_tokens * H);
-                    result = cuda_conv_layer_forward_bf16(
-                        tmp_out, tmp_in,
-                        ctx->layer_weights[i], ctx->layer_caches[i],
-                        1, num_tokens, 0);
-                    if (result == 0) cuda_bf16_to_fp16(fp16_b, tmp_out, (size_t)num_tokens * H);
-                    cudaFree(tmp_in);
-                    cudaFree(tmp_out);
-                }
-            } else {
-                // Attention layer — use basic_attention_gqa with causal mask (not paged)
-                // seq_len > 1 triggers the prefill path in layer forward
-                if (ctx->use_bf16_native) {
-                    result = cuda_layer_forward_bf16_native(
-                        bf16_b, bf16_a, ctx->layer_weights[i],
-                        nullptr, // no KV cache for prefill (uses basic_attention)
-                        d_positions, nullptr, // d_seq_lens not used for basic attention
-                        1, num_tokens,
-                        H, ctx->intermediate_size, ctx->num_heads,
-                        ctx->num_kv_heads, ctx->head_dim,
-                        ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
-                        batch_ws);
-                } else {
-                    result = cuda_layer_forward_fp16(
-                        fp16_b, fp16_a, ctx->layer_weights[i],
-                        nullptr, // no KV cache for prefill
-                        d_positions, 1, num_tokens,
-                        H, ctx->intermediate_size, ctx->num_heads,
-                        ctx->num_kv_heads, ctx->head_dim,
-                        ctx->norm_eps, ctx->rope_theta, ctx->rope_style);
-                }
-            }
-            if (result != 0) {
-                fprintf(stderr, "[Prefill] Layer %d failed: %d\n", i, result);
-                if (ctx->use_bf16_native) cuda_free_layer_workspace_bf16(batch_ws);
-                else cuda_free_layer_workspace_fp16(batch_ws);
-                goto cleanup;
-            }
-
-            // Ping-pong
+        if (ctx->layer_types[i] == 0) {
+            // Conv layer — supports seq_len > 1 natively
             if (ctx->use_bf16_native) {
-                __nv_bfloat16* tmp = bf16_a; bf16_a = bf16_b; bf16_b = tmp;
+                result = cuda_conv_layer_forward_bf16(
+                    bf16_b, bf16_a, ctx->layer_weights[i], ctx->layer_caches[i],
+                    1, num_tokens, 0);
             } else {
-                half* tmp = fp16_a; fp16_a = fp16_b; fp16_b = tmp;
+                __nv_bfloat16* tmp_in = nullptr; __nv_bfloat16* tmp_out = nullptr;
+                cudaMalloc(&tmp_in, token_bytes_bf16);
+                cudaMalloc(&tmp_out, token_bytes_bf16);
+                cuda_fp16_to_bf16(tmp_in, fp16_a, (size_t)num_tokens * H);
+                result = cuda_conv_layer_forward_bf16(
+                    tmp_out, tmp_in, ctx->layer_weights[i], ctx->layer_caches[i],
+                    1, num_tokens, 0);
+                if (result == 0) cuda_bf16_to_fp16(fp16_b, tmp_out, (size_t)num_tokens * H);
+                cudaFree(tmp_in); cudaFree(tmp_out);
+            }
+        } else {
+            // Attention layer — basic_attention_gqa with causal mask for prefill
+            if (ctx->use_bf16_native) {
+                result = cuda_layer_forward_bf16_native(
+                    bf16_b, bf16_a, ctx->layer_weights[i],
+                    nullptr, d_positions, nullptr,
+                    1, num_tokens,
+                    H, ctx->intermediate_size, ctx->num_heads,
+                    ctx->num_kv_heads, ctx->head_dim,
+                    ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
+                    batch_ws);
+            } else {
+                result = cuda_layer_forward_fp16(
+                    fp16_b, fp16_a, ctx->layer_weights[i],
+                    nullptr, d_positions, 1, num_tokens,
+                    H, ctx->intermediate_size, ctx->num_heads,
+                    ctx->num_kv_heads, ctx->head_dim,
+                    ctx->norm_eps, ctx->rope_theta, ctx->rope_style);
+            }
+
+            // vLLM pattern: write K/V to paged cache via slot_mapping
+            // After layer forward, workspace k_fp16/v_fp16 contain RoPE'd K/V in FP16
+            if (result == 0 && d_slot_mapping && ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
+                void* ws_k = nullptr;
+                void* ws_v = nullptr;
+                if (ctx->use_bf16_native) {
+                    cuda_workspace_bf16_get_kv_fp16(batch_ws, &ws_k, &ws_v);
+                }
+                if (ws_k && ws_v) {
+                    result = cuda_reshape_and_cache(ws_k, ws_v,
+                        ctx->paged_caches[i], d_slot_mapping, num_tokens);
+                }
             }
         }
 
-        // Free batch workspace
-        if (ctx->use_bf16_native) cuda_free_layer_workspace_bf16(batch_ws);
-        else cuda_free_layer_workspace_fp16(batch_ws);
+        if (result != 0) {
+            fprintf(stderr, "[Prefill] Layer %d failed: %d\n", i, result);
+            goto cleanup_ws;
+        }
+
+        // Ping-pong
+        if (ctx->use_bf16_native) {
+            __nv_bfloat16* tmp = bf16_a; bf16_a = bf16_b; bf16_b = tmp;
+        } else {
+            half* tmp = fp16_a; fp16_a = fp16_b; fp16_b = tmp;
+        }
     }
 
     // Extract last token's hidden state → d_output
     {
         size_t last_offset = (size_t)(num_tokens - 1) * H;
         if (ctx->use_bf16_native) {
-            // Convert last token BF16 → FP16
             cuda_bf16_to_fp16(d_output, bf16_a + last_offset, H);
         } else {
-            CUDA_CHECK(cudaMemcpy(d_output, fp16_a + last_offset * sizeof(half),
+            CUDA_CHECK(cudaMemcpy(d_output, (half*)fp16_a + last_offset,
                 H * sizeof(half), cudaMemcpyDeviceToDevice));
         }
     }
 
-    // Note: K/V cache is NOT populated during batch prefill (basic_attention_gqa doesn't
-    // write to paged cache). The decode path handles this: the first decode step after
-    // prefill starts at position=num_tokens, and the per-token prefill fallback is used
-    // if KV cache population is needed. For BF16 native attention, this is acceptable
-    // because the prefill computes correct attention via causal mask.
+    // Invalidate CUDA graph (was captured for batch_size=1 decode)
+    ctx->graph_captured = false;
+    ctx->warmup_count_gpu = 0;
 
+cleanup_ws:
+    if (batch_ws) {
+        if (ctx->use_bf16_native) cuda_free_layer_workspace_bf16(batch_ws);
+        else cuda_free_layer_workspace_fp16(batch_ws);
+    }
 cleanup:
     if (fp16_a) cudaFree(fp16_a);
     if (fp16_b) cudaFree(fp16_b);
     if (bf16_a) cudaFree(bf16_a);
     if (bf16_b) cudaFree(bf16_b);
-    return 0;
+    return rc;
 }
 
 // Invalidate CUDA Graph — force re-capture on next decode

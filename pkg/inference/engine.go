@@ -741,15 +741,34 @@ func (e *Engine) GenerateStream(ctx context.Context, req *GenerateRequest, callb
 	return nil
 }
 
+// BatchPrefiller can process all input tokens in a single batched pass.
+type BatchPrefiller interface {
+	PrefillBatch(tokens []int, embeddingTable unsafe.Pointer, seqID uint64) ([]byte, error)
+}
+
 // prefill processes all input tokens through the model.
 func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byte, error) {
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
+	// Fast path: batch prefill (all tokens in one pass, vLLM-style)
+	if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
+		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
+			embTable := embedLookup.(*GPUComponents).Embeddings.ptr
+			hidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
+			if err != nil {
+				log.Printf("[prefill] Batch prefill failed, falling back to sequential: %v", err)
+			} else {
+				log.Printf("[prefill] Batch prefill: %d tokens in one pass", len(tokens))
+				return hidden, nil
+			}
+		}
+	}
+
+	// Sequential fallback (one token at a time)
 	pagedAlloc, hasPaged := e.layerExecutor.(PagedCacheAllocator)
 
-	// Get embeddings for all input tokens
 	var hidden []byte
 	for i, token := range tokens {
 		select {
@@ -758,19 +777,16 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		default:
 		}
 
-		// Embed token
 		tokenHidden, err := e.embedToken(token)
 		if err != nil {
 			return nil, fmt.Errorf("embed token %d failed: %w", i, err)
 		}
 
-		// Forward through all layers at this position
 		hidden, err = e.forwardAllLayersHidden(ctx, tokenHidden, i, seqID)
 		if err != nil {
 			return nil, fmt.Errorf("forward at position %d failed: %w", i, err)
 		}
 
-		// Append token to paged KV cache
 		if hasPaged {
 			if err := pagedAlloc.AppendToken(seqID); err != nil {
 				log.Printf("[prefill] Warning: paged cache append failed at pos %d: %v", i, err)
