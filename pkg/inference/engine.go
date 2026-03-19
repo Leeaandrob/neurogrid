@@ -753,15 +753,19 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 	}
 
 	// Fast path: batch prefill (all tokens in one pass, vLLM-style)
-	if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
-		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
-			embTable := embedLookup.(*GPUComponents).Embeddings.ptr
-			hidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
-			if err != nil {
-				log.Printf("[prefill] Batch prefill failed, falling back to sequential: %v", err)
-			} else {
-				log.Printf("[prefill] Batch prefill: %d tokens in one pass", len(tokens))
-				return hidden, nil
+	// TODO: enable after debugging workspace K/V extraction + CUDA error recovery
+	// Infrastructure is ready: cuda_prefill_batch, cuda_reshape_and_cache, cuda_gather_embeddings
+	if false {
+		if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
+			if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
+				embTable := embedLookup.(*GPUComponents).Embeddings.ptr
+				hidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
+				if err != nil {
+					log.Printf("[prefill] Batch prefill failed, falling back to sequential: %v", err)
+				} else {
+					log.Printf("[prefill] Batch prefill: %d tokens in one pass", len(tokens))
+					return hidden, nil
+				}
 			}
 		}
 	}
