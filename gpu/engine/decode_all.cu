@@ -242,13 +242,15 @@ extern "C" int cuda_decode_convert_fp16_to_bf16(void* ctx_ptr) {
     fprintf(stderr, "[BF16-CVT] FP16 input: [%f, %f, %f, %f] H=%d\n",
         __half2float(h_fp16[0]), __half2float(h_fp16[1]),
         __half2float(h_fp16[2]), __half2float(h_fp16[3]), ctx->hidden_size);
+    cudaDeviceSynchronize(); // ensure FP16 data is committed
     int rc = cuda_fp16_to_bf16(ctx->bf16_hidden_a, ctx->hidden_a, ctx->hidden_size);
+    cudaDeviceSynchronize(); // ensure conversion kernel completes
     // Debug: check BF16 output after conversion
     __nv_bfloat16 h_bf16[4];
     cudaMemcpy(h_bf16, ctx->bf16_hidden_a, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-    fprintf(stderr, "[BF16-CVT] BF16 output: [%f, %f, %f, %f] rc=%d\n",
+    fprintf(stderr, "[BF16-CVT] BF16 output: [%f, %f, %f, %f] rc=%d ptr=%p\n",
         __bfloat162float(h_bf16[0]), __bfloat162float(h_bf16[1]),
-        __bfloat162float(h_bf16[2]), __bfloat162float(h_bf16[3]), rc);
+        __bfloat162float(h_bf16[2]), __bfloat162float(h_bf16[3]), rc, ctx->bf16_hidden_a);
     return rc;
 }
 
@@ -300,11 +302,13 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
         // Debug: print first values of BF16 input on first call
         static int bf16_debug_count = 0;
         if (bf16_debug_count < 2) {
+            cudaDeviceSynchronize(); // ensure all prior kernels committed
             __nv_bfloat16 h_val[4];
             cudaMemcpy(h_val, current, 4 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[BF16-DBG] run_all_layers input: [%f, %f, %f, %f]\n",
+            fprintf(stderr, "[BF16-DBG] run_all_layers input: [%f, %f, %f, %f] ptr=%p (b=%p)\n",
                 __bfloat162float(h_val[0]), __bfloat162float(h_val[1]),
-                __bfloat162float(h_val[2]), __bfloat162float(h_val[3]));
+                __bfloat162float(h_val[2]), __bfloat162float(h_val[3]),
+                current, ctx->bf16_hidden_b);
         }
 
         for (int i = 0; i < ctx->num_layers; i++) {
