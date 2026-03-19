@@ -401,6 +401,6 @@ Contact: **leandrobar93@gmail.com**
 ---
 
 <p align="center">
-  <strong>NeuroGrid Engine v0.5.0</strong><br>
+  <strong>NeuroGrid Engine v0.6.0</strong><br>
   Built with Go + CUDA
 </p>

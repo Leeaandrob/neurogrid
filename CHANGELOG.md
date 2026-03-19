@@ -5,6 +5,47 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-03-19
+
+### Performance Optimizations
+
+#### Flash Decode Attention Kernel
+- Custom CUDA kernel with online softmax (no full score materialization)
+- Tiled KV access (FLASH_TILE_SIZE=32) with FP32 accumulation
+- Works on all GPUs CC >= 7.0 (RTX 2080 Ti and 4090)
+- Drop-in replacement for naive attention in decode path
+
+#### Single CUDA Call Decode (DecodeContext)
+- All 16 layers execute in a single C function call
+- Eliminates ~90 Go↔CUDA boundary crossings per token
+- Ping-pong GPU buffers for zero-allocation layer traversal
+- **Best measured: 230 tok/s (+9% over baseline)**
+
+#### GPU-Resident Decode Path
+- Hidden state stays on GPU between tokens (no Host↔Device copy)
+- GPU→GPU embedding lookup via `SetHiddenFromGPU`
+- LM head reads directly from GPU pointer via `ForwardFromGPU`
+- Automatic fallback to host-copy path for distributed mode
+
+#### Fused CUDA Kernels
+- `cuda_silu_mul`: fused SwiGLU (SiLU + element-wise Mul) in single pass
+- `cuda_add_rmsnorm`: fused Residual Add + RMSNorm in single pass
+- Pre-allocated workspace buffers for attention and conv layers
+
+#### Benchmark Results (LFM2.5-1.2B, RTX 4090, 128 tokens)
+| Engine | tok/s | vs vLLM |
+|--------|-------|---------|
+| HuggingFace 5.3 | 201 | 57% |
+| NeuroGrid v0.6 | 204 | 58% |
+| vLLM 0.17.1 | 350 | 100% |
+
+### Infrastructure
+- `cublas_set_stream()` for future CUDA Graph support
+- `cuda_flash_attention_supported()` runtime capability check
+- Benchmark script: `scripts/benchmark_all.py`
+
+---
+
 ## [0.5.0] - 2026-03-18
 
 ### Added
