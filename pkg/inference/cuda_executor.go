@@ -582,6 +582,11 @@ func (e *CUDALayerExecutor) DecodeStepGPUResident(position int) error {
 	if e.decodeCtx == nil {
 		return fmt.Errorf("decode context not initialized")
 	}
+	// When paged cache is active, decode context uses contiguous KV which isn't updated.
+	// Fall back to per-layer path.
+	if e.usePagedCache {
+		return fmt.Errorf("paged cache active, use per-layer path")
+	}
 	return bindings.DecodeStepGPU(e.decodeCtx, position)
 }
 
