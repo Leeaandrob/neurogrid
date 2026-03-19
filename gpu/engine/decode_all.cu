@@ -636,6 +636,15 @@ extern "C" int cuda_decode_step_gpu(void* ctx_ptr, int position) {
         if (cvt != 0) return cvt;
     }
 
+    // Debug: check output
+    if (gpu_dbg <= 3) {
+        half h_out[4];
+        cudaMemcpy(h_out, ctx->hidden_a, 4*sizeof(half), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[GPU-DBG] step_gpu OUTPUT hidden_a=[%.6f, %.6f, %.6f, %.6f]\n",
+            __half2float(h_out[0]), __half2float(h_out[1]),
+            __half2float(h_out[2]), __half2float(h_out[3]));
+    }
+
     return 0;
 }
 
