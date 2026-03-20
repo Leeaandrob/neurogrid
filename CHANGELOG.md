@@ -5,6 +5,33 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-03-20
+
+### Continuous Batching Phase 2 — Batched Multi-Sequence Decode
+
+Multiple sequences processed in a single batched forward pass with
+per-sequence state isolation.
+
+#### CUDA Kernels
+- **cuda_decode_step_batched**: orchestrates all 16 layers for N sequences
+- **cuda_paged_attention_batched**: N sequences in one kernel launch
+  (grid: batch_size × num_heads, per-sequence block tables + seq_lens)
+- Per-sequence conv state via contiguous GPU buffer `[num_conv, batch, H, K]`
+- Per-sequence paged attention via cuda_layer_forward_bf16_paged
+
+#### Architecture
+- Conv layers: per-sequence (contiguous state buffer, state swap per decode step)
+- Attention layers: per-sequence paged attention (reads from per-sequence KV cache)
+- Embeddings: batched concatenation
+- Block tables: per-sequence update before each attention layer
+
+#### Correctness
+- No cross-contamination between concurrent sequences
+- Per-sequence conv state save/restore via contiguous GPU buffer
+- H2O, Paris, 2+2 — all verified independently in concurrent mode
+
+---
+
 ## [0.11.0] - 2026-03-20
 
 ### Continuous Batching Phase 1 — Concurrent Request Processing
