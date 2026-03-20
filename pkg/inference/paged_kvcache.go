@@ -3,10 +3,17 @@
 // Instead of allocating one contiguous buffer per sequence (wasting VRAM),
 // KV cache is divided into fixed-size blocks (pages) allocated on demand.
 // This allows 2-4x more concurrent sequences and enables continuous batching.
+//
+// Prefix caching: blocks can be cached by token hash and reused across requests.
+// When a new request has the same prefix (e.g. system prompt), the KV cache
+// blocks are reused without re-running the prefill for those tokens.
 package inference
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"log"
 	"sync"
 )
 
@@ -280,4 +287,172 @@ func (m *PagedKVCacheManager) Stats() (totalBlocks, freeBlocks, activeSequences 
 	defer m.mu.RUnlock()
 
 	return m.pool.NumTotal(), m.pool.NumFree(), len(m.sequences)
+}
+
+// ============================================================================
+// Prefix Caching — reuse KV cache blocks across requests with same prefix
+// ============================================================================
+
+// blockHash computes a hash for a block of tokens (BlockSize tokens).
+func blockHash(tokens []int) [32]byte {
+	buf := make([]byte, len(tokens)*4)
+	for i, t := range tokens {
+		binary.LittleEndian.PutUint32(buf[i*4:], uint32(t))
+	}
+	return sha256.Sum256(buf)
+}
+
+// CachedPrefix stores cached block IDs and their token hash for reuse.
+type CachedPrefix struct {
+	BlockHashes [][32]byte // Hash of each block's tokens
+	BlockIDs    []int      // Physical block IDs with valid KV data
+	NumTokens   int        // Total tokens in the cached prefix
+}
+
+// PrefixCache stores cached prefixes for reuse across requests.
+type PrefixCache struct {
+	cache map[[32]byte]int // blockHash → physical block ID
+	mu    sync.RWMutex
+}
+
+// NewPrefixCache creates a prefix cache.
+func NewPrefixCache() *PrefixCache {
+	return &PrefixCache{
+		cache: make(map[[32]byte]int),
+	}
+}
+
+// CacheBlocks stores the hash→blockID mapping for a set of full blocks.
+func (pc *PrefixCache) CacheBlocks(tokens []int, blockIDs []int) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	numFullBlocks := len(tokens) / BlockSize
+	for i := 0; i < numFullBlocks && i < len(blockIDs); i++ {
+		blockTokens := tokens[i*BlockSize : (i+1)*BlockSize]
+		hash := blockHash(blockTokens)
+		pc.cache[hash] = blockIDs[i]
+	}
+}
+
+// FindCachedPrefix returns the number of tokens that can be skipped (cached)
+// and the block IDs to reuse. Only returns full-block matches from the start.
+func (pc *PrefixCache) FindCachedPrefix(tokens []int) (cachedTokens int, cachedBlockIDs []int) {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+
+	numFullBlocks := len(tokens) / BlockSize
+	for i := 0; i < numFullBlocks; i++ {
+		blockTokens := tokens[i*BlockSize : (i+1)*BlockSize]
+		hash := blockHash(blockTokens)
+		blockID, ok := pc.cache[hash]
+		if !ok {
+			break // Cache miss — stop at this block
+		}
+		cachedBlockIDs = append(cachedBlockIDs, blockID)
+		cachedTokens = (i + 1) * BlockSize
+	}
+	return
+}
+
+// Size returns the number of cached blocks.
+func (pc *PrefixCache) Size() int {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	return len(pc.cache)
+}
+
+// AllocateWithPrefix allocates blocks for a sequence, reusing cached prefix blocks.
+// Returns the number of tokens that are already cached (can skip prefill).
+func (m *PagedKVCacheManager) AllocateWithPrefix(seqID uint64, tokens []int, maxTokens int, prefixCache *PrefixCache) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Find cached prefix
+	cachedTokens, cachedBlockIDs := prefixCache.FindCachedPrefix(tokens)
+	numCachedBlocks := len(cachedBlockIDs)
+
+	// Allocate remaining blocks
+	totalBlocksNeeded := (maxTokens + BlockSize - 1) / BlockSize
+	remainingBlocks := totalBlocksNeeded - numCachedBlocks
+
+	newBlockIDs, err := m.pool.Allocate(remainingBlocks)
+	if err != nil {
+		return 0, fmt.Errorf("sequence %d: %w", seqID, err)
+	}
+
+	// Build block table: cached blocks first, then new blocks
+	allBlockIDs := make([]int, 0, totalBlocksNeeded)
+	allBlockIDs = append(allBlockIDs, cachedBlockIDs...)
+	allBlockIDs = append(allBlockIDs, newBlockIDs...)
+
+	// Increase ref count for cached blocks (they're now used by this sequence too)
+	for _, bid := range cachedBlockIDs {
+		if bid < len(m.pool.blocks) {
+			m.pool.blocks[bid].RefCount++
+		}
+	}
+
+	m.sequences[seqID] = &SequenceBlocks{
+		BlockIDs: allBlockIDs,
+		SeqLen:   cachedTokens, // Already have KV data for this many tokens
+	}
+
+	if numCachedBlocks > 0 {
+		log.Printf("[PrefixCache] Hit: %d blocks (%d tokens) reused for seq %d", numCachedBlocks, cachedTokens, seqID)
+	}
+
+	return cachedTokens, nil
+}
+
+// CacheSequencePrefix stores the current sequence's blocks in the prefix cache.
+// Called after prefill completes — the blocks now have valid KV data.
+func (m *PagedKVCacheManager) CacheSequencePrefix(seqID uint64, tokens []int, prefixCache *PrefixCache) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	seq, ok := m.sequences[seqID]
+	if !ok {
+		return
+	}
+
+	prefixCache.CacheBlocks(tokens, seq.BlockIDs)
+}
+
+// FreeWithPrefix releases blocks but keeps cached prefix blocks alive.
+func (m *PagedKVCacheManager) FreeWithPrefix(seqID uint64, prefixCache *PrefixCache) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	seq, ok := m.sequences[seqID]
+	if !ok {
+		return
+	}
+
+	// Only free blocks that aren't cached
+	for _, bid := range seq.BlockIDs {
+		if bid < len(m.pool.blocks) {
+			block := m.pool.blocks[bid]
+			block.RefCount--
+			if block.RefCount <= 0 {
+				// Check if this block is in the prefix cache
+				isCached := false
+				prefixCache.mu.RLock()
+				for _, cachedBID := range prefixCache.cache {
+					if cachedBID == bid {
+						isCached = true
+						break
+					}
+				}
+				prefixCache.mu.RUnlock()
+
+				if !isCached {
+					m.pool.Free([]int{bid})
+				}
+				// Cached blocks stay allocated with RefCount=0 until evicted
+			}
+		}
+	}
+
+	delete(m.sequences, seqID)
 }

@@ -240,6 +240,11 @@ func (e *CUDALayerExecutor) PagedManager() *PagedKVCacheManager {
 	return e.pagedManager
 }
 
+// GetPagedManager returns the paged KV cache manager (for prefix caching).
+func (e *CUDALayerExecutor) GetPagedManager() *PagedKVCacheManager {
+	return e.pagedManager
+}
+
 // AllocateSequence allocates paged KV cache blocks for a new sequence.
 func (e *CUDALayerExecutor) AllocateSequence(seqID uint64, maxTokens int) error {
 	if e.pagedManager == nil {

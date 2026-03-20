@@ -96,6 +96,7 @@ type PagedCacheAllocator interface {
 	AppendToken(seqID uint64) error
 	FreeSequence(seqID uint64)
 	GetBlockTableGPU(seqID uint64) (unsafe.Pointer, int, error) // returns GPU ptr, seqLen
+	GetPagedManager() *PagedKVCacheManager
 }
 
 // EngineConfig holds configuration for the inference engine.
@@ -140,6 +141,9 @@ type Engine struct {
 	// Health check configuration
 	enableHealthCheck bool
 
+	// Prefix caching: reuse KV cache blocks across requests with same prefix
+	prefixCache *PrefixCache
+
 	mu sync.RWMutex
 }
 
@@ -152,6 +156,7 @@ func NewEngine(config EngineConfig) *Engine {
 		localPeerID:       config.LocalPeerID,
 		remoteExecutors:   make(map[string]LayerExecutor),
 		enableHealthCheck: config.EnableHealthCheck,
+		prefixCache:       NewPrefixCache(),
 	}
 }
 
@@ -391,33 +396,55 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	// Get sequence ID for this request
 	seqID := atomic.AddUint64(&e.seqCounter, 1)
 
-	// Reset CUDA KV caches and conv state for new request
+	// Reset conv state for new request (but preserve cached KV blocks)
 	if resetter, ok := e.layerExecutor.(interface{ ResetKVCache() error }); ok {
 		if err := resetter.ResetKVCache(); err != nil {
 			log.Printf("[Generate] Warning: KV cache reset failed: %v", err)
 		}
 	}
-
-	// Clear CPU-side KV caches
 	e.kvCaches.ClearAll()
 
-	// Allocate paged KV cache blocks for this sequence if available
+	// Allocate with prefix caching: reuse KV blocks from previous requests
+	var cachedTokens int
 	if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
 		maxTokens := len(inputTokens) + req.MaxTokens
-		if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
-			log.Printf("[Generate] Paged cache allocation failed: %v (using contiguous fallback)", err)
+		if mgr := pagedAlloc.GetPagedManager(); mgr != nil && e.prefixCache != nil {
+			var allocErr error
+			cachedTokens, allocErr = mgr.AllocateWithPrefix(seqID, inputTokens, maxTokens, e.prefixCache)
+			if allocErr != nil {
+				log.Printf("[Generate] Prefix cache allocation failed: %v, falling back", allocErr)
+				if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
+					log.Printf("[Generate] Paged cache allocation failed: %v", err)
+				}
+			}
+			defer func() {
+				mgr.FreeWithPrefix(seqID, e.prefixCache)
+			}()
 		} else {
-			log.Printf("[Generate] Paged cache allocated: seqID=%d, maxTokens=%d", seqID, maxTokens)
-			defer pagedAlloc.FreeSequence(seqID)
+			if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
+				log.Printf("[Generate] Paged cache allocation failed: %v", err)
+			} else {
+				defer pagedAlloc.FreeSequence(seqID)
+			}
 		}
-	} else {
-		log.Printf("[Generate] No paged cache allocator available")
 	}
 
-	// Prefill phase - process all input tokens
-	hidden, err := e.prefill(ctx, inputTokens, seqID)
+	// Prefill: skip already-cached tokens, only process new ones
+	prefillTokens := inputTokens[cachedTokens:]
+	if cachedTokens > 0 {
+		log.Printf("[Generate] Prefix cache: skipping %d/%d tokens (cached)", cachedTokens, len(inputTokens))
+	}
+
+	hidden, err := e.prefillFrom(ctx, inputTokens, prefillTokens, cachedTokens, seqID)
 	if err != nil {
 		return nil, fmt.Errorf("prefill failed: %w", err)
+	}
+
+	// Cache the prefix blocks for future requests
+	if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
+		if mgr := pagedAlloc.GetPagedManager(); mgr != nil && e.prefixCache != nil {
+			mgr.CacheSequencePrefix(seqID, inputTokens, e.prefixCache)
+		}
 	}
 
 	// Autoregressive decode
@@ -751,6 +778,13 @@ type BatchPrefiller interface {
 
 // prefill processes all input tokens through the model.
 func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byte, error) {
+	return e.prefillFrom(ctx, tokens, tokens, 0, seqID)
+}
+
+// prefillFrom processes tokens starting from positionOffset.
+// allTokens is the full token list (for batch prefill). tokens is the subset to actually process.
+// positionOffset is the starting position (non-zero when prefix is cached).
+func (e *Engine) prefillFrom(ctx context.Context, allTokens []int, tokens []int, positionOffset int, seqID uint64) ([]byte, error) {
 	if len(tokens) == 0 {
 		return nil, fmt.Errorf("empty input tokens")
 	}
@@ -763,7 +797,7 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 			if err != nil {
 				log.Printf("[prefill] Batch prefill failed, falling back: %v", err)
 			} else {
-				log.Printf("[prefill] Batch prefill: %d tokens", len(tokens))
+				log.Printf("[prefill] Batch prefill: %d tokens (offset=%d)", len(tokens), positionOffset)
 				return batchHidden, nil
 			}
 		}
@@ -785,9 +819,9 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 			return nil, fmt.Errorf("embed token %d failed: %w", i, err)
 		}
 
-		hidden, err = e.forwardAllLayersHidden(ctx, tokenHidden, i, seqID)
+		hidden, err = e.forwardAllLayersHidden(ctx, tokenHidden, positionOffset+i, seqID)
 		if err != nil {
-			return nil, fmt.Errorf("forward at position %d failed: %w", i, err)
+			return nil, fmt.Errorf("forward at position %d failed: %w", positionOffset+i, err)
 		}
 
 		if hasPaged {
