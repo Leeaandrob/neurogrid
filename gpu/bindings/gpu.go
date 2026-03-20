@@ -1125,10 +1125,14 @@ func SetDecodeConvWorkspace(ctx *DecodeContext, ws *ConvWorkspace) {
 }
 
 // SetDecodePagedCache sets the paged KV cache on the decode context.
+// Sets use_paged=true and configures the block table. pagedCache can be nil
+// when using per-layer caches (set via SetDecodePagedLayer).
 func SetDecodePagedCache(ctx *DecodeContext, pagedCache *PagedKVCache, dBlockTable unsafe.Pointer, maxBlocksPerSeq int) {
+	var cachePtr unsafe.Pointer
 	if pagedCache != nil {
-		C.cuda_set_decode_paged_cache(ctx.ptr, pagedCache.ptr, (*C.int)(dBlockTable), C.int(maxBlocksPerSeq))
+		cachePtr = pagedCache.ptr
 	}
+	C.cuda_set_decode_paged_cache(ctx.ptr, cachePtr, (*C.int)(dBlockTable), C.int(maxBlocksPerSeq))
 }
 
 // SetDecodePagedLayer sets a per-layer paged cache on the decode context.
