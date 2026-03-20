@@ -23,6 +23,7 @@ type BatchScheduler struct {
 	maxActive    int // Max concurrent sequences
 	addCh        chan *Sequence
 	active       map[uint64]*Sequence
+	waiting      []*Sequence // Buffered requests waiting for prefill
 	seqCounter   uint64
 	mu           sync.Mutex
 	running      bool
@@ -116,25 +117,63 @@ func (bs *BatchScheduler) loop() {
 
 		// 4. Cleanup finished sequences
 		bs.cleanupFinished()
+
+		// 5. If no more decoding sequences, prefill waiting requests
+		hasDecoding := false
+		for _, seq := range bs.active {
+			if seq.State == SeqDecode {
+				hasDecoding = true
+				break
+			}
+		}
+		if !hasDecoding {
+			bs.mu.Lock()
+			pending := bs.waiting
+			bs.waiting = nil
+			bs.mu.Unlock()
+			for _, seq := range pending {
+				if len(bs.active) < bs.maxActive {
+					bs.startSequence(seq)
+				} else {
+					bs.mu.Lock()
+					bs.waiting = append(bs.waiting, seq)
+					bs.mu.Unlock()
+				}
+			}
+		}
 	}
 }
 
-// admitRequests drains the add channel and starts prefill for new sequences.
+// admitRequests drains the add channel but only prefills if no sequences are decoding.
+// This prevents prefill from corrupting decode state of active sequences.
 func (bs *BatchScheduler) admitRequests() {
+	// Check if any sequence is actively decoding
+	hasDecoding := false
+	for _, seq := range bs.active {
+		if seq.State == SeqDecode {
+			hasDecoding = true
+			break
+		}
+	}
+
 	for {
 		select {
 		case seq := <-bs.addCh:
-			if len(bs.active) >= bs.maxActive {
-				// Queue full — wait
-				go func() { bs.addCh <- seq }() // Re-queue
-				return
+			if len(bs.active) >= bs.maxActive || hasDecoding {
+				// Can't prefill while decode is active — buffer for later
+				bs.mu.Lock()
+				bs.waiting = append(bs.waiting, seq)
+				bs.mu.Unlock()
+				continue
 			}
 			bs.startSequence(seq)
+			hasDecoding = true // After prefill, this seq is decoding
 		default:
 			return
 		}
 	}
 }
+
 
 // startSequence runs prefill for a new sequence and transitions to decode.
 // Prefill is SYNCHRONOUS (blocks scheduler loop) to avoid GPU contention.
