@@ -408,8 +408,11 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
 			log.Printf("[Generate] Paged cache allocation failed: %v (using contiguous fallback)", err)
 		} else {
+			log.Printf("[Generate] Paged cache allocated: seqID=%d, maxTokens=%d", seqID, maxTokens)
 			defer pagedAlloc.FreeSequence(seqID)
 		}
+	} else {
+		log.Printf("[Generate] No paged cache allocator available")
 	}
 
 	// Prefill phase - process all input tokens
