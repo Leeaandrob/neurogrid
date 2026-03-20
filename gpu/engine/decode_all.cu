@@ -717,17 +717,26 @@ extern "C" int cuda_prefill_batch(
                     ctx->norm_eps, ctx->rope_theta, ctx->rope_style);
             }
 
-            // vLLM pattern: write K/V to paged cache via slot_mapping
-            // After layer forward, workspace k_fp16/v_fp16 contain RoPE'd K/V in FP16
-            if (result == 0 && d_slot_mapping && ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
+            // Write K/V to paged cache — per-token using same function as sequential decode
+            // (cuda_paged_kvcache_update uses d_position GPU buffer → matches decode path exactly)
+            if (result == 0 && ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
                 void* ws_k = nullptr;
                 void* ws_v = nullptr;
                 if (ctx->use_bf16_native) {
                     cuda_workspace_bf16_get_kv_fp16(batch_ws, &ws_k, &ws_v);
                 }
                 if (ws_k && ws_v) {
-                    result = cuda_reshape_and_cache(ws_k, ws_v,
-                        ctx->paged_caches[i], d_slot_mapping, num_tokens);
+                    int kv_dim = ctx->num_kv_heads * ctx->head_dim;
+                    for (int t = 0; t < num_tokens && result == 0; t++) {
+                        // Set position to t on GPU
+                        CUDA_CHECK(cudaMemcpy(ctx->d_position, &t, sizeof(int), cudaMemcpyHostToDevice));
+                        // K/V for token t: offset t * kv_dim in workspace
+                        half* k_t = (half*)ws_k + (size_t)t * kv_dim;
+                        half* v_t = (half*)ws_v + (size_t)t * kv_dim;
+                        result = cuda_paged_kvcache_update(
+                            ctx->paged_caches[i], k_t, v_t,
+                            ctx->d_block_table, ctx->d_position);
+                    }
                 }
             }
         }

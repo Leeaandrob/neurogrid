@@ -355,7 +355,19 @@ func (e *CUDALayerExecutor) PrefillBatch(tokens []int, embeddingTable unsafe.Poi
 	}
 	defer bindings.FreeOnDevice(dOutput, 0)
 
-	// 6. Run batched prefill (all layers, all tokens, writes KV to paged cache)
+	// 6. Copy block table to decode context GPU buffer (needed for per-token KV cache writes)
+	if e.usePagedCache && e.pagedManager != nil {
+		activeSeqID := e.pagedManager.FirstActiveSequenceID()
+		if activeSeqID > 0 {
+			blockTable, _, btErr := e.pagedManager.GetBlockTable(activeSeqID, e.maxBlocksPerSeq)
+			if btErr == nil {
+				tableBytes := uint64(len(blockTable) * 4)
+				bindings.CopyToDeviceRaw(e.blockTableGPU, getBytePointer(blockTableToBytes(blockTable)), tableBytes)
+			}
+		}
+	}
+
+	// 7. Run batched prefill (all layers, all tokens, writes KV to paged cache)
 	if err := bindings.PrefillBatch(e.decodeCtx, dEmbeddings, dOutput, dPositions, dSlotMapping, numTokens); err != nil {
 		return nil, fmt.Errorf("prefill batch: %w", err)
 	}
