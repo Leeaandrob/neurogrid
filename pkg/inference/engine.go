@@ -811,8 +811,10 @@ func (e *Engine) prefillFrom(ctx context.Context, allTokens []int, tokens []int,
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
-	// Batch prefill: conv sequential + attention batched + per-token KV cache write
-	if true {
+	// Batch prefill disabled — KV cache write intermittently fails.
+	// Infrastructure ready: cuda_prefill_batch, per-token KV write, transpose fix.
+	// Needs dedicated debug session to find the intermittent KV write issue.
+	if false {
 		if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
 			if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
 				embTable := embedLookup.(*GPUComponents).Embeddings.ptr
