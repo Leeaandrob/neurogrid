@@ -737,6 +737,33 @@ extern "C" int cuda_prefill_batch(
                     }
                     // Sync: ensure all KV writes complete before next layer overwrites workspace
                     CUDA_CHECK(cudaDeviceSynchronize());
+
+                    // DEBUG: verify KV cache write by reading back token 0's K and comparing with workspace
+                    static int kv_verify = 0;
+                    if (kv_verify < 1) {
+                        // Read workspace K for token 0
+                        half h_ws_k[4];
+                        cudaMemcpy(h_ws_k, ws_k, 4*sizeof(half), cudaMemcpyDeviceToHost);
+
+                        // Read paged cache K for token 0 (block_table[0], slot 0)
+                        // PagedKVCache has key_cache at offset 0 in the struct
+                        void** cache_fields = (void**)ctx->paged_caches[i];
+                        half* key_cache = (half*)cache_fields[0]; // first field is key_cache
+                        // Position 0 → block_table[0], slot 0 → offset = physical_block * kv_heads * block_size * head_dim
+                        int h_block_table;
+                        cudaMemcpy(&h_block_table, ctx->d_block_table, sizeof(int), cudaMemcpyDeviceToHost);
+                        int block_stride = ctx->num_kv_heads * 16 * ctx->head_dim; // block_size=16
+                        half h_cache_k[4];
+                        cudaMemcpy(h_cache_k, key_cache + (size_t)h_block_table * block_stride, 4*sizeof(half), cudaMemcpyDeviceToHost);
+
+                        fprintf(stderr, "[KV-VERIFY] Layer %d: ws_k[0]=[%.4f,%.4f,%.4f,%.4f] cache_k[0]=[%.4f,%.4f,%.4f,%.4f]\n",
+                            i,
+                            __half2float(h_ws_k[0]), __half2float(h_ws_k[1]),
+                            __half2float(h_ws_k[2]), __half2float(h_ws_k[3]),
+                            __half2float(h_cache_k[0]), __half2float(h_cache_k[1]),
+                            __half2float(h_cache_k[2]), __half2float(h_cache_k[3]));
+                        kv_verify++;
+                    }
                 }
             }
         }

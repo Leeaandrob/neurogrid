@@ -1549,9 +1549,7 @@ extern "C" int cuda_layer_forward_bf16_native(
             kv_cache, positions,
             batch_size, num_heads, num_kv_heads, head_dim);
     } else if (seq_len > 1) {
-        // Prefill: basic attention (needs transpose [seq,heads,dim] → [heads,seq,dim])
-        // GEMM output is [batch*seq, heads*dim] = [batch, seq, heads, dim] row-major
-        // Attention expects [batch, heads, seq, dim]
+        // Prefill: transpose Q/K/V, run basic_attention with causal mask
         half* q_t = nullptr; half* k_t = nullptr; half* v_t = nullptr; half* o_t = nullptr;
         cudaMalloc(&q_t, num_tokens * hidden_size * sizeof(half));
         cudaMalloc(&k_t, num_tokens * kv_dim * sizeof(half));
@@ -1565,7 +1563,6 @@ extern "C" int cuda_layer_forward_bf16_native(
         result = cuda_basic_attention_gqa(o_t, q_t, k_t, v_t,
             batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
 
-        // Transpose output back: [batch, heads, seq, dim] → [batch, seq, heads, dim]
         if (result == 0) {
             cuda_transpose_hsd_to_shd_fp16(attn_out_fp16, o_t, batch_size, num_heads, seq_len, head_dim);
         }
