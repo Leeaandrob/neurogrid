@@ -886,47 +886,39 @@ extern "C" int cuda_decode_step_batched(
             }
             conv_state_idx++;
         } else {
-            // Attention layer: BATCHED — process all sequences at once
-            // The BF16 layer forward already supports num_tokens > 1!
-            // With batch_size sequences each contributing 1 token, num_tokens = batch_size.
-            // GEMM: [batch_size, H] × [H, out] — single cuBLAS call
-            // Paged attention: use cuda_paged_attention_batched
+            // Attention layer: BATCHED with paged attention
+            // 1. Use layer forward for GEMM + RMSNorm + RoPE + FFN (batch_size=N, seq_len=1)
+            //    BUT: skip the internal attention (kv_cache=nullptr → trivial self-attention)
+            // 2. Write K/V to paged cache per-sequence
+            // 3. Run batched paged attention (reads from ALL previous tokens per-sequence)
+            // 4. Apply O projection + residual + FFN
 
-            if (ctx->use_bf16_native && batch_ws) {
-                // Use the batched BF16 native layer forward
-                // For seq_len=1 per-sequence, attention uses paged attention
-                // We need batched paged attention for multiple sequences
-                result = cuda_layer_forward_bf16_native(
-                    bf16_b, bf16_a, ctx->layer_weights[i],
-                    nullptr, // kv_cache=nullptr triggers basic_attention for seq_len>1
-                    d_positions, d_seq_lens,
-                    batch_size, 1, // batch_size=N, seq_len=1
-                    H, ctx->intermediate_size, ctx->num_heads,
-                    ctx->num_kv_heads, ctx->head_dim,
-                    ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
-                    batch_ws);
+            // For now: use per-sequence decode (same as Phase 1) for correctness.
+            // Full batched attention requires restructuring the layer forward.
+            // TODO: inline attention layer with batched paged attention for true batching.
+            for (int b = 0; b < batch_size && result == 0; b++) {
+                size_t off = (size_t)b * H;
 
-                // Write K/V to paged cache for each sequence (from workspace)
-                if (result == 0 && ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
-                    void* ws_k = nullptr;
-                    void* ws_v = nullptr;
-                    cuda_workspace_bf16_get_kv_fp16(batch_ws, &ws_k, &ws_v);
-                    if (ws_k && ws_v) {
-                        for (int b = 0; b < batch_size; b++) {
-                            // Set position for this sequence
-                            CUDA_CHECK(cudaMemcpy(ctx->d_position, d_positions + b, sizeof(int), cudaMemcpyDeviceToDevice));
-                            half* k_b = (half*)ws_k + (size_t)b * kv_dim;
-                            half* v_b = (half*)ws_v + (size_t)b * kv_dim;
-                            const int* bt_b = d_block_tables + b * ctx->max_blocks_per_seq;
-                            result = cuda_paged_kvcache_update(
-                                ctx->paged_caches[i], k_b, v_b, bt_b, ctx->d_position);
-                            if (result != 0) break;
-                        }
-                        CUDA_CHECK(cudaDeviceSynchronize());
-                    }
+                // Save/restore position and seq_len for this sequence
+                CUDA_CHECK(cudaMemcpy(ctx->d_position, d_positions + b, sizeof(int), cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(ctx->d_seq_lens, d_seq_lens + b, sizeof(int), cudaMemcpyDeviceToDevice));
+
+                // Update block table for this sequence
+                const int* bt_b = d_block_tables + b * ctx->max_blocks_per_seq;
+                CUDA_CHECK(cudaMemcpy(ctx->d_block_table, bt_b,
+                    ctx->max_blocks_per_seq * sizeof(int), cudaMemcpyDeviceToDevice));
+
+                if (ctx->use_bf16_native && ctx->bf16_attn_workspace) {
+                    result = cuda_layer_forward_bf16_paged(
+                        bf16_b + off, bf16_a + off, ctx->layer_weights[i],
+                        ctx->paged_caches[i], ctx->d_block_table,
+                        ctx->d_position, ctx->d_seq_lens, 1, 1,
+                        H, ctx->intermediate_size, ctx->num_heads,
+                        ctx->num_kv_heads, ctx->head_dim,
+                        ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
+                        ctx->bf16_attn_workspace);
                 }
             }
-            if (result != 0) goto cleanup;
         }
 
         // Ping-pong
