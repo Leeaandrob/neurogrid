@@ -334,18 +334,60 @@ func (bs *BatchScheduler) decodeStepBatched() {
 	dOutput, _ := bindings.AllocOnDevice(uint64(N*H*2), 0) // FP16
 	defer bindings.FreeOnDevice(dOutput, 0)
 
-	// 4. Restore conv state for first active sequence (all share same conv context)
-	// TODO: proper per-sequence conv state in batched mode
-	if len(seqs) > 0 {
-		if restorer, ok2 := e.layerExecutor.(interface{ RestoreConvStates(map[int][]byte) }); ok2 {
-			restorer.RestoreConvStates(seqs[0].ConvStates)
-		}
+	// 4. Allocate per-sequence conv states on GPU
+	// Layout: [num_conv_layers * batch_size] pointers
+	// For each conv layer, each sequence has its own state buffer
+	numConvLayers := 0
+	for layerID := range executor.convStates {
+		_ = layerID
+		numConvLayers++
 	}
 
-	// 5. Call batched decode
+	var convStatesGPU unsafe.Pointer
+	if numConvLayers > 0 {
+		// Allocate per-sequence conv state buffers
+		stateSize := e.config.HiddenSize * e.config.ConvKernelSize * 4 // FP32
+		convPtrs := make([]unsafe.Pointer, numConvLayers*N)
+
+		convIdx := 0
+		for layerID := 0; layerID < e.config.NumLayers; layerID++ {
+			if !e.config.IsConvLayer(layerID) {
+				continue
+			}
+			for b := 0; b < N; b++ {
+				// Allocate GPU buffer for this sequence's conv state
+				ptr, allocErr := bindings.AllocOnDevice(uint64(stateSize), 0)
+				if allocErr != nil {
+					continue
+				}
+				// Restore from saved host copy
+				if len(seqs[b].ConvStates[layerID]) > 0 {
+					bindings.CopyToDeviceRaw(ptr, unsafe.Pointer(&seqs[b].ConvStates[layerID][0]), uint64(stateSize))
+				}
+				convPtrs[convIdx*N+b] = ptr
+			}
+			convIdx++
+		}
+
+		// Upload pointer array to GPU
+		ptrArraySize := uint64(len(convPtrs) * 8) // 8 bytes per pointer
+		convStatesGPU, _ = bindings.AllocOnDevice(ptrArraySize, 0)
+		bindings.CopyToDeviceRaw(convStatesGPU, unsafe.Pointer(&convPtrs[0]), ptrArraySize)
+		defer func() {
+			// Free per-sequence conv state buffers
+			for _, ptr := range convPtrs {
+				if ptr != nil {
+					bindings.FreeOnDevice(ptr, 0)
+				}
+			}
+			bindings.FreeOnDevice(convStatesGPU, 0)
+		}()
+	}
+
+	// 5. Call batched decode with per-sequence conv states
 	if err := bindings.DecodeStepBatched(executor.decodeCtx,
 		dEmbeddings, dOutput, dPositions, dSeqLens, dBlockTables,
-		nil, // conv_states_array — using global state for now
+		convStatesGPU,
 		N); err != nil {
 		log.Printf("[Scheduler] Batched decode failed: %v, falling back to round-robin", err)
 		bs.decodeStep()
@@ -371,10 +413,26 @@ func (bs *BatchScheduler) decodeStepBatched() {
 		}
 	}
 
-	// Save conv state for first sequence (simplified)
-	if len(seqs) > 0 {
-		if saver, ok2 := e.layerExecutor.(interface{ SaveConvStates() map[int][]byte }); ok2 {
-			seqs[0].ConvStates = saver.SaveConvStates()
+	// Save conv states back from GPU to each sequence
+	if numConvLayers > 0 && convStatesGPU != nil {
+		stateSize := e.config.HiddenSize * e.config.ConvKernelSize * 4
+		convIdx := 0
+		for layerID := 0; layerID < e.config.NumLayers; layerID++ {
+			if !e.config.IsConvLayer(layerID) {
+				continue
+			}
+			for b := 0; b < N; b++ {
+				// Read pointer from array
+				var ptr unsafe.Pointer
+				ptrOff := unsafe.Pointer(uintptr(convStatesGPU) + uintptr((convIdx*N+b)*8))
+				bindings.CopyFromDeviceRaw(unsafe.Pointer(&ptr), ptrOff, 8)
+				if ptr != nil {
+					buf := make([]byte, stateSize)
+					bindings.CopyFromDeviceRaw(unsafe.Pointer(&buf[0]), ptr, uint64(stateSize))
+					seqs[b].ConvStates[layerID] = buf
+				}
+			}
+			convIdx++
 		}
 	}
 }

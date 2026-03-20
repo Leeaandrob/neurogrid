@@ -853,33 +853,34 @@ extern "C" int cuda_decode_step_batched(
     int conv_state_idx = 0;
 
     for (int i = 0; i < ctx->num_layers; i++) {
-        int result;
+        int result = 0;
 
         if (ctx->layer_types[i] == 0) {
-            // Conv layer: per-sequence (conv is stateful)
-            // Process each sequence individually with its own conv state
-            void* conv_state = conv_states_array ? conv_states_array[conv_state_idx] : ctx->layer_caches[i];
-            conv_state_idx++;
+            // Conv layer: per-sequence with PER-SEQUENCE conv state
+            // conv_states_array layout: [conv_layer_0_seq_0, conv_layer_0_seq_1, ..., conv_layer_1_seq_0, ...]
+            // When conv_states_array is NULL, fall back to shared state (single-sequence mode)
+            for (int b = 0; b < batch_size && result == 0; b++) {
+                void* conv_state;
+                if (conv_states_array) {
+                    conv_state = conv_states_array[conv_state_idx * batch_size + b];
+                } else {
+                    conv_state = ctx->layer_caches[i]; // shared (single-sequence)
+                }
 
-            if (ctx->use_bf16_native && ctx->conv_workspace) {
-                for (int b = 0; b < batch_size; b++) {
-                    size_t off = (size_t)b * H;
+                size_t off = (size_t)b * H;
+                if (ctx->use_bf16_native && ctx->conv_workspace) {
                     result = cuda_conv_layer_forward_bf16_ws(
                         bf16_b + off, bf16_a + off,
                         ctx->layer_weights[i], conv_state,
                         1, 1, 0, ctx->conv_workspace);
-                    if (result != 0) goto cleanup;
-                }
-            } else {
-                for (int b = 0; b < batch_size; b++) {
-                    size_t off = (size_t)b * H;
+                } else {
                     result = cuda_conv_layer_forward_bf16(
                         bf16_b + off, bf16_a + off,
                         ctx->layer_weights[i], conv_state,
                         1, 1, 0);
-                    if (result != 0) goto cleanup;
                 }
             }
+            conv_state_idx++;
         } else {
             // Attention layer: BATCHED — process all sequences at once
             // The BF16 layer forward already supports num_tokens > 1!
