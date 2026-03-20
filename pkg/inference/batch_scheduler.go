@@ -53,7 +53,7 @@ func (bs *BatchScheduler) Submit(ctx context.Context, req *GenerateRequest) *Seq
 		return seq
 	}
 	seq.InputTokens = tokens
-	seq.StopStrings = getModelStopStrings(bs.engine.config.ModelName)
+	seq.StopStrings = getModelStopStrings(bs.engine.config.ModelType)
 
 	bs.addCh <- seq
 	return seq
