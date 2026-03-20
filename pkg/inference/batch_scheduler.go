@@ -112,8 +112,18 @@ func (bs *BatchScheduler) loop() {
 			continue
 		}
 
-		// 3. Process one decode step for each active sequence
-		bs.decodeStep()
+		// 3. Process decode step (batched when multiple sequences, round-robin for single)
+		activeCount := 0
+		for _, seq := range bs.active {
+			if seq.State == SeqDecode {
+				activeCount++
+			}
+		}
+		if activeCount > 1 {
+			bs.decodeStepBatched() // Phase 2: N sequences in one CUDA call
+		} else {
+			bs.decodeStep() // Phase 1: single sequence
+		}
 
 		// 4. Cleanup finished sequences
 		bs.cleanupFinished()
@@ -232,6 +242,140 @@ func (bs *BatchScheduler) runPrefill(seq *Sequence) ([]byte, error) {
 	}
 
 	return hidden, nil
+}
+
+// decodeStepBatched processes ALL active sequences in one batched forward pass.
+// This is Phase 2: N sequences generate N tokens in one CUDA call.
+func (bs *BatchScheduler) decodeStepBatched() {
+	e := bs.engine
+	executor, ok := e.layerExecutor.(*CUDALayerExecutor)
+	if !ok {
+		bs.decodeStep() // fallback to round-robin
+		return
+	}
+
+	// Collect active decoding sequences
+	var seqs []*Sequence
+	for _, seq := range bs.active {
+		if seq.State == SeqDecode && len(seq.OutputTokens) > 0 {
+			seqs = append(seqs, seq)
+		}
+	}
+
+	if len(seqs) == 0 {
+		// Handle first-token sequences (i=0 path: LM head only)
+		bs.decodeStep()
+		return
+	}
+
+	N := len(seqs)
+	H := e.config.HiddenSize
+
+	// 1. Gather embeddings: embed each sequence's previous token → [N, H]
+	dEmbeddings, err := bindings.AllocOnDevice(uint64(N*H*2), 0) // BF16 = 2 bytes
+	if err != nil {
+		bs.decodeStep()
+		return
+	}
+	defer bindings.FreeOnDevice(dEmbeddings, 0)
+
+	for i, seq := range seqs {
+		prevToken := seq.OutputTokens[len(seq.OutputTokens)-1]
+		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
+			embPtr, embErr := embedLookup.EmbedTokenGPUPtr(prevToken)
+			if embErr != nil {
+				continue
+			}
+			// Copy FP16 embedding to position i in the batch buffer (D2D)
+			off := unsafe.Pointer(uintptr(dEmbeddings) + uintptr(i*H*2))
+			bindings.CopyToDeviceRaw(off, embPtr, uint64(H*2))
+		}
+	}
+
+	// 2. Stack positions, seq_lens, block_tables
+	positions := make([]int32, N)
+	seqLens := make([]int32, N)
+	maxBlocks := executor.maxBlocksPerSeq
+	blockTables := make([]int32, N*maxBlocks)
+
+	for i, seq := range seqs {
+		positions[i] = int32(seq.Position)
+		seqLens[i] = int32(seq.Position + 1)
+
+		// Get block table for this sequence
+		if mgr := executor.pagedManager; mgr != nil {
+			bt, _, btErr := mgr.GetBlockTable(seq.ID, maxBlocks)
+			if btErr == nil {
+				copy(blockTables[i*maxBlocks:], bt)
+			}
+		}
+
+		// Append token to paged cache tracking
+		if pagedAlloc, ok2 := e.layerExecutor.(PagedCacheAllocator); ok2 {
+			pagedAlloc.AppendToken(seq.ID)
+		}
+	}
+
+	// Upload to GPU
+	dPositions, _ := bindings.AllocOnDevice(uint64(N*4), 0)
+	defer bindings.FreeOnDevice(dPositions, 0)
+	bindings.CopyToDeviceRaw(dPositions, unsafe.Pointer(&positions[0]), uint64(N*4))
+
+	dSeqLens, _ := bindings.AllocOnDevice(uint64(N*4), 0)
+	defer bindings.FreeOnDevice(dSeqLens, 0)
+	bindings.CopyToDeviceRaw(dSeqLens, unsafe.Pointer(&seqLens[0]), uint64(N*4))
+
+	dBlockTables, _ := bindings.AllocOnDevice(uint64(len(blockTables)*4), 0)
+	defer bindings.FreeOnDevice(dBlockTables, 0)
+	bindings.CopyToDeviceRaw(dBlockTables, unsafe.Pointer(&blockTables[0]), uint64(len(blockTables)*4))
+
+	// 3. Output buffer
+	dOutput, _ := bindings.AllocOnDevice(uint64(N*H*2), 0) // FP16
+	defer bindings.FreeOnDevice(dOutput, 0)
+
+	// 4. Restore conv state for first active sequence (all share same conv context)
+	// TODO: proper per-sequence conv state in batched mode
+	if len(seqs) > 0 {
+		if restorer, ok2 := e.layerExecutor.(interface{ RestoreConvStates(map[int][]byte) }); ok2 {
+			restorer.RestoreConvStates(seqs[0].ConvStates)
+		}
+	}
+
+	// 5. Call batched decode
+	if err := bindings.DecodeStepBatched(executor.decodeCtx,
+		dEmbeddings, dOutput, dPositions, dSeqLens, dBlockTables,
+		nil, // conv_states_array — using global state for now
+		N); err != nil {
+		log.Printf("[Scheduler] Batched decode failed: %v, falling back to round-robin", err)
+		bs.decodeStep()
+		return
+	}
+
+	// 6. Apply LM head and sample for each sequence
+	for i, seq := range seqs {
+		// Get hidden state for this sequence from output
+		off := unsafe.Pointer(uintptr(dOutput) + uintptr(i*H*2))
+		if lmForwarder, ok2 := e.gpuInference.(GPULMHeadForwarder); ok2 {
+			logits, lmErr := lmForwarder.ApplyLMHeadFromGPU(off)
+			if lmErr != nil {
+				continue
+			}
+			token := e.sampler.Sample(logits, seq.Temperature, seq.TopP)
+			seq.OutputTokens = append(seq.OutputTokens, token)
+			seq.Position++
+
+			if bs.shouldStop(seq, token) {
+				bs.finishSequence(seq)
+			}
+		}
+	}
+
+	// Save conv state for first sequence (simplified)
+	if len(seqs) > 0 {
+		if saver, ok2 := e.layerExecutor.(interface{ SaveConvStates() map[int][]byte }); ok2 {
+			seqs[0].ConvStates = saver.SaveConvStates()
+		}
+	}
 }
 
 // decodeStep runs one decode iteration for each active decoding sequence.
