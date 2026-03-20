@@ -5,6 +5,51 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-03-20
+
+### Batched Prefill + Prefix Caching Infrastructure
+
+Process all prefill tokens through attention layers in a single batched pass
+instead of N sequential passes. KV cache populated via per-token writes
+matching the decode path (vLLM pattern).
+
+#### Batched Prefill
+- **Conv layers**: processed sequentially (matches decode conv state exactly)
+- **Attention layers**: batched with `basic_attention_gqa` (causal mask)
+- **Q/K/V transpose**: `[seq,heads,dim] → [heads,seq,dim]` before attention
+- **Per-token KV cache write**: using `cuda_paged_kvcache_update` (same as decode)
+- **Batch embedding gather**: `cuda_gather_embeddings` for N tokens at once
+
+#### New CUDA Kernels
+- `cuda_transpose_shd_to_hsd_fp16` / `_hsd_to_shd`: attention layout transpose
+- `cuda_reshape_and_cache`: vLLM-style KV cache write via slot_mapping
+- `cuda_gather_embeddings`: batch token embedding lookup
+- `cuda_prefill_batch`: batched forward through all layers
+- `cuda_workspace_bf16_get_kv_fp16`: workspace K/V accessor
+
+#### Prefix Caching (infrastructure, disabled)
+- `PrefixCache`: SHA256 block hashing for KV cache reuse
+- `AllocateWithPrefix` / `FreeWithPrefix`: prefix-aware block allocation
+- Conv state save/restore (240KB per snapshot)
+- Cache hits verified: 2-3 blocks reused across requests
+
+#### Critical Bug Fixes
+- **SetDecodePagedCache nil guard**: Go binding skipped `use_paged=true` when
+  `pagedCache` was nil (always the case with per-layer caches). KV cache writes
+  in batch prefill never executed. THE root cause of the batch prefill bug.
+- **Missing forward declaration**: `cuda_paged_kvcache_update` undefined in
+  decode_all.cu — build silently used stale .o file without KV write code.
+
+#### Benchmark (LFM2.5-1.2B, BF16 native, GH200 480GB)
+| Config | tok/s |
+|--------|-------|
+| Sequential prefill | 362 |
+| **Batched prefill** | **348** |
+
+Correctness: Paris, 4, H₂O, gravity — all verified with EOS.
+
+---
+
 ## [0.9.0] - 2026-03-19
 
 ### BF16 Native Compute — Precision-Preserving Inference

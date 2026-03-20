@@ -191,7 +191,6 @@ extern "C" void cuda_set_decode_paged_cache(void* ctx_ptr, void* paged_cache,
     ctx->d_block_table = d_block_table;
     ctx->max_blocks_per_seq = max_blocks_per_seq;
     ctx->use_paged = true;
-    fprintf(stderr, "[PAGED-INIT] ctx=%p use_paged set to true\n", ctx);
     // Note: per-layer caches set via cuda_set_decode_paged_layer
 }
 
@@ -663,8 +662,6 @@ extern "C" int cuda_prefill_batch(
 
     // Clear any pending CUDA errors before starting
     cudaGetLastError();
-    fprintf(stderr, "[PF-ENTRY] ctx=%p num_tokens=%d H=%d bf16=%d paged=%d num_layers=%d\n",
-        ctx, num_tokens, H, ctx->use_bf16_native, ctx->use_paged, ctx->num_layers);
 
     // Allocate batch-sized workspace
     if (ctx->use_bf16_native) {
@@ -722,8 +719,6 @@ extern "C" int cuda_prefill_batch(
             }
 
             // Write K/V to paged cache — per-token using same function as sequential decode.
-            fprintf(stderr, "[PF-KV] Layer %d: result=%d use_paged=%d paged_caches=%p paged_caches[%d]=%p\n",
-                i, result, ctx->use_paged, ctx->paged_caches, i, ctx->paged_caches ? ctx->paged_caches[i] : nullptr);
             if (result == 0 && ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
                 void* ws_k = nullptr;
                 void* ws_v = nullptr;
@@ -742,33 +737,6 @@ extern "C" int cuda_prefill_batch(
                     }
                     // Sync: ensure all KV writes complete before next layer overwrites workspace
                     CUDA_CHECK(cudaDeviceSynchronize());
-
-                    // DEBUG: verify KV cache write by reading back token 0's K and comparing with workspace
-                    static int kv_verify = 0;
-                    if (kv_verify < 1) {
-                        // Read workspace K for token 0
-                        half h_ws_k[4];
-                        cudaMemcpy(h_ws_k, ws_k, 4*sizeof(half), cudaMemcpyDeviceToHost);
-
-                        // Read paged cache K for token 0 (block_table[0], slot 0)
-                        // PagedKVCache has key_cache at offset 0 in the struct
-                        void** cache_fields = (void**)ctx->paged_caches[i];
-                        half* key_cache = (half*)cache_fields[0]; // first field is key_cache
-                        // Position 0 → block_table[0], slot 0 → offset = physical_block * kv_heads * block_size * head_dim
-                        int h_block_table;
-                        cudaMemcpy(&h_block_table, ctx->d_block_table, sizeof(int), cudaMemcpyDeviceToHost);
-                        int block_stride = ctx->num_kv_heads * 16 * ctx->head_dim; // block_size=16
-                        half h_cache_k[4];
-                        cudaMemcpy(h_cache_k, key_cache + (size_t)h_block_table * block_stride, 4*sizeof(half), cudaMemcpyDeviceToHost);
-
-                        fprintf(stderr, "[KV-VERIFY] Layer %d: ws_k[0]=[%.4f,%.4f,%.4f,%.4f] cache_k[0]=[%.4f,%.4f,%.4f,%.4f]\n",
-                            i,
-                            __half2float(h_ws_k[0]), __half2float(h_ws_k[1]),
-                            __half2float(h_ws_k[2]), __half2float(h_ws_k[3]),
-                            __half2float(h_cache_k[0]), __half2float(h_cache_k[1]),
-                            __half2float(h_cache_k[2]), __half2float(h_cache_k[3]));
-                        kv_verify++;
-                    }
                 }
             }
         }
