@@ -755,17 +755,28 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
-	// Fast path: batch prefill (all tokens in one pass, vLLM-style)
+	// DEBUG: test batch prefill with just the LAST token to verify basic correctness
+	// If single-token batch works, the issue is in multi-token batching
 	if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
 		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
 			embTable := embedLookup.(*GPUComponents).Embeddings.ptr
-			batchHidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
+			// Test with just first token [tokens[0]]
+			singleToken := tokens[:1]
+			batchHidden, err := batcher.PrefillBatch(singleToken, embTable, seqID)
 			if err != nil {
-				log.Printf("[prefill] Batch prefill failed, falling back: %v", err)
+				log.Printf("[prefill] Single-token batch prefill failed: %v", err)
 			} else {
-				log.Printf("[prefill] Batch prefill OK (%d tokens), hidden[0:4]=%02x%02x%02x%02x",
-					len(tokens), batchHidden[0], batchHidden[1], batchHidden[2], batchHidden[3])
-				return batchHidden, nil
+				log.Printf("[prefill] Single-token batch OK, hidden[0:4]=%02x%02x%02x%02x",
+					batchHidden[0], batchHidden[1], batchHidden[2], batchHidden[3])
+				// Don't return — fall through to sequential for comparison
+			}
+			// Reset caches for sequential
+			if resetter, ok3 := e.layerExecutor.(interface{ ResetKVCache() error }); ok3 {
+				resetter.ResetKVCache()
+			}
+			// Re-allocate sequence
+			if pagedAlloc2, ok3 := e.layerExecutor.(PagedCacheAllocator); ok3 {
+				pagedAlloc2.AllocateSequence(seqID, len(tokens)+2048)
 			}
 		}
 	}
