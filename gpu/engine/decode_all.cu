@@ -753,7 +753,7 @@ extern "C" int cuda_prefill_batch(
             cudaError_t layerErr = cudaDeviceSynchronize();
             if (layerErr != cudaSuccess) {
                 fprintf(stderr, "[Prefill] Layer %d CUDA error: %s\n", i, cudaGetErrorString(layerErr));
-                cudaGetLastError(); // clear error
+                cudaGetLastError();
                 result = -1;
             }
         }
@@ -761,6 +761,18 @@ extern "C" int cuda_prefill_batch(
             fprintf(stderr, "[Prefill] Layer %d failed: rc=%d type=%s\n", i,
                 result, ctx->layer_types[i] == 0 ? "conv" : "attn");
             goto cleanup_ws;
+        }
+        // Debug: print last token's output after each layer
+        {
+            size_t last_off = (size_t)(num_tokens - 1) * H;
+            if (ctx->use_bf16_native && bf16_b) {
+                __nv_bfloat16 dbg[4];
+                cudaMemcpy(dbg, bf16_b + last_off, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[Prefill] L%d(%s) last_token=[%.6f, %.6f, %.6f, %.6f]\n",
+                    i, ctx->layer_types[i]==0?"conv":"attn",
+                    __bfloat162float(dbg[0]), __bfloat162float(dbg[1]),
+                    __bfloat162float(dbg[2]), __bfloat162float(dbg[3]));
+            }
         }
 
         // Ping-pong
