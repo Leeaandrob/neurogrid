@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/neurogrid/engine/gpu/bindings"
 )
 
 // BatchScheduler manages concurrent inference requests.
@@ -135,25 +137,23 @@ func (bs *BatchScheduler) admitRequests() {
 }
 
 // startSequence runs prefill for a new sequence and transitions to decode.
+// Prefill is SYNCHRONOUS (blocks scheduler loop) to avoid GPU contention.
 func (bs *BatchScheduler) startSequence(seq *Sequence) {
 	seq.State = SeqPrefill
 	bs.active[seq.ID] = seq
 
-	// Run prefill (this is the expensive part — blocks for this sequence)
-	go func() {
-		start := time.Now()
-		hidden, err := bs.runPrefill(seq)
-		if err != nil {
-			seq.ErrCh <- err
-			seq.State = SeqFinished
-			return
-		}
-		seq.Hidden = hidden
-		seq.Position = len(seq.InputTokens)
-		seq.State = SeqDecode
-		log.Printf("[Scheduler] Seq %d prefilled %d tokens in %v",
-			seq.ID, len(seq.InputTokens), time.Since(start).Round(time.Millisecond))
-	}()
+	start := time.Now()
+	hidden, err := bs.runPrefill(seq)
+	if err != nil {
+		seq.ErrCh <- err
+		seq.State = SeqFinished
+		return
+	}
+	seq.Hidden = hidden
+	seq.Position = len(seq.InputTokens)
+	seq.State = SeqDecode
+	log.Printf("[Scheduler] Seq %d prefilled %d tokens in %v",
+		seq.ID, len(seq.InputTokens), time.Since(start).Round(time.Millisecond))
 }
 
 // runPrefill executes the prefill phase for a sequence.
@@ -257,7 +257,7 @@ func (bs *BatchScheduler) runDecodeStep(seq *Sequence) (int, error) {
 		return e.sampler.Sample(logits, seq.Temperature, seq.TopP), nil
 	}
 
-	// For subsequent tokens: run layers then LM head
+	// For subsequent tokens: embed → layers → LM head
 	prevToken := seq.OutputTokens[len(seq.OutputTokens)-1]
 
 	// Embed previous token
@@ -279,9 +279,19 @@ func (bs *BatchScheduler) runDecodeStep(seq *Sequence) (int, error) {
 		}
 	}
 
-	// Update block table for paged cache
+	// Append token to paged cache tracking
 	if pagedAlloc, ok2 := e.layerExecutor.(PagedCacheAllocator); ok2 {
 		pagedAlloc.AppendToken(seq.ID)
+
+		// Update block table on GPU for THIS sequence
+		if mgr := pagedAlloc.GetPagedManager(); mgr != nil {
+			blockTable, _, err := mgr.GetBlockTable(seq.ID, 256) // max 256 blocks
+			if err == nil {
+				executor := e.layerExecutor.(*CUDALayerExecutor)
+				tableBytes := uint64(len(blockTable) * 4)
+				bindings.CopyToDeviceRaw(executor.blockTableGPU, getBytePointer(blockTableToBytes(blockTable)), tableBytes)
+			}
+		}
 	}
 
 	// Run decode step
@@ -289,7 +299,7 @@ func (bs *BatchScheduler) runDecodeStep(seq *Sequence) (int, error) {
 		return 0, err
 	}
 
-	// Apply LM head
+	// Apply LM head from GPU hidden state
 	hiddenPtr := gpuDecoder.GetHiddenGPUPtr()
 	if lmForwarder, ok2 := e.gpuInference.(GPULMHeadForwarder); ok2 {
 		logits, err := lmForwarder.ApplyLMHeadFromGPU(hiddenPtr)
