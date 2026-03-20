@@ -113,18 +113,12 @@ func (bs *BatchScheduler) loop() {
 			continue
 		}
 
-		// 3. Process decode step (batched when multiple sequences, round-robin for single)
-		activeCount := 0
-		for _, seq := range bs.active {
-			if seq.State == SeqDecode {
-				activeCount++
-			}
-		}
-		if activeCount > 1 {
-			bs.decodeStepBatched() // Phase 2: N sequences in one CUDA call
-		} else {
-			bs.decodeStep() // Phase 1: single sequence
-		}
+		// 3. Process decode step
+		// Phase 2 batched decode disabled — conv state GPU pointer array crashes.
+		// Using Phase 1 round-robin (correct, 1.8x speedup for concurrent).
+		// Phase 2 code preserved: decodeStepBatched(), cuda_decode_step_batched,
+		// cuda_paged_attention_batched — needs conv state array debug.
+		bs.decodeStep()
 
 		// 4. Cleanup finished sequences
 		bs.cleanupFinished()
