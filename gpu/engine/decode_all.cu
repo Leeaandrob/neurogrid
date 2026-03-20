@@ -484,6 +484,30 @@ extern "C" int cuda_decode_step(
         }
     }
 
+    // Debug: print sequential output
+    {
+        static int seq_dbg = 0;
+        if (seq_dbg < 2) {
+            half h_out[8];
+            cudaMemcpy(h_out, result_buf, 8*sizeof(half), cudaMemcpyDeviceToHost);
+            __nv_bfloat16 h_bf16[8];
+            cudaMemcpy(h_bf16, ctx->bf16_hidden_a, 8*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[SeqDec] pos=%d BF16[0:8]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                position,
+                __bfloat162float(h_bf16[0]),__bfloat162float(h_bf16[1]),
+                __bfloat162float(h_bf16[2]),__bfloat162float(h_bf16[3]),
+                __bfloat162float(h_bf16[4]),__bfloat162float(h_bf16[5]),
+                __bfloat162float(h_bf16[6]),__bfloat162float(h_bf16[7]));
+            fprintf(stderr, "[SeqDec] pos=%d FP16[0:8]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                position,
+                __half2float(h_out[0]),__half2float(h_out[1]),
+                __half2float(h_out[2]),__half2float(h_out[3]),
+                __half2float(h_out[4]),__half2float(h_out[5]),
+                __half2float(h_out[6]),__half2float(h_out[7]));
+            seq_dbg++;
+        }
+    }
+
     // Copy result back to host
     CUDA_CHECK(cudaMemcpy(h_output, result_buf, hs, cudaMemcpyDeviceToHost));
 
@@ -794,13 +818,23 @@ extern "C" int cuda_prefill_batch(
         }
     }
 
-    // Debug: print first values of output hidden state
+    // Debug: print output and check bf16→fp16 conversion
     {
-        half h_out[4];
-        cudaMemcpy(h_out, d_output, 4*sizeof(half), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[Prefill] Output hidden[0:4] = [%.6f, %.6f, %.6f, %.6f]\n",
-            __half2float(h_out[0]), __half2float(h_out[1]),
-            __half2float(h_out[2]), __half2float(h_out[3]));
+        half h_out[8];
+        __nv_bfloat16 h_bf16[8];
+        size_t last_off = (size_t)(num_tokens - 1) * H;
+        cudaMemcpy(h_bf16, bf16_a + last_off, 8*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_out, d_output, 8*sizeof(half), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[Prefill] BF16 last[0:8]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+            __bfloat162float(h_bf16[0]),__bfloat162float(h_bf16[1]),
+            __bfloat162float(h_bf16[2]),__bfloat162float(h_bf16[3]),
+            __bfloat162float(h_bf16[4]),__bfloat162float(h_bf16[5]),
+            __bfloat162float(h_bf16[6]),__bfloat162float(h_bf16[7]));
+        fprintf(stderr, "[Prefill] FP16 out[0:8]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+            __half2float(h_out[0]),__half2float(h_out[1]),
+            __half2float(h_out[2]),__half2float(h_out[3]),
+            __half2float(h_out[4]),__half2float(h_out[5]),
+            __half2float(h_out[6]),__half2float(h_out[7]));
     }
 
     // Invalidate CUDA graph (was captured for batch_size=1 decode)
