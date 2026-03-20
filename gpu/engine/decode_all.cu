@@ -281,15 +281,6 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
         __nv_bfloat16* current = ctx->bf16_hidden_a;
         __nv_bfloat16* next = ctx->bf16_hidden_b;
 
-        static int bf16_trace = 0;
-        if (bf16_trace < 3) {
-            __nv_bfloat16 dbg[4];
-            cudaMemcpy(dbg, current, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[BF16] input: [%.6f, %.6f, %.6f, %.6f]\n",
-                __bfloat162float(dbg[0]), __bfloat162float(dbg[1]),
-                __bfloat162float(dbg[2]), __bfloat162float(dbg[3]));
-        }
-
         for (int i = 0; i < ctx->num_layers; i++) {
             int result;
 
@@ -331,21 +322,11 @@ static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
                 if (result != 0) return result;
             }
 
-            if (bf16_trace < 1) {
-                __nv_bfloat16 dbg[4];
-                cudaMemcpy(dbg, next, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-                fprintf(stderr, "[BF16] L%d(%s): [%.6f, %.6f, %.6f, %.6f] rc=%d\n",
-                    i, ctx->layer_types[i]==0?"conv":"attn",
-                    __bfloat162float(dbg[0]), __bfloat162float(dbg[1]),
-                    __bfloat162float(dbg[2]), __bfloat162float(dbg[3]), result);
-            }
-
             // Ping-pong (BF16)
             __nv_bfloat16* tmp = current;
             current = next;
             next = tmp;
         }
-        if (bf16_trace < 3) bf16_trace++;
         return 0;
     }
 
@@ -481,30 +462,6 @@ extern "C" int cuda_decode_step(
             // Odd layers: result is in hidden_b, but BF16 result was converted to hidden_a
             // Need to copy to hidden_b OR adjust result_buf
             result_buf = ctx->hidden_a;
-        }
-    }
-
-    // Debug: print sequential output
-    {
-        static int seq_dbg = 0;
-        if (seq_dbg < 2) {
-            half h_out[8];
-            cudaMemcpy(h_out, result_buf, 8*sizeof(half), cudaMemcpyDeviceToHost);
-            __nv_bfloat16 h_bf16[8];
-            cudaMemcpy(h_bf16, ctx->bf16_hidden_a, 8*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[SeqDec] pos=%d BF16[0:8]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                position,
-                __bfloat162float(h_bf16[0]),__bfloat162float(h_bf16[1]),
-                __bfloat162float(h_bf16[2]),__bfloat162float(h_bf16[3]),
-                __bfloat162float(h_bf16[4]),__bfloat162float(h_bf16[5]),
-                __bfloat162float(h_bf16[6]),__bfloat162float(h_bf16[7]));
-            fprintf(stderr, "[SeqDec] pos=%d FP16[0:8]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-                position,
-                __half2float(h_out[0]),__half2float(h_out[1]),
-                __half2float(h_out[2]),__half2float(h_out[3]),
-                __half2float(h_out[4]),__half2float(h_out[5]),
-                __half2float(h_out[6]),__half2float(h_out[7]));
-            seq_dbg++;
         }
     }
 
@@ -714,7 +671,6 @@ extern "C" int cuda_prefill_batch(
             H, ctx->intermediate_size, ctx->num_kv_heads, ctx->head_dim);
     }
     if (rc != 0) { fprintf(stderr, "[Prefill] Workspace alloc failed\n"); goto cleanup; }
-    fprintf(stderr, "[Prefill] Workspace allocated for %d tokens\n", num_tokens);
 
     // Process all layers
     for (int i = 0; i < ctx->num_layers; i++) {
@@ -786,19 +742,6 @@ extern "C" int cuda_prefill_batch(
                 result, ctx->layer_types[i] == 0 ? "conv" : "attn");
             goto cleanup_ws;
         }
-        // Debug: print last token's output after each layer
-        {
-            size_t last_off = (size_t)(num_tokens - 1) * H;
-            if (ctx->use_bf16_native && bf16_b) {
-                __nv_bfloat16 dbg[4];
-                cudaMemcpy(dbg, bf16_b + last_off, 4*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-                fprintf(stderr, "[Prefill] L%d(%s) last_token=[%.6f, %.6f, %.6f, %.6f]\n",
-                    i, ctx->layer_types[i]==0?"conv":"attn",
-                    __bfloat162float(dbg[0]), __bfloat162float(dbg[1]),
-                    __bfloat162float(dbg[2]), __bfloat162float(dbg[3]));
-            }
-        }
-
         // Ping-pong
         if (ctx->use_bf16_native) {
             __nv_bfloat16* tmp = bf16_a; bf16_a = bf16_b; bf16_b = tmp;
@@ -816,25 +759,6 @@ extern "C" int cuda_prefill_batch(
             CUDA_CHECK(cudaMemcpy(d_output, (half*)fp16_a + last_offset,
                 H * sizeof(half), cudaMemcpyDeviceToDevice));
         }
-    }
-
-    // Debug: print output and check bf16→fp16 conversion
-    {
-        half h_out[8];
-        __nv_bfloat16 h_bf16[8];
-        size_t last_off = (size_t)(num_tokens - 1) * H;
-        cudaMemcpy(h_bf16, bf16_a + last_off, 8*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_out, d_output, 8*sizeof(half), cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[Prefill] BF16 last[0:8]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-            __bfloat162float(h_bf16[0]),__bfloat162float(h_bf16[1]),
-            __bfloat162float(h_bf16[2]),__bfloat162float(h_bf16[3]),
-            __bfloat162float(h_bf16[4]),__bfloat162float(h_bf16[5]),
-            __bfloat162float(h_bf16[6]),__bfloat162float(h_bf16[7]));
-        fprintf(stderr, "[Prefill] FP16 out[0:8]=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
-            __half2float(h_out[0]),__half2float(h_out[1]),
-            __half2float(h_out[2]),__half2float(h_out[3]),
-            __half2float(h_out[4]),__half2float(h_out[5]),
-            __half2float(h_out[6]),__half2float(h_out[7]));
     }
 
     // Invalidate CUDA graph (was captured for batch_size=1 decode)

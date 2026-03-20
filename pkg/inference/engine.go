@@ -755,19 +755,10 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
-	// Batch prefill (all tokens at once, vLLM-style)
-	if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
-		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
-			embTable := embedLookup.(*GPUComponents).Embeddings.ptr
-			batchHidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
-			if err != nil {
-				log.Printf("[prefill] Batch prefill failed, falling back: %v", err)
-			} else {
-				log.Printf("[prefill] Batch prefill: %d tokens", len(tokens))
-				return batchHidden, nil
-			}
-		}
-	}
+	// Batch prefill infrastructure ready but disabled — conv1d multi-token path
+	// produces different results from sequential (cuda_causal_conv1d_fwd vs _update).
+	// Needs conv1d validation before enabling. Single-token batch verified correct.
+	// See: cuda_prefill_batch, cuda_reshape_and_cache, cuda_gather_embeddings
 
 	// Sequential fallback (one token at a time)
 	pagedAlloc, hasPaged := e.layerExecutor.(PagedCacheAllocator)
@@ -797,9 +788,6 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		}
 	}
 
-	if len(hidden) >= 4 {
-		log.Printf("[prefill] Sequential hidden[0:4 bytes]: %02x%02x%02x%02x", hidden[0], hidden[1], hidden[2], hidden[3])
-	}
 	return hidden, nil
 }
 
