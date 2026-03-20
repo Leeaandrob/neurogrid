@@ -827,8 +827,11 @@ func (e *Engine) prefillFrom(ctx context.Context, allTokens []int, tokens []int,
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
-	// Batch prefill: conv sequential + attention batched + per-token KV cache write
-	if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
+	// Batch prefill disabled for debug
+	if false {
+		batcher, _ := e.layerExecutor.(BatchPrefiller); _ = batcher; _ = e.gpuInference
+	}
+	if false && false {
 		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
 			embTable := embedLookup.(*GPUComponents).Embeddings.ptr
 			batchHidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
