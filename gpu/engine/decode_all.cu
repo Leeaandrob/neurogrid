@@ -661,6 +661,8 @@ extern "C" int cuda_prefill_batch(
 
     // Clear any pending CUDA errors before starting
     cudaGetLastError();
+    fprintf(stderr, "[PF-ENTRY] num_tokens=%d H=%d bf16=%d paged=%d num_layers=%d\n",
+        num_tokens, H, ctx->use_bf16_native, ctx->use_paged, ctx->num_layers);
 
     // Allocate batch-sized workspace
     if (ctx->use_bf16_native) {
