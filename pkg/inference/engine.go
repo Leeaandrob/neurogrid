@@ -755,7 +755,20 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
-	// Batch prefill disabled — sequential path used (batch path needs debugging)
+	// Fast path: batch prefill (all tokens in one pass, vLLM-style)
+	if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
+		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
+			embTable := embedLookup.(*GPUComponents).Embeddings.ptr
+			batchHidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
+			if err != nil {
+				log.Printf("[prefill] Batch prefill failed, falling back: %v", err)
+			} else {
+				log.Printf("[prefill] Batch prefill OK (%d tokens), hidden[0:4]=%02x%02x%02x%02x",
+					len(tokens), batchHidden[0], batchHidden[1], batchHidden[2], batchHidden[3])
+				return batchHidden, nil
+			}
+		}
+	}
 
 	// Sequential fallback (one token at a time)
 	pagedAlloc, hasPaged := e.layerExecutor.(PagedCacheAllocator)
