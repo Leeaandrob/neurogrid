@@ -718,7 +718,8 @@ extern "C" int cuda_prefill_batch(
             }
 
             // Write K/V to paged cache — per-token using same function as sequential decode.
-            // CRITICAL: must sync before next layer overwrites workspace K/V buffers.
+            fprintf(stderr, "[PF-KV] Layer %d: result=%d use_paged=%d paged_caches=%p paged_caches[%d]=%p\n",
+                i, result, ctx->use_paged, ctx->paged_caches, i, ctx->paged_caches ? ctx->paged_caches[i] : nullptr);
             if (result == 0 && ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
                 void* ws_k = nullptr;
                 void* ws_v = nullptr;
