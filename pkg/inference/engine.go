@@ -141,6 +141,9 @@ type Engine struct {
 	// Health check configuration
 	enableHealthCheck bool
 
+	// Continuous batching scheduler
+	batchScheduler *BatchScheduler
+
 	// Prefix caching: reuse KV cache blocks across requests with same prefix
 	prefixCache *PrefixCache
 
@@ -208,6 +211,13 @@ func (e *Engine) SetSampler(seed int64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.sampler = NewSampler(seed)
+}
+
+// EnableContinuousBatching starts the batch scheduler for concurrent request processing.
+func (e *Engine) EnableContinuousBatching(maxActive int) {
+	e.batchScheduler = NewBatchScheduler(e, maxActive)
+	e.batchScheduler.Start()
+	log.Printf("[Engine] Continuous batching enabled (max_active=%d)", maxActive)
 }
 
 // SetLayerExecutor sets the layer executor for forward passes.
@@ -372,8 +382,24 @@ func (e *Engine) InitializeKVCaches() error {
 }
 
 // Generate performs text generation given a prompt.
-// Uses exclusive lock to serialize requests (single GPU, shared KV cache state).
+// With continuous batching enabled, submits to the batch scheduler.
+// Otherwise, uses exclusive lock for single-request processing.
 func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	// Continuous batching path: submit to scheduler
+	if e.batchScheduler != nil {
+		seq := e.batchScheduler.Submit(ctx, req)
+		select {
+		case resp := <-seq.ResultCh:
+			return resp, nil
+		case err := <-seq.ErrCh:
+			return nil, err
+		case <-ctx.Done():
+			seq.Cancel()
+			return nil, ctx.Err()
+		}
+	}
+
+	// Legacy single-request path
 	e.mu.Lock()
 	defer e.mu.Unlock()
 

@@ -290,6 +290,10 @@ func (e *Engine) InitializeGPU(loader *model.WeightLoader, deviceID int) (*GPUCo
 
 	gpu.Initialized = true
 	log.Printf("GPU inference mode ENABLED")
+
+	// Enable continuous batching (max 8 concurrent sequences)
+	e.EnableContinuousBatching(8)
+
 	return gpu, nil
 }
 
