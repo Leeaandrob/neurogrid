@@ -1284,6 +1284,20 @@ func GatherEmbeddings(output, embedTable unsafe.Pointer, dTokenIDs unsafe.Pointe
 	return nil
 }
 
+// DecodeStepBatched processes N sequences in one forward pass.
+func DecodeStepBatched(ctx *DecodeContext, dEmbeddings, dOutput unsafe.Pointer,
+	dPositions, dSeqLens, dBlockTables unsafe.Pointer,
+	convStatesArray unsafe.Pointer, batchSize int) error {
+	result := C.cuda_decode_step_batched(ctx.ptr,
+		dEmbeddings, dOutput,
+		(*C.int)(dPositions), (*C.int)(dSeqLens), (*C.int)(dBlockTables),
+		(*unsafe.Pointer)(convStatesArray), C.int(batchSize))
+	if result != 0 {
+		return fmt.Errorf("decode step batched failed: %d", result)
+	}
+	return nil
+}
+
 // DecodeInvalidateGraph destroys the captured CUDA graph, forcing re-capture on next decode.
 func DecodeInvalidateGraph(ctx *DecodeContext) {
 	if ctx != nil && ctx.ptr != nil {

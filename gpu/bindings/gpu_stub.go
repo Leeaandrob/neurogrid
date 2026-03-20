@@ -705,6 +705,9 @@ func PrefillBatch(ctx *DecodeContext, dInput, dOutput unsafe.Pointer, dPositions
 func GatherEmbeddings(output, embedTable unsafe.Pointer, dTokenIDs unsafe.Pointer, hiddenSize, numTokens int) error {
 	return ErrNotImplemented
 }
+func DecodeStepBatched(ctx *DecodeContext, dEmbeddings, dOutput unsafe.Pointer, dPositions, dSeqLens, dBlockTables unsafe.Pointer, convStatesArray unsafe.Pointer, batchSize int) error {
+	return ErrNotImplemented
+}
 func DecodeInvalidateGraph(ctx *DecodeContext) {}
 func FreeDecodeContext(ctx *DecodeContext)     {}
 

@@ -807,6 +807,144 @@ extern "C" void cuda_decode_invalidate_graph(void* ctx_ptr) {
     ctx->warmup_count_gpu = 0;
 }
 
+// ============================================================================
+// Batched Decode Step — process N sequences in one forward pass (Phase 2)
+// ============================================================================
+// Conv layers: per-sequence (swap state, run individually)
+// Attention layers: batched GEMM [N, H] × [H, out] + batched paged attention
+// This is where the real throughput multiplication happens.
+
+extern "C" int cuda_paged_attention_batched(void*, const void*, const void*, const void*,
+    void*, const int*, const int*, const int*, int, int, int, int, int);
+
+extern "C" int cuda_decode_step_batched(
+    void* ctx_ptr,
+    const void* d_embeddings,      // [batch_size, hidden_size] BF16 — concatenated embeddings
+    void* d_output,                // [batch_size, hidden_size] FP16 — output hidden states
+    const int* d_positions,        // [batch_size] — per-sequence positions
+    const int* d_seq_lens,         // [batch_size] — per-sequence seq_lens (pos+1)
+    const int* d_block_tables,     // [batch_size, max_blocks_per_seq] — stacked block tables
+    void** conv_states_array,      // [num_conv_layers] — array of conv state GPU pointers (per-sequence, pre-swapped)
+    int batch_size
+) {
+    DecodeContext* ctx = (DecodeContext*)ctx_ptr;
+    int H = ctx->hidden_size;
+    int kv_dim = ctx->num_kv_heads * ctx->head_dim;
+    size_t batch_bf16 = (size_t)batch_size * H * sizeof(__nv_bfloat16);
+    size_t batch_fp16 = (size_t)batch_size * H * sizeof(half);
+
+    // Allocate batched ping-pong buffers
+    __nv_bfloat16* bf16_a = nullptr;
+    __nv_bfloat16* bf16_b = nullptr;
+    CUDA_CHECK(cudaMalloc(&bf16_a, batch_bf16));
+    CUDA_CHECK(cudaMalloc(&bf16_b, batch_bf16));
+
+    // Copy input embeddings (already BF16)
+    CUDA_CHECK(cudaMemcpy(bf16_a, d_embeddings, batch_bf16, cudaMemcpyDeviceToDevice));
+
+    // Allocate batched workspace for attention layers
+    void* batch_ws = nullptr;
+    if (ctx->use_bf16_native) {
+        int rc = cuda_create_layer_workspace_bf16(&batch_ws, batch_size,
+            H, ctx->intermediate_size, ctx->num_kv_heads, ctx->head_dim);
+        if (rc != 0) { cudaFree(bf16_a); cudaFree(bf16_b); return rc; }
+    }
+
+    int conv_state_idx = 0;
+
+    for (int i = 0; i < ctx->num_layers; i++) {
+        int result;
+
+        if (ctx->layer_types[i] == 0) {
+            // Conv layer: per-sequence (conv is stateful)
+            // Process each sequence individually with its own conv state
+            void* conv_state = conv_states_array ? conv_states_array[conv_state_idx] : ctx->layer_caches[i];
+            conv_state_idx++;
+
+            if (ctx->use_bf16_native && ctx->conv_workspace) {
+                for (int b = 0; b < batch_size; b++) {
+                    size_t off = (size_t)b * H;
+                    result = cuda_conv_layer_forward_bf16_ws(
+                        bf16_b + off, bf16_a + off,
+                        ctx->layer_weights[i], conv_state,
+                        1, 1, 0, ctx->conv_workspace);
+                    if (result != 0) goto cleanup;
+                }
+            } else {
+                for (int b = 0; b < batch_size; b++) {
+                    size_t off = (size_t)b * H;
+                    result = cuda_conv_layer_forward_bf16(
+                        bf16_b + off, bf16_a + off,
+                        ctx->layer_weights[i], conv_state,
+                        1, 1, 0);
+                    if (result != 0) goto cleanup;
+                }
+            }
+        } else {
+            // Attention layer: BATCHED — process all sequences at once
+            // The BF16 layer forward already supports num_tokens > 1!
+            // With batch_size sequences each contributing 1 token, num_tokens = batch_size.
+            // GEMM: [batch_size, H] × [H, out] — single cuBLAS call
+            // Paged attention: use cuda_paged_attention_batched
+
+            if (ctx->use_bf16_native && batch_ws) {
+                // Use the batched BF16 native layer forward
+                // For seq_len=1 per-sequence, attention uses paged attention
+                // We need batched paged attention for multiple sequences
+                result = cuda_layer_forward_bf16_native(
+                    bf16_b, bf16_a, ctx->layer_weights[i],
+                    nullptr, // kv_cache=nullptr triggers basic_attention for seq_len>1
+                    d_positions, d_seq_lens,
+                    batch_size, 1, // batch_size=N, seq_len=1
+                    H, ctx->intermediate_size, ctx->num_heads,
+                    ctx->num_kv_heads, ctx->head_dim,
+                    ctx->norm_eps, ctx->rope_theta, ctx->rope_style,
+                    batch_ws);
+
+                // Write K/V to paged cache for each sequence (from workspace)
+                if (result == 0 && ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
+                    void* ws_k = nullptr;
+                    void* ws_v = nullptr;
+                    cuda_workspace_bf16_get_kv_fp16(batch_ws, &ws_k, &ws_v);
+                    if (ws_k && ws_v) {
+                        for (int b = 0; b < batch_size; b++) {
+                            // Set position for this sequence
+                            CUDA_CHECK(cudaMemcpy(ctx->d_position, d_positions + b, sizeof(int), cudaMemcpyDeviceToDevice));
+                            half* k_b = (half*)ws_k + (size_t)b * kv_dim;
+                            half* v_b = (half*)ws_v + (size_t)b * kv_dim;
+                            const int* bt_b = d_block_tables + b * ctx->max_blocks_per_seq;
+                            result = cuda_paged_kvcache_update(
+                                ctx->paged_caches[i], k_b, v_b, bt_b, ctx->d_position);
+                            if (result != 0) break;
+                        }
+                        CUDA_CHECK(cudaDeviceSynchronize());
+                    }
+                }
+            }
+            if (result != 0) goto cleanup;
+        }
+
+        // Ping-pong
+        __nv_bfloat16* tmp = bf16_a;
+        bf16_a = bf16_b;
+        bf16_b = tmp;
+    }
+
+    // Convert final BF16 output to FP16
+    {
+        int cvt = cuda_bf16_to_fp16(d_output, bf16_a, (size_t)batch_size * H);
+        if (cvt != 0) goto cleanup;
+    }
+
+cleanup:
+    if (batch_ws) {
+        if (ctx->use_bf16_native) cuda_free_layer_workspace_bf16(batch_ws);
+    }
+    if (bf16_a) cudaFree(bf16_a);
+    if (bf16_b) cudaFree(bf16_b);
+    return 0;
+}
+
 extern "C" void cuda_free_decode_context(void* ctx_ptr) {
     if (!ctx_ptr) return;
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
