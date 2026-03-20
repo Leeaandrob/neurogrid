@@ -1287,11 +1287,11 @@ func GatherEmbeddings(output, embedTable unsafe.Pointer, dTokenIDs unsafe.Pointe
 // DecodeStepBatched processes N sequences in one forward pass.
 func DecodeStepBatched(ctx *DecodeContext, dEmbeddings, dOutput unsafe.Pointer,
 	dPositions, dSeqLens, dBlockTables unsafe.Pointer,
-	convStatesArray unsafe.Pointer, batchSize int) error {
+	dConvStates unsafe.Pointer, batchSize int) error {
 	result := C.cuda_decode_step_batched(ctx.ptr,
 		dEmbeddings, dOutput,
 		(*C.int)(dPositions), (*C.int)(dSeqLens), (*C.int)(dBlockTables),
-		(*unsafe.Pointer)(convStatesArray), C.int(batchSize))
+		dConvStates, C.int(batchSize))
 	if result != 0 {
 		return fmt.Errorf("decode step batched failed: %d", result)
 	}

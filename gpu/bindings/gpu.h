@@ -434,7 +434,7 @@ int cuda_reshape_and_cache(const void* key, const void* value,
 // Batched decode: N sequences in one forward pass
 int cuda_decode_step_batched(void* ctx, const void* d_embeddings, void* d_output,
     const int* d_positions, const int* d_seq_lens, const int* d_block_tables,
-    void** conv_states_array, int batch_size);
+    void* d_conv_states, int batch_size);
 
 void cuda_decode_invalidate_graph(void* ctx);
 void cuda_free_decode_context(void* ctx);

@@ -824,7 +824,7 @@ extern "C" int cuda_decode_step_batched(
     const int* d_positions,        // [batch_size] — per-sequence positions
     const int* d_seq_lens,         // [batch_size] — per-sequence seq_lens (pos+1)
     const int* d_block_tables,     // [batch_size, max_blocks_per_seq] — stacked block tables
-    void** conv_states_array,      // [num_conv_layers] — array of conv state GPU pointers (per-sequence, pre-swapped)
+    void* d_conv_states,           // [num_conv_layers, batch_size, H, K] FP32 contiguous (or NULL)
     int batch_size
 ) {
     DecodeContext* ctx = (DecodeContext*)ctx_ptr;
@@ -856,13 +856,17 @@ extern "C" int cuda_decode_step_batched(
         int result = 0;
 
         if (ctx->layer_types[i] == 0) {
-            // Conv layer: per-sequence with PER-SEQUENCE conv state
-            // conv_states_array layout: [conv_layer_0_seq_0, conv_layer_0_seq_1, ..., conv_layer_1_seq_0, ...]
-            // When conv_states_array is NULL, fall back to shared state (single-sequence mode)
+            // Conv layer: per-sequence with per-sequence conv state
+            // d_conv_states layout: contiguous [num_conv_layers, batch_size, H, K] FP32
+            // Each sequence's state: offset = (conv_state_idx * batch_size + b) * H * K * sizeof(float)
+            int K = ctx->conv_kernel_size;
+            size_t state_size = (size_t)H * K * sizeof(float);
+
             for (int b = 0; b < batch_size && result == 0; b++) {
                 void* conv_state;
-                if (conv_states_array) {
-                    conv_state = conv_states_array[conv_state_idx * batch_size + b];
+                if (d_conv_states) {
+                    // Per-sequence state from contiguous buffer
+                    conv_state = (char*)d_conv_states + (size_t)(conv_state_idx * batch_size + b) * state_size;
                 } else {
                     conv_state = ctx->layer_caches[i]; // shared (single-sequence)
                 }
