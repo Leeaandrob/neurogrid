@@ -753,29 +753,7 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
-	// Fast path: batch prefill (all tokens in one pass, vLLM-style)
-	// DEBUG: run batch prefill but discard result, use sequential for correctness comparison
-	if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
-		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
-			embTable := embedLookup.(*GPUComponents).Embeddings.ptr
-			batchHidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
-			if err != nil {
-				log.Printf("[prefill] Batch prefill failed: %v", err)
-			} else {
-				// Log batch result for comparison
-				if len(batchHidden) >= 8 {
-					h0 := math.Float32frombits(uint32(batchHidden[0]) | uint32(batchHidden[1])<<8 | uint32(batchHidden[2])<<16 | uint32(batchHidden[3])<<24)
-					_ = h0
-					log.Printf("[prefill] Batch hidden[0:4 bytes]: %02x%02x%02x%02x", batchHidden[0], batchHidden[1], batchHidden[2], batchHidden[3])
-				}
-				log.Printf("[prefill] Batch done (%d tokens), now running sequential for comparison", len(tokens))
-				// Reset caches to run sequential from clean state
-				if resetter, ok3 := e.layerExecutor.(interface{ ResetKVCache() error }); ok3 {
-					resetter.ResetKVCache()
-				}
-			}
-		}
-	}
+	// Batch prefill disabled — sequential path used (batch path needs debugging)
 
 	// Sequential fallback (one token at a time)
 	pagedAlloc, hasPaged := e.layerExecutor.(PagedCacheAllocator)
@@ -805,6 +783,9 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		}
 	}
 
+	if len(hidden) >= 4 {
+		log.Printf("[prefill] Sequential hidden[0:4 bytes]: %02x%02x%02x%02x", hidden[0], hidden[1], hidden[2], hidden[3])
+	}
 	return hidden, nil
 }
 
