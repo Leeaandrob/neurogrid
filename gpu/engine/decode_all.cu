@@ -271,6 +271,7 @@ extern "C" void* cuda_decode_get_hidden_bf16_gpu_ptr(void* ctx_ptr) {
 // ============================================================================
 // Forward declaration for paged attention (CUDA Graph safe — reads position/seq_len from GPU buffers)
 extern "C" int cuda_paged_attention(void*, const void*, const void*, const void*, void*, const int*, const int*, const int*, int, int, int);
+extern "C" int cuda_paged_kvcache_update(void*, const void*, const void*, const int*, const int*);
 
 static int run_all_layers(DecodeContext* ctx, cudaStream_t stream) {
     int H = ctx->hidden_size;
