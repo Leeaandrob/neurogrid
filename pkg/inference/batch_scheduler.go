@@ -238,6 +238,14 @@ func (bs *BatchScheduler) decodeStep() {
 		seq.OutputTokens = append(seq.OutputTokens, token)
 		seq.Position++
 
+		// Trace first tokens per sequence
+		if len(seq.OutputTokens) <= 3 {
+			if decoded, err2 := e.tokenizer.Decode([]int{token}); err2 == nil {
+				log.Printf("[Sched] Seq %d step %d: token=%d %q pos=%d",
+					seq.ID, len(seq.OutputTokens), token, decoded, seq.Position)
+			}
+		}
+
 		// Check stopping conditions
 		if bs.shouldStop(seq, token) {
 			bs.finishSequence(seq)
