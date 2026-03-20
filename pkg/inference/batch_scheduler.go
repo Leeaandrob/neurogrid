@@ -168,9 +168,17 @@ func (bs *BatchScheduler) runPrefill(seq *Sequence) ([]byte, error) {
 		}
 	}
 
-	// Reset conv state for this sequence
-	if resetter, ok := e.layerExecutor.(interface{ ResetKVCache() error }); ok {
-		resetter.ResetKVCache()
+	// Reset conv state only (don't FreeAll — other sequences' KV blocks must survive)
+	if executor, ok := e.layerExecutor.(*CUDALayerExecutor); ok {
+		// Zero conv states for fresh prefill
+		for layerID, state := range executor.convStates {
+			bindings.ConvStateReset(state, 1, e.config.HiddenSize, e.config.ConvKernelSize)
+			_ = layerID
+		}
+		// Invalidate CUDA graph
+		if executor.decodeCtx != nil {
+			bindings.DecodeInvalidateGraph(executor.decodeCtx)
+		}
 	}
 
 	// Run prefill
