@@ -408,7 +408,9 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	var cachedTokens int
 	if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
 		maxTokens := len(inputTokens) + req.MaxTokens
-		if mgr := pagedAlloc.GetPagedManager(); mgr != nil && e.prefixCache != nil {
+		mgr := pagedAlloc.GetPagedManager()
+		log.Printf("[Generate] Prefix cache: mgr=%v prefixCache=%v (size=%d)", mgr != nil, e.prefixCache != nil, e.prefixCache.Size())
+		if mgr != nil && e.prefixCache != nil {
 			var allocErr error
 			cachedTokens, allocErr = mgr.AllocateWithPrefix(seqID, inputTokens, maxTokens, e.prefixCache)
 			if allocErr != nil {
