@@ -25,6 +25,73 @@
 } while(0)
 
 // ============================================================================
+// Transpose: [batch, seq, heads, dim] ↔ [batch, heads, seq, dim] (FP16)
+// ============================================================================
+// Required before basic_attention when seq_len > 1 (GEMM outputs [seq, heads, dim])
+
+__global__ void transpose_shd_to_hsd_fp16_kernel(
+    half* __restrict__ out,
+    const half* __restrict__ in,
+    int batch, int seq, int heads, int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * seq * heads * dim;
+    if (idx >= total) return;
+
+    int d = idx % dim;
+    int h = (idx / dim) % heads;
+    int s = (idx / (dim * heads)) % seq;
+    int b = idx / (dim * heads * seq);
+
+    // in[b, s, h, d] → out[b, h, s, d]
+    int in_off = b * seq * heads * dim + s * heads * dim + h * dim + d;
+    int out_off = b * heads * seq * dim + h * seq * dim + s * dim + d;
+    out[out_off] = in[in_off];
+}
+
+__global__ void transpose_hsd_to_shd_fp16_kernel(
+    half* __restrict__ out,
+    const half* __restrict__ in,
+    int batch, int heads, int seq, int dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * heads * seq * dim;
+    if (idx >= total) return;
+
+    int d = idx % dim;
+    int s = (idx / dim) % seq;
+    int h = (idx / (dim * seq)) % heads;
+    int b = idx / (dim * seq * heads);
+
+    // in[b, h, s, d] → out[b, s, h, d]
+    int in_off = b * heads * seq * dim + h * seq * dim + s * dim + d;
+    int out_off = b * seq * heads * dim + s * heads * dim + h * dim + d;
+    out[out_off] = in[in_off];
+}
+
+extern "C" int cuda_transpose_shd_to_hsd_fp16(void* out, const void* in,
+    int batch, int seq, int heads, int dim) {
+    int total = batch * seq * heads * dim;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    transpose_shd_to_hsd_fp16_kernel<<<grid, block, 0, ng_get_stream()>>>(
+        (half*)out, (const half*)in, batch, seq, heads, dim);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+extern "C" int cuda_transpose_hsd_to_shd_fp16(void* out, const void* in,
+    int batch, int heads, int seq, int dim) {
+    int total = batch * heads * seq * dim;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    transpose_hsd_to_shd_fp16_kernel<<<grid, block, 0, ng_get_stream()>>>(
+        (half*)out, (const half*)in, batch, heads, seq, dim);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+// ============================================================================
 // Causal Mask Kernel
 // ============================================================================
 // Sets attention scores to -inf where query position > key position

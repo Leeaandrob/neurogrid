@@ -677,27 +677,21 @@ extern "C" int cuda_prefill_batch(
         int result;
 
         if (ctx->layer_types[i] == 0) {
-            // Conv layer — process tokens sequentially (1-by-1) using workspace.
-            // The multi-token conv1d_fwd kernel has known divergence from sequential.
-            // Per-token processing matches decode path exactly (critical for correctness).
-            result = 0;
-            if (ctx->use_bf16_native && ctx->conv_workspace) {
-                for (int t = 0; t < num_tokens && result == 0; t++) {
-                    size_t off = (size_t)t * H;
-                    result = cuda_conv_layer_forward_bf16_ws(
-                        bf16_b + off, bf16_a + off,
-                        ctx->layer_weights[i], ctx->layer_caches[i],
-                        1, 1, 0, ctx->conv_workspace);
-                }
+            // Conv layer — batch with seq_len=num_tokens
+            if (ctx->use_bf16_native) {
+                result = cuda_conv_layer_forward_bf16(
+                    bf16_b, bf16_a, ctx->layer_weights[i], ctx->layer_caches[i],
+                    1, num_tokens, 0);
             } else {
-                // Fallback: non-workspace sequential
-                for (int t = 0; t < num_tokens && result == 0; t++) {
-                    size_t off = (size_t)t * H;
-                    result = cuda_conv_layer_forward_bf16(
-                        bf16_b + off, bf16_a + off,
-                        ctx->layer_weights[i], ctx->layer_caches[i],
-                        1, 1, 0);
-                }
+                __nv_bfloat16* tmp_in = nullptr; __nv_bfloat16* tmp_out = nullptr;
+                cudaMalloc(&tmp_in, token_bytes_bf16);
+                cudaMalloc(&tmp_out, token_bytes_bf16);
+                cuda_fp16_to_bf16(tmp_in, fp16_a, (size_t)num_tokens * H);
+                result = cuda_conv_layer_forward_bf16(
+                    tmp_out, tmp_in, ctx->layer_weights[i], ctx->layer_caches[i],
+                    1, num_tokens, 0);
+                if (result == 0) cuda_bf16_to_fp16(fp16_b, tmp_out, (size_t)num_tokens * H);
+                cudaFree(tmp_in); cudaFree(tmp_out);
             }
         } else {
             // Attention layer — basic_attention_gqa with causal mask for prefill

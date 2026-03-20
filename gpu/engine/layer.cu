@@ -13,6 +13,10 @@
 #include "../cuda/kernels.h"
 #include "../cuda/matmul.h"
 #include "../cuda/attention.h"
+
+// Transpose for prefill attention: [batch, seq, heads, dim] ↔ [batch, heads, seq, dim]
+extern "C" int cuda_transpose_shd_to_hsd_fp16(void*, const void*, int, int, int, int);
+extern "C" int cuda_transpose_hsd_to_shd_fp16(void*, const void*, int, int, int, int);
 #include "../cuda/memory.h"
 
 #include "../cuda/stream.h"
@@ -1544,8 +1548,30 @@ extern "C" int cuda_layer_forward_bf16_native(
         result = cuda_flash_attention_with_kvcache(attn_out_fp16, q_fp16, k_fp16, v_fp16,
             kv_cache, positions,
             batch_size, num_heads, num_kv_heads, head_dim);
+    } else if (seq_len > 1) {
+        // Prefill: basic attention (needs transpose [seq,heads,dim] → [heads,seq,dim])
+        // GEMM output is [batch*seq, heads*dim] = [batch, seq, heads, dim] row-major
+        // Attention expects [batch, heads, seq, dim]
+        half* q_t = nullptr; half* k_t = nullptr; half* v_t = nullptr; half* o_t = nullptr;
+        cudaMalloc(&q_t, num_tokens * hidden_size * sizeof(half));
+        cudaMalloc(&k_t, num_tokens * kv_dim * sizeof(half));
+        cudaMalloc(&v_t, num_tokens * kv_dim * sizeof(half));
+        cudaMalloc(&o_t, num_tokens * hidden_size * sizeof(half));
+
+        cuda_transpose_shd_to_hsd_fp16(q_t, q_fp16, batch_size, seq_len, num_heads, head_dim);
+        cuda_transpose_shd_to_hsd_fp16(k_t, k_fp16, batch_size, seq_len, num_kv_heads, head_dim);
+        cuda_transpose_shd_to_hsd_fp16(v_t, v_fp16, batch_size, seq_len, num_kv_heads, head_dim);
+
+        result = cuda_basic_attention_gqa(o_t, q_t, k_t, v_t,
+            batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
+
+        // Transpose output back: [batch, heads, seq, dim] → [batch, seq, heads, dim]
+        if (result == 0) {
+            cuda_transpose_hsd_to_shd_fp16(attn_out_fp16, o_t, batch_size, num_heads, seq_len, head_dim);
+        }
+        cudaFree(q_t); cudaFree(k_t); cudaFree(v_t); cudaFree(o_t);
     } else {
-        // Prefill: basic attention
+        // seq_len == 1, no KV cache — basic attention (trivial, no transpose needed)
         result = cuda_basic_attention_gqa(attn_out_fp16, q_fp16, k_fp16, v_fp16,
             batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
     }
@@ -1683,6 +1709,20 @@ extern "C" int cuda_layer_forward_bf16_paged(
         result = cuda_paged_attention(attn_out_fp16, q_fp16, k_fp16, v_fp16,
             paged_cache, d_block_table, d_seq_lens, positions,
             num_heads, num_kv_heads, head_dim);
+    } else if (seq_len > 1) {
+        // Prefill: transpose [seq,heads,dim] → [heads,seq,dim] for attention
+        half* q_t = nullptr; half* k_t = nullptr; half* v_t = nullptr; half* o_t = nullptr;
+        cudaMalloc(&q_t, num_tokens * hidden_size * sizeof(half));
+        cudaMalloc(&k_t, num_tokens * kv_dim * sizeof(half));
+        cudaMalloc(&v_t, num_tokens * kv_dim * sizeof(half));
+        cudaMalloc(&o_t, num_tokens * hidden_size * sizeof(half));
+        cuda_transpose_shd_to_hsd_fp16(q_t, q_fp16, batch_size, seq_len, num_heads, head_dim);
+        cuda_transpose_shd_to_hsd_fp16(k_t, k_fp16, batch_size, seq_len, num_kv_heads, head_dim);
+        cuda_transpose_shd_to_hsd_fp16(v_t, v_fp16, batch_size, seq_len, num_kv_heads, head_dim);
+        result = cuda_basic_attention_gqa(o_t, q_t, k_t, v_t,
+            batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
+        if (result == 0) cuda_transpose_hsd_to_shd_fp16(attn_out_fp16, o_t, batch_size, num_heads, seq_len, head_dim);
+        cudaFree(q_t); cudaFree(k_t); cudaFree(v_t); cudaFree(o_t);
     } else {
         result = cuda_basic_attention_gqa(attn_out_fp16, q_fp16, k_fp16, v_fp16,
             batch_size, num_heads, num_kv_heads, seq_len, head_dim, true);
