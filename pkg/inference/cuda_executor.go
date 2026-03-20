@@ -1294,15 +1294,17 @@ func (e *CUDALayerExecutor) Close() error {
 	return nil
 }
 
-// ResetKVCache resets conv state and CUDA graph for a new request.
-// Does NOT free paged blocks — prefix caching keeps them alive.
-// Sequence cleanup is handled by FreeWithPrefix at the end of Generate.
+// ResetKVCache resets state for a new request.
+// Frees active sequences (blocks return to pool). Conv states zeroed.
+// Note: prefix-cached blocks are re-allocated by AllocateWithPrefix.
 func (e *CUDALayerExecutor) ResetKVCache() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// NOTE: Don't call FreeAll() — prefix cached blocks must survive across requests.
-	// Sequences are freed by FreeWithPrefix after each request.
+	// Free all active sequences (blocks return to pool)
+	if e.pagedManager != nil {
+		e.pagedManager.FreeAll()
+	}
 
 	// Reset conv states (zero the state buffers, keep same GPU addresses)
 	for layerID, state := range e.convStates {

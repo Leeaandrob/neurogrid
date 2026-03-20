@@ -404,30 +404,14 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	}
 	e.kvCaches.ClearAll()
 
-	// Allocate with prefix caching: reuse KV blocks from previous requests
+	// Allocate paged KV cache (prefix caching disabled — needs block retention fix)
 	var cachedTokens int
 	if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
 		maxTokens := len(inputTokens) + req.MaxTokens
-		mgr := pagedAlloc.GetPagedManager()
-		log.Printf("[Generate] Prefix cache: mgr=%v prefixCache=%v (size=%d)", mgr != nil, e.prefixCache != nil, e.prefixCache.Size())
-		if mgr != nil && e.prefixCache != nil {
-			var allocErr error
-			cachedTokens, allocErr = mgr.AllocateWithPrefix(seqID, inputTokens, maxTokens, e.prefixCache)
-			if allocErr != nil {
-				log.Printf("[Generate] Prefix cache allocation failed: %v, falling back", allocErr)
-				if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
-					log.Printf("[Generate] Paged cache allocation failed: %v", err)
-				}
-			}
-			defer func() {
-				mgr.FreeWithPrefix(seqID, e.prefixCache)
-			}()
+		if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
+			log.Printf("[Generate] Paged cache allocation failed: %v", err)
 		} else {
-			if err := pagedAlloc.AllocateSequence(seqID, maxTokens); err != nil {
-				log.Printf("[Generate] Paged cache allocation failed: %v", err)
-			} else {
-				defer pagedAlloc.FreeSequence(seqID)
-			}
+			defer pagedAlloc.FreeSequence(seqID)
 		}
 	}
 
@@ -827,8 +811,8 @@ func (e *Engine) prefillFrom(ctx context.Context, allTokens []int, tokens []int,
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
-	// Batch prefill (disabled — testing sequential regression)
-	if false {
+	// Batch prefill: conv sequential + attention batched + per-token KV cache write
+	if true {
 		if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
 			if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
 				embTable := embedLookup.(*GPUComponents).Embeddings.ptr
