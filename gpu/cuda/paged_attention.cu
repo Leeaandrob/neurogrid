@@ -390,6 +390,164 @@ __global__ void paged_attention_v1_kernel(
 // Entry point: Paged Attention with KV Cache update
 // ============================================================================
 
+// ============================================================================
+// Batched Paged Attention — process N sequences in one kernel launch
+// ============================================================================
+// Grid: (batch_size * num_heads) — one block per (batch, head) pair
+// Each block processes one query head for one sequence, using that
+// sequence's block table and seq_len.
+
+__global__ void paged_attention_v1_batched_kernel(
+    half* __restrict__ output,              // [batch, num_heads, head_dim]
+    const half* __restrict__ queries,        // [batch, num_heads, head_dim]
+    const half* __restrict__ key_cache,
+    const half* __restrict__ value_cache,
+    const int* __restrict__ block_tables,    // [batch, max_blocks_per_seq]
+    const int* __restrict__ seq_lens,        // [batch]
+    int batch_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq,
+    float scale
+) {
+    int flat_idx = blockIdx.x;
+    int batch_idx = flat_idx / num_heads;
+    int head_idx = flat_idx % num_heads;
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+
+    if (batch_idx >= batch_size || head_idx >= num_heads) return;
+
+    int seq_len = seq_lens[batch_idx];
+    const int* block_table = block_tables + batch_idx * max_blocks_per_seq;
+
+    int heads_per_kv = num_heads / num_kv_heads;
+    int kv_head_idx = head_idx / heads_per_kv;
+
+    const half* q = queries + (size_t)batch_idx * num_heads * head_dim + head_idx * head_dim;
+    half* out = output + (size_t)batch_idx * num_heads * head_dim + head_idx * head_dim;
+
+    extern __shared__ float smem[];
+    float* scores = smem;
+    float* reduce_buf = smem + seq_len;
+
+    // Phase 1: Q·K scores
+    float local_max = -FLT_MAX;
+    for (int token = tid; token < seq_len; token += num_threads) {
+        int bi = token / block_size;
+        int slot = token % block_size;
+        int phys_block = block_table[bi];
+
+        const half* k_ptr = key_cache
+            + (size_t)phys_block * num_kv_heads * block_size * head_dim
+            + kv_head_idx * block_size * head_dim
+            + slot * head_dim;
+
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++)
+            score += __half2float(q[d]) * __half2float(k_ptr[d]);
+        score *= scale;
+        scores[token] = score;
+        local_max = fmaxf(local_max, score);
+    }
+
+    reduce_buf[tid] = local_max;
+    __syncthreads();
+    for (int s = num_threads / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < num_threads)
+            reduce_buf[tid] = fmaxf(reduce_buf[tid], reduce_buf[tid + s]);
+        __syncthreads();
+    }
+    float global_max = reduce_buf[0];
+    __syncthreads();
+
+    // Phase 2: Softmax
+    float local_sum = 0.0f;
+    for (int token = tid; token < seq_len; token += num_threads) {
+        float e = expf(scores[token] - global_max);
+        scores[token] = e;
+        local_sum += e;
+    }
+    reduce_buf[tid] = local_sum;
+    __syncthreads();
+    for (int s = num_threads / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < num_threads)
+            reduce_buf[tid] += reduce_buf[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / fmaxf(reduce_buf[0], 1e-9f);
+    __syncthreads();
+    for (int token = tid; token < seq_len; token += num_threads)
+        scores[token] *= inv_sum;
+    __syncthreads();
+
+    // Phase 3: Weighted sum of V
+    for (int d = tid; d < head_dim; d += num_threads) {
+        float acc = 0.0f;
+        for (int token = 0; token < seq_len; token++) {
+            int bi = token / block_size;
+            int slot = token % block_size;
+            int phys_block = block_table[bi];
+            const half* v_ptr = value_cache
+                + (size_t)phys_block * num_kv_heads * block_size * head_dim
+                + kv_head_idx * block_size * head_dim
+                + slot * head_dim;
+            acc += scores[token] * __half2float(v_ptr[d]);
+        }
+        out[d] = __float2half(acc);
+    }
+}
+
+// Batched paged attention: process N sequences with different KV lengths
+extern "C" int cuda_paged_attention_batched(
+    void* output,               // [batch, num_heads, head_dim]
+    const void* queries,         // [batch, num_heads, head_dim]
+    const void* new_keys,        // [batch, num_kv_heads, head_dim]
+    const void* new_values,      // [batch, num_kv_heads, head_dim]
+    void* cache_ptr,             // PagedKVCache* (shared across sequences)
+    const int* d_block_tables,   // [batch, max_blocks_per_seq]
+    const int* d_seq_lens,       // [batch]
+    const int* d_positions,      // [batch]
+    int batch_size,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_blocks_per_seq
+) {
+    PagedKVCache* cache = (PagedKVCache*)cache_ptr;
+
+    // Step 1: Update KV cache for each sequence
+    int kv_dim = num_kv_heads * head_dim;
+    for (int b = 0; b < batch_size; b++) {
+        const half* k_b = (const half*)new_keys + (size_t)b * kv_dim;
+        const half* v_b = (const half*)new_values + (size_t)b * kv_dim;
+        const int* bt_b = d_block_tables + b * max_blocks_per_seq;
+        const int* pos_b = d_positions + b;
+        int result = cuda_paged_kvcache_update(cache_ptr, k_b, v_b, bt_b, pos_b);
+        if (result != 0) return result;
+    }
+
+    // Step 2: Batched attention
+    float scale_val = 1.0f / sqrtf((float)head_dim);
+    int num_threads = 128;
+    int max_seq_for_shared = 4096;
+    int shared_size = (max_seq_for_shared + num_threads) * sizeof(float);
+    int grid = batch_size * num_heads;
+
+    paged_attention_v1_batched_kernel<<<grid, num_threads, shared_size, ng_get_stream()>>>(
+        (half*)output, (const half*)queries,
+        cache->key_cache, cache->value_cache,
+        d_block_tables, d_seq_lens,
+        batch_size, num_heads, num_kv_heads, head_dim,
+        cache->block_size, max_blocks_per_seq, scale_val
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    return 0;
+}
+
 extern "C" int cuda_paged_attention(
     void* output,           // [num_heads, head_dim] FP16 on GPU
     const void* query,      // [num_heads, head_dim] FP16 on GPU
