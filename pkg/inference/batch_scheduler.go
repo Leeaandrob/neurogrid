@@ -216,6 +216,12 @@ func (bs *BatchScheduler) decodeStep() {
 			restorer.RestoreConvStates(seq.ConvStates)
 		}
 
+		// Invalidate CUDA graph before each sequence switch
+		// (graph captured for one sequence can't be reused for another)
+		if executor, ok := e.layerExecutor.(*CUDALayerExecutor); ok && executor.decodeCtx != nil {
+			bindings.DecodeInvalidateGraph(executor.decodeCtx)
+		}
+
 		// Run one decode step
 		token, err := bs.runDecodeStep(seq)
 		if err != nil {
