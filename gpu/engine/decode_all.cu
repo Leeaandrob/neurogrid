@@ -782,6 +782,15 @@ extern "C" int cuda_prefill_batch(
         }
     }
 
+    // Debug: print first values of output hidden state
+    {
+        half h_out[4];
+        cudaMemcpy(h_out, d_output, 4*sizeof(half), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[Prefill] Output hidden[0:4] = [%.6f, %.6f, %.6f, %.6f]\n",
+            __half2float(h_out[0]), __half2float(h_out[1]),
+            __half2float(h_out[2]), __half2float(h_out[3]));
+    }
+
     // Invalidate CUDA graph (was captured for batch_size=1 decode)
     ctx->graph_captured = false;
     ctx->warmup_count_gpu = 0;
