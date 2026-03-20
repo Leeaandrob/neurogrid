@@ -191,6 +191,7 @@ extern "C" void cuda_set_decode_paged_cache(void* ctx_ptr, void* paged_cache,
     ctx->d_block_table = d_block_table;
     ctx->max_blocks_per_seq = max_blocks_per_seq;
     ctx->use_paged = true;
+    fprintf(stderr, "[PAGED-INIT] ctx=%p use_paged set to true\n", ctx);
     // Note: per-layer caches set via cuda_set_decode_paged_layer
 }
 
@@ -662,8 +663,8 @@ extern "C" int cuda_prefill_batch(
 
     // Clear any pending CUDA errors before starting
     cudaGetLastError();
-    fprintf(stderr, "[PF-ENTRY] num_tokens=%d H=%d bf16=%d paged=%d num_layers=%d\n",
-        num_tokens, H, ctx->use_bf16_native, ctx->use_paged, ctx->num_layers);
+    fprintf(stderr, "[PF-ENTRY] ctx=%p num_tokens=%d H=%d bf16=%d paged=%d num_layers=%d\n",
+        ctx, num_tokens, H, ctx->use_bf16_native, ctx->use_paged, ctx->num_layers);
 
     // Allocate batch-sized workspace
     if (ctx->use_bf16_native) {
