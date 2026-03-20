@@ -717,8 +717,8 @@ extern "C" int cuda_prefill_batch(
                     ctx->norm_eps, ctx->rope_theta, ctx->rope_style);
             }
 
-            // Write K/V to paged cache — per-token using same function as sequential decode
-            // (cuda_paged_kvcache_update uses d_position GPU buffer → matches decode path exactly)
+            // Write K/V to paged cache — per-token using same function as sequential decode.
+            // CRITICAL: must sync before next layer overwrites workspace K/V buffers.
             if (result == 0 && ctx->use_paged && ctx->paged_caches && ctx->paged_caches[i]) {
                 void* ws_k = nullptr;
                 void* ws_v = nullptr;
@@ -728,15 +728,15 @@ extern "C" int cuda_prefill_batch(
                 if (ws_k && ws_v) {
                     int kv_dim = ctx->num_kv_heads * ctx->head_dim;
                     for (int t = 0; t < num_tokens && result == 0; t++) {
-                        // Set position to t on GPU
                         CUDA_CHECK(cudaMemcpy(ctx->d_position, &t, sizeof(int), cudaMemcpyHostToDevice));
-                        // K/V for token t: offset t * kv_dim in workspace
                         half* k_t = (half*)ws_k + (size_t)t * kv_dim;
                         half* v_t = (half*)ws_v + (size_t)t * kv_dim;
                         result = cuda_paged_kvcache_update(
                             ctx->paged_caches[i], k_t, v_t,
                             ctx->d_block_table, ctx->d_position);
                     }
+                    // Sync: ensure all KV writes complete before next layer overwrites workspace
+                    CUDA_CHECK(cudaDeviceSynchronize());
                 }
             }
         }
