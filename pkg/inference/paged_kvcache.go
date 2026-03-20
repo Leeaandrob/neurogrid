@@ -309,16 +309,23 @@ type CachedPrefix struct {
 	NumTokens   int        // Total tokens in the cached prefix
 }
 
+// CachedConvState stores conv state snapshots for prefix restoration.
+type CachedConvState struct {
+	States map[int][]byte // layerID → FP32 conv state bytes (host copy)
+}
+
 // PrefixCache stores cached prefixes for reuse across requests.
 type PrefixCache struct {
-	cache map[[32]byte]int // blockHash → physical block ID
-	mu    sync.RWMutex
+	cache     map[[32]byte]int           // blockHash → physical block ID
+	convCache map[[32]byte]*CachedConvState // prefixHash → conv state snapshot
+	mu        sync.RWMutex
 }
 
 // NewPrefixCache creates a prefix cache.
 func NewPrefixCache() *PrefixCache {
 	return &PrefixCache{
-		cache: make(map[[32]byte]int),
+		cache:     make(map[[32]byte]int),
+		convCache: make(map[[32]byte]*CachedConvState),
 	}
 }
 
@@ -360,6 +367,31 @@ func (pc *PrefixCache) Size() int {
 	pc.mu.RLock()
 	defer pc.mu.RUnlock()
 	return len(pc.cache)
+}
+
+// prefixHash computes a hash for the entire cached token prefix.
+func prefixHash(tokens []int, numCachedTokens int) [32]byte {
+	buf := make([]byte, numCachedTokens*4)
+	for i := 0; i < numCachedTokens && i < len(tokens); i++ {
+		binary.LittleEndian.PutUint32(buf[i*4:], uint32(tokens[i]))
+	}
+	return sha256.Sum256(buf)
+}
+
+// SaveConvState stores a snapshot of conv states for a cached prefix.
+func (pc *PrefixCache) SaveConvState(tokens []int, numCachedTokens int, states map[int][]byte) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	hash := prefixHash(tokens, numCachedTokens)
+	pc.convCache[hash] = &CachedConvState{States: states}
+}
+
+// GetConvState retrieves the conv state snapshot for a cached prefix.
+func (pc *PrefixCache) GetConvState(tokens []int, numCachedTokens int) *CachedConvState {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+	hash := prefixHash(tokens, numCachedTokens)
+	return pc.convCache[hash]
 }
 
 // AllocateWithPrefix allocates blocks for a sequence, reusing cached prefix blocks.

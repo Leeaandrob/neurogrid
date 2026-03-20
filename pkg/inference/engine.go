@@ -437,10 +437,23 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		log.Printf("[Generate] Prefix cache: skipping %d/%d tokens (cached)", cachedTokens, len(inputTokens))
 	}
 
+	// Restore conv state from prefix cache (if cache hit)
+	type convStateSaver interface {
+		SaveConvStates() map[int][]byte
+		RestoreConvStates(map[int][]byte)
+	}
+	if cachedTokens > 0 {
+		if saver, ok := e.layerExecutor.(convStateSaver); ok && e.prefixCache != nil {
+			if cached := e.prefixCache.GetConvState(inputTokens, cachedTokens); cached != nil {
+				saver.RestoreConvStates(cached.States)
+				log.Printf("[Generate] Restored conv state for %d cached tokens", cachedTokens)
+			}
+		}
+	}
+
 	var hidden []byte
 	if len(prefillTokens) == 0 {
-		// ALL tokens cached — need to reconstruct the last token's hidden state.
-		// Run a single-token forward at the last position using the cached KV context.
+		// ALL tokens cached — recompute last token with restored conv state + cached KV
 		lastToken := inputTokens[len(inputTokens)-1]
 		tokenHidden, embErr := e.embedToken(lastToken)
 		if embErr != nil {
@@ -458,10 +471,17 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		}
 	}
 
-	// Cache the prefix blocks for future requests
+	// Cache prefix blocks + conv state for future requests
 	if pagedAlloc, ok := e.layerExecutor.(PagedCacheAllocator); ok {
 		if mgr := pagedAlloc.GetPagedManager(); mgr != nil && e.prefixCache != nil {
 			mgr.CacheSequencePrefix(seqID, inputTokens, e.prefixCache)
+			// Save conv state snapshot for this prefix
+			if saver, ok2 := e.layerExecutor.(convStateSaver); ok2 {
+				numCached := len(inputTokens) / BlockSize * BlockSize // only full blocks
+				if numCached > 0 {
+					e.prefixCache.SaveConvState(inputTokens, numCached, saver.SaveConvStates())
+				}
+			}
 		}
 	}
 

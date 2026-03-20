@@ -245,6 +245,31 @@ func (e *CUDALayerExecutor) GetPagedManager() *PagedKVCacheManager {
 	return e.pagedManager
 }
 
+// SaveConvStates copies all conv states from GPU to host (for prefix caching).
+func (e *CUDALayerExecutor) SaveConvStates() map[int][]byte {
+	states := make(map[int][]byte)
+	stateSize := e.config.HiddenSize * e.config.ConvKernelSize * 4 // FP32
+	for layerID, statePtr := range e.convStates {
+		buf := make([]byte, stateSize)
+		if err := bindings.CopyFromDeviceRaw(unsafe.Pointer(&buf[0]), statePtr, uint64(stateSize)); err != nil {
+			continue
+		}
+		states[layerID] = buf
+	}
+	return states
+}
+
+// RestoreConvStates copies conv states from host to GPU (for prefix cache hit).
+func (e *CUDALayerExecutor) RestoreConvStates(states map[int][]byte) {
+	for layerID, buf := range states {
+		statePtr, ok := e.convStates[layerID]
+		if !ok || len(buf) == 0 {
+			continue
+		}
+		bindings.CopyToDeviceRaw(statePtr, unsafe.Pointer(&buf[0]), uint64(len(buf)))
+	}
+}
+
 // AllocateSequence allocates paged KV cache blocks for a new sequence.
 func (e *CUDALayerExecutor) AllocateSequence(seqID uint64, maxTokens int) error {
 	if e.pagedManager == nil {
