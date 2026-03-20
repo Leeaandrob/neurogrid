@@ -437,9 +437,25 @@ func (e *Engine) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		log.Printf("[Generate] Prefix cache: skipping %d/%d tokens (cached)", cachedTokens, len(inputTokens))
 	}
 
-	hidden, err := e.prefillFrom(ctx, inputTokens, prefillTokens, cachedTokens, seqID)
-	if err != nil {
-		return nil, fmt.Errorf("prefill failed: %w", err)
+	var hidden []byte
+	if len(prefillTokens) == 0 {
+		// ALL tokens cached — need to reconstruct the last token's hidden state.
+		// Run a single-token forward at the last position using the cached KV context.
+		lastToken := inputTokens[len(inputTokens)-1]
+		tokenHidden, embErr := e.embedToken(lastToken)
+		if embErr != nil {
+			return nil, fmt.Errorf("embed cached last token: %w", embErr)
+		}
+		hidden, err = e.forwardAllLayersHidden(ctx, tokenHidden, len(inputTokens)-1, seqID)
+		if err != nil {
+			return nil, fmt.Errorf("forward cached last token: %w", err)
+		}
+		log.Printf("[Generate] Full prefix cache hit: recomputed last token at pos %d", len(inputTokens)-1)
+	} else {
+		hidden, err = e.prefillFrom(ctx, inputTokens, prefillTokens, cachedTokens, seqID)
+		if err != nil {
+			return nil, fmt.Errorf("prefill failed: %w", err)
+		}
 	}
 
 	// Cache the prefix blocks for future requests
