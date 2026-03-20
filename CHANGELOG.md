@@ -5,6 +5,30 @@ All notable changes to NeuroGrid Inference Engine will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-03-20
+
+### Continuous Batching Phase 1 — Concurrent Request Processing
+
+Multiple requests processed concurrently via BatchScheduler. Each request
+has independent lifecycle (prefill → decode → finish) with isolated state.
+
+#### Architecture
+- **BatchScheduler**: admit → buffer → prefill → decode (round-robin) → sample → cleanup
+- **Per-sequence state**: conv state save/restore, paged KV cache blocks, position tracking
+- **Phase isolation**: prefill only runs when no sequences are decoding (prevents GPU state corruption)
+- **Auto-enabled**: 8 max concurrent sequences after GPU init
+
+#### Performance (GH200 480GB)
+| Config | Time | Speedup |
+|--------|------|---------|
+| 3 sequential | 18.9s | 1x |
+| **3 concurrent** | **10.4s** | **1.8x** |
+| Single request | 0.5s (Paris) | — |
+
+Correctness verified: Paris, H₂O, 2+2 — all independent, no cross-contamination.
+
+---
+
 ## [0.10.0] - 2026-03-20
 
 ### Batched Prefill + Prefix Caching Infrastructure
