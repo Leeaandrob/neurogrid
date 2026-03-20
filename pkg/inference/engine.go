@@ -755,19 +755,10 @@ func (e *Engine) prefill(ctx context.Context, tokens []int, seqID uint64) ([]byt
 		return nil, fmt.Errorf("empty input tokens")
 	}
 
-	// Batch prefill: attention batched, conv sequential (matches decode path)
-	if batcher, ok := e.layerExecutor.(BatchPrefiller); ok && e.useGPU && e.gpuInference != nil {
-		if embedLookup, ok2 := e.gpuInference.(GPUEmbeddingLookup); ok2 {
-			embTable := embedLookup.(*GPUComponents).Embeddings.ptr
-			batchHidden, err := batcher.PrefillBatch(tokens, embTable, seqID)
-			if err != nil {
-				log.Printf("[prefill] Batch prefill failed, falling back: %v", err)
-			} else {
-				log.Printf("[prefill] Batch prefill: %d tokens", len(tokens))
-				return batchHidden, nil
-			}
-		}
-	}
+	// Batch prefill: hidden state computation correct (transpose fix applied),
+	// but KV cache write via reshape_and_cache has ordering issue with decode.
+	// Disabled until KV cache population is debugged.
+	// Infrastructure: cuda_prefill_batch, cuda_reshape_and_cache, transpose kernels
 
 	// Sequential fallback (one token at a time)
 	pagedAlloc, hasPaged := e.layerExecutor.(PagedCacheAllocator)
